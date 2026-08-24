@@ -39,13 +39,31 @@ UA = (
 app = Flask(__name__)
 
 
-@app.after_request
-def add_cors(resp):
+def _cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Range"
+    resp.headers["Access-Control-Expose-Headers"] = "Content-Type, Content-Length, Accept-Ranges"
     return resp
+
+
+def _json(data, status=200):
+    resp = jsonify(data)
+    resp.status_code = status
+    return _cors(resp)
+
+
+@app.after_request
+def add_cors(resp):
+    return _cors(resp)
+
+
+@app.route("/", methods=["OPTIONS"])
+@app.route("/<path:path>", methods=["OPTIONS"])
+def preflight(path=None):
+    resp = jsonify({"ok": True})
+    resp.status_code = 204
+    return _cors(resp)
 
 
 def http_get(url: str) -> str | None:
@@ -158,21 +176,21 @@ def yt_map(v: dict) -> dict | None:
 def ytmusic_search():
     q = (request.args.get("q") or "").strip()
     if not q:
-        return jsonify({"error": "Missing q param", "items": []}), 400
+        return _json({"error": "Missing q param", "items": []}), 400
     data = yt_post("search", {"query": q, "params": "EgWKAQIIAWoKEAoQCRADEAA%3D"})
     if not data:
-        return jsonify({"error": "YouTube blocked the request", "items": []}), 502
+        return _json({"error": "YouTube blocked the request", "items": []}), 502
     items: list = []
     yt_walk(data.get("contents"), items)
     tracks = [t for t in (yt_map(v) for v in items) if t]
-    return jsonify({"items": tracks, "count": len(tracks), "source": "innertube"})
+    return _json({"items": tracks, "count": len(tracks), "source": "innertube"})
 
 
 @app.route("/api/ytmusic/stream")
 def ytmusic_stream():
     vid = (request.args.get("id") or "").strip()
     if not vid:
-        return jsonify({"error": "Missing id param"}), 400
+        return _json({"error": "Missing id param"}), 400
 
     # 0) Piped instances first (they proxy YouTube streams themselves and often work from Vercel)
     for piped in [
@@ -197,7 +215,7 @@ def ytmusic_stream():
             if audio:
                 audio.sort(key=lambda s: s.get("bitrate") or 0, reverse=True)
                 pick = next((s for s in audio if "mp4" in str(s.get("mimeType", ""))), audio[0])
-                return jsonify({
+                return _json({
                     "id": vid,
                     "title": d.get("title", ""),
                     "author": (d.get("uploader") or {}).get("name", ""),
@@ -210,7 +228,7 @@ def ytmusic_stream():
                     "source": f"piped:{piped}",
                 })
             if d.get("hls"):
-                return jsonify({
+                return _json({
                     "id": vid, "title": d.get("title", ""), "author": (d.get("uploader") or {}).get("name", ""),
                     "lengthSeconds": int(d.get("duration") or 0), "url": "", "mimeType": "", "itag": 0,
                     "bitrate": 0, "hls": d.get("hls"), "source": f"piped-hls:{piped}",
@@ -255,7 +273,7 @@ def ytmusic_stream():
                 continue
             audio.sort(key=lambda f: f.get("bitrate") or 0, reverse=True)
             pick = next((f for f in audio if "mp4" in str(f.get("mimeType", ""))), audio[0] if audio else None)
-            return jsonify({
+            return _json({
                 "id": vid,
                 "title": (d.get("videoDetails") or {}).get("title", ""),
                 "author": (d.get("videoDetails") or {}).get("author", ""),
@@ -270,7 +288,7 @@ def ytmusic_stream():
             })
         except Exception:
             continue
-    return jsonify({"error": "Could not get a playable stream (blocked)", "id": vid}), 502
+    return _json({"error": "Could not get a playable stream (blocked)", "id": vid}), 502
 
 
 @app.route("/api/ytmusic/play")
@@ -283,7 +301,7 @@ def ytmusic_play():
     """
     vid = (request.args.get("id") or "").strip()
     if not vid:
-        return jsonify({"error": "Missing id param"}), 400
+        return _json({"error": "Missing id param"}), 400
     # Resolve the stream URL first (reuse the resolution logic)
     import urllib.request as _ur
 
@@ -296,13 +314,13 @@ def ytmusic_play():
     except Exception:
         resolved = None
     if not resolved:
-        return jsonify({"error": "Could not resolve stream", "id": vid}), 502
+        return _json({"error": "Could not resolve stream", "id": vid}), 502
     if cf_requests is None:
-        return jsonify({"error": "curl_cffi unavailable"}), 502
+        return _json({"error": "curl_cffi unavailable"}), 502
     try:
         r = cf_requests.get(resolved, impersonate="chrome", timeout=30, stream=True)
         if r.status_code != 200:
-            return jsonify({"error": f"Upstream {r.status_code}"}), 502
+            return _json({"error": f"Upstream {r.status_code}"}), 502
         resp = Response(
             r.iter_content(chunk_size=64 * 1024),
             status=200,
@@ -313,7 +331,7 @@ def ytmusic_play():
         resp.headers["Access-Control-Allow-Origin"] = "*"
         return resp
     except Exception as e:
-        return jsonify({"error": f"Relay failed: {e}"}), 502
+        return _json({"error": f"Relay failed: {e}"}), 502
 
 
 def _rot13(s: str) -> str:
@@ -393,7 +411,7 @@ def get_stream_data(uri: str, en: str, iv: str) -> dict | None:
 
 @app.route("/")
 def api_health():
-    return jsonify(
+    return _json(
         {
             "status": True,
             "service": "REproxy",
@@ -409,7 +427,7 @@ def api_stream():
     slug = (request.args.get("slug") or "").strip()
     ep = (request.args.get("ep") or "1").strip()
     if not slug:
-        return jsonify({"status": False, "error": 'Missing "slug" query param'}), 400
+        return _json({"status": False, "error": 'Missing "slug" query param'}), 400
 
     watch_candidates = []
     if ep and ep != "1":
@@ -423,13 +441,13 @@ def api_stream():
         if cfg:
             break
     if not cfg:
-        return jsonify({"status": False, "error": f"Could not resolve player config for {slug}"}), 404
+        return _json({"status": False, "error": f"Could not resolve player config for {slug}"}), 404
 
     stream = get_stream_data(cfg["uri"], cfg["en"], cfg["iv"])
     if not stream:
-        return jsonify({"status": False, "error": "Could not fetch stream URL"}), 502
+        return _json({"status": False, "error": "Could not fetch stream URL"}), 502
 
-    return jsonify(
+    return _json(
         {"status": True, "src": stream["src"], "sources": stream["sources"], "slug": slug, "episode": ep}
     )
 
@@ -438,7 +456,7 @@ def api_stream():
 def api_search():
     q = (request.args.get("q") or "").strip()
     if not q:
-        return jsonify({"status": False, "error": 'Missing "q" query param'}), 400
+        return _json({"status": False, "error": 'Missing "q" query param'}), 400
 
     # normalize: drop trailing episode/season markers (" 2", " season 1", " 1080p")
     base_q = re.sub(r"\s+\d+\s*$", "", q)
@@ -479,8 +497,8 @@ def api_search():
             break
 
     if not best:
-        return jsonify({"status": False, "found": False})
-    return jsonify(
+        return _json({"status": False, "found": False})
+    return _json(
         {"status": True, "found": True, "slug": best[0], "title": best[1], "url": f"{BASE}/watch/{best[0]}/"}
     )
 
@@ -644,7 +662,7 @@ def api_xreels():
 
     import random
     random.shuffle(posts)
-    return jsonify({"posts": posts[:limit * 2], "after": next_after, "count": len(posts), "source": "reddit", "debug": debug})
+    return _json({"posts": posts[:limit * 2], "after": next_after, "count": len(posts), "source": "reddit", "debug": debug})
 
 
 @app.route("/api/catalog")
@@ -658,7 +676,7 @@ def api_catalog():
     page_url = f"{BASE}/tag/{tag}/" if page == 1 else f"{BASE}/tag/{tag}/page/{page}/"
     html = http_get(page_url)
     if not html:
-        return jsonify({"status": False, "error": "Failed to fetch tag page"}), 502
+        return _json({"status": False, "error": "Failed to fetch tag page"}), 502
 
     titles = []
     seen = set()
@@ -685,11 +703,11 @@ def api_catalog():
         )
 
     if not titles:
-        return jsonify({"status": False, "error": "No entries found (tag may not exist)"}), 404
+        return _json({"status": False, "error": "No entries found (tag may not exist)"}), 404
 
     lp = re.search(r'page/(\d+)/"[^>]*>\s*»', html)
     total_pages = int(lp.group(1)) if lp else page
-    return jsonify(
+    return _json(
         {"status": True, "tag": tag, "page": page, "totalPages": total_pages, "count": len(titles), "titles": titles}
     )
 

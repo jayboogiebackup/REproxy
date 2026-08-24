@@ -214,8 +214,9 @@ def ytmusic_stream():
 
     # 1) YouTube player API with client rotation
     for client in [
-        {"clientName": "WEB", "clientVersion": "2.20240701.01.00"},
+        {"clientName": "ANDROID", "clientVersion": "20.10.20"},
         {"clientName": "ANDROID", "clientVersion": "19.09.37"},
+        {"clientName": "WEB", "clientVersion": "2.20240701.01.00"},
         {"clientName": "IOS", "clientVersion": "19.09.3"},
         {"clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER", "clientVersion": "2.0"},
     ]:

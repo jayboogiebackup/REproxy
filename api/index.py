@@ -191,14 +191,49 @@ def api_search():
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"status": False, "error": 'Missing "q" query param'}), 400
-    html = http_get(f"{BASE}/?s={quote(q, safe='')}")
-    if not html:
-        return jsonify({"status": False, "error": "Search request failed"}), 502
-    m = re.search(r'href="https://hentaihaven\.xxx/watch/([^"/]+)/"[^>]*title="([^"]+)"', html)
-    if not m:
+
+    # normalize: drop trailing episode/season markers (" 2", " season 1", " 1080p")
+    base_q = re.sub(r"\s+\d+\s*$", "", q)
+    base_q = re.sub(r"\s*[-\u2013]\s*(episode|season)?\s*\d+\s*$", "", base_q, flags=re.I).strip()
+    queries = list(dict.fromkeys([q, base_q])) if base_q and base_q != q else [q]
+
+    best = None
+    best_score = 999
+    for query in queries:
+        html = http_get(f"{BASE}/?s={quote(query, safe='')}")
+        if not html:
+            continue
+        # collect all watch results (slug, title) — WordPress relevance is unreliable
+        results = re.findall(r'href="https://hentaihaven\.xxx/watch/([^"/]+)/"[^>]*title="([^"]+)"', html)
+        seen = {}
+        for slug, title in results:
+            t = title.strip()
+            if slug not in seen:
+                seen[slug] = t
+
+        ql = query.lower().strip()
+        for slug, title in seen.items():
+            tl = title.lower()
+            if tl == ql:
+                score = 0
+            elif tl.startswith(ql):
+                score = 1
+            elif ql.startswith(tl):
+                score = 2
+            elif ql in tl:
+                score = 3
+            else:
+                score = 99
+            if score < best_score:
+                best_score = score
+                best = (slug, title)
+        if best_score == 0:
+            break
+
+    if not best:
         return jsonify({"status": False, "found": False})
     return jsonify(
-        {"status": True, "found": True, "slug": m.group(1), "title": m.group(2), "url": f"{BASE}/watch/{m.group(1)}/"}
+        {"status": True, "found": True, "slug": best[0], "title": best[1], "url": f"{BASE}/watch/{best[0]}/"}
     )
 
 

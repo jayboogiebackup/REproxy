@@ -262,6 +262,8 @@ def ytmusic_stream():
                     "context": {"client": client},
                     "videoId": vid,
                     "playbackContext": {"contentPlaybackContext": {"html5Preference": "HTML5_PREF_WANTS"}},
+                    "contentCheckOk": True,
+                    "racyCheckOk": True,
                 },
             )
             if r.status_code != 200:
@@ -288,7 +290,13 @@ def ytmusic_stream():
             })
         except Exception:
             continue
-    return _json({"error": "Could not get a playable stream (blocked)", "id": vid}), 502
+    return _json({"error": "Could not get a playable stream (blocked)", "id": vid, "attempts": [c["clientName"] + "@" + c["clientVersion"] for c in [
+        {"clientName": "ANDROID", "clientVersion": "20.10.20"},
+        {"clientName": "ANDROID", "clientVersion": "19.09.37"},
+        {"clientName": "WEB", "clientVersion": "2.20240701.01.00"},
+        {"clientName": "IOS", "clientVersion": "19.09.3"},
+        {"clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER", "clientVersion": "2.0"},
+    ]]}), 502
 
 
 @app.route("/api/ytmusic/play")

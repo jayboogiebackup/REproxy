@@ -16,7 +16,14 @@ import json
 import re
 
 from flask import Flask, jsonify, request
-from curl_cffi import requests as cf_requests
+
+try:
+    from curl_cffi import requests as cf_requests
+except Exception as e:  # keep the app importable so errors surface as JSON, not a crash
+    cf_requests = None
+    _CURL_IMPORT_ERROR = str(e)
+else:
+    _CURL_IMPORT_ERROR = None
 
 BASE = "https://hentaihaven.xxx"
 UA = (
@@ -28,6 +35,8 @@ app = Flask(__name__)
 
 
 def http_get(url: str) -> str | None:
+    if cf_requests is None:
+        return None
     try:
         r = cf_requests.get(
             url,
@@ -95,6 +104,8 @@ def get_player_config(watch_url: str) -> dict | None:
 
 
 def get_stream_data(uri: str, en: str, iv: str) -> dict | None:
+    if cf_requests is None:
+        return None
     try:
         r = cf_requests.post(
             uri.rstrip("/") + "/api.php",
@@ -117,6 +128,19 @@ def get_stream_data(uri: str, en: str, iv: str) -> dict | None:
         return {"src": sources[0]["src"], "sources": sources}
     except Exception:
         return None
+
+
+@app.route("/")
+def api_health():
+    return jsonify(
+        {
+            "status": True,
+            "service": "REproxy",
+            "curl_cffi_loaded": cf_requests is not None,
+            "curl_cffi_error": _CURL_IMPORT_ERROR,
+            "routes": ["/api/catalog", "/api/search", "/api/stream"],
+        }
+    )
 
 
 @app.route("/api/stream")

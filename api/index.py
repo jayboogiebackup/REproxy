@@ -143,7 +143,13 @@ def yt_map(v: dict) -> dict | None:
     dt = v.get("lengthText") or {}
     dur_text = dt.get("simpleText") or "".join(x.get("text", "") for x in (dt.get("runs") or []))
     thumbs = (v.get("thumbnail") or {}).get("thumbnails") or []
-    thumb = (thumbs[-1].get("url") if thumbs else None) or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+    thumb = None
+    for t in reversed(thumbs):
+        u = t.get("url") or ""
+        if "maxres" in u or "hq720" in u or "hqdefault" in u:
+            thumb = u
+            break
+    thumb = thumb or (thumbs[-1].get("url") if thumbs else None) or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
     thumb = thumb.split("?")[0]
     return {"videoId": vid, "title": title, "author": author, "thumb": thumb, "duration": yt_dur(dur_text)}
 

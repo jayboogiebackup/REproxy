@@ -167,6 +167,52 @@ def ytmusic_stream():
     vid = (request.args.get("id") or "").strip()
     if not vid:
         return jsonify({"error": "Missing id param"}), 400
+
+    # 0) Piped instances first (they proxy YouTube streams themselves and often work from Vercel)
+    for piped in [
+        "https://api.piped.private.coffee",
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.adminforge.de",
+        "https://pipedapi.reallyaweso.me",
+    ]:
+        if cf_requests is None:
+            break
+        try:
+            r = cf_requests.get(
+                f"{piped}/streams/{vid}",
+                impersonate="chrome",
+                timeout=20,
+                headers={"User-Agent": UA, "Accept": "application/json"},
+            )
+            if r.status_code != 200:
+                continue
+            d = r.json()
+            audio = [s for s in d.get("audioStreams") or [] if s.get("url")]
+            if audio:
+                audio.sort(key=lambda s: s.get("bitrate") or 0, reverse=True)
+                pick = next((s for s in audio if "mp4" in str(s.get("mimeType", ""))), audio[0])
+                return jsonify({
+                    "id": vid,
+                    "title": d.get("title", ""),
+                    "author": (d.get("uploader") or {}).get("name", ""),
+                    "lengthSeconds": int(d.get("duration") or 0),
+                    "url": pick.get("url", ""),
+                    "mimeType": pick.get("mimeType", ""),
+                    "itag": pick.get("itag", 0),
+                    "bitrate": pick.get("bitrate", 0),
+                    "hls": d.get("hls"),
+                    "source": f"piped:{piped}",
+                })
+            if d.get("hls"):
+                return jsonify({
+                    "id": vid, "title": d.get("title", ""), "author": (d.get("uploader") or {}).get("name", ""),
+                    "lengthSeconds": int(d.get("duration") or 0), "url": "", "mimeType": "", "itag": 0,
+                    "bitrate": 0, "hls": d.get("hls"), "source": f"piped-hls:{piped}",
+                })
+        except Exception:
+            continue
+
+    # 1) YouTube player API with client rotation
     for client in [
         {"clientName": "WEB", "clientVersion": "2.20240701.01.00"},
         {"clientName": "ANDROID", "clientVersion": "19.09.37"},

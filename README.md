@@ -1,7 +1,7 @@
-# streaming proxy for repeaks
+# REproxy — hentaihaven.xxx streaming proxy for repeaks
 
-Serverless proxy (Vercel Python runtime, Flask + curl_cffi) that turns
-repeaks 18+ category.
+Serverless proxy (Vercel Python runtime, curl_cffi) that turns hentaihaven.xxx
+episodes into playable HLS streams for the repeaks 18+ category.
 
 > curl_cffi impersonates Chrome's TLS fingerprint, which is required because
 > hentaihaven.xxx sits behind a Cloudflare bot challenge that rejects plain
@@ -9,7 +9,7 @@ repeaks 18+ category.
 
 ## Why this works
 
-protects its video player with a token exchange, but every step
+hentaihaven.xxx protects its video player with a token exchange, but every step
 is plain server-side HTTP (no browser fingerprint required):
 
 1. `GET /watch/<slug>/episode-N/` -> HTML with a `player.php?data=<blob>` iframe
@@ -32,3 +32,39 @@ hls.js — no byte proxying needed.
 | `/api/catalog` | `tag` (default `hanime`), `page` (default 1) | `{ status, tag, page, totalPages, count, titles[] }` |
 
 All responses include `Access-Control-Allow-Origin: *`.
+
+## Deploy
+
+The proxy uses Vercel's native Python functions (one `handler(request)` per
+route in `api/`) — no Flask, no `vercel.json` needed.
+
+```sh
+npm i -g vercel
+cd hanime-proxy
+vercel --prod
+```
+
+> Redeploying an existing project keeps the same URL (e.g.
+> `reproxy-seven.vercel.app`) and just swaps the build. The deployed instance
+> only updates when YOU run `vercel --prod` (or when the GitHub repo is
+> connected under Project → Settings → Git in the Vercel dashboard).
+
+After deploying, set `HENTAI_PROXY` in `client/src/pages/V6.tsx`:
+```ts
+const HENTAI_PROXY = 'https://reproxy-seven.vercel.app'; // your deployment URL
+```
+
+## Example
+
+```sh
+curl 'https://<your-proxy>/api/stream?slug=deco-x-deco-the-animation&ep=2'
+# {"status":true,"src":"https://octopusmanifest.org/07d69b06-.../playlist.m3u8",...}
+```
+
+## Notes
+
+- Vercel free tier is fine; each stream request is a few small HTTP calls.
+- If a stream call fails, the client falls back to opening the video on
+  hentaihaven.xxx / hanime.tv in a new tab.
+- The token + stream URL are short-lived (~10 min), so always fetch fresh per
+  play — never cache the `src`.

@@ -237,6 +237,7 @@ def ytmusic_stream():
             continue
 
     # 1) YouTube player API with client rotation
+    statuses: list = []
     for client in [
         {"clientName": "ANDROID", "clientVersion": "20.10.20"},
         {"clientName": "ANDROID", "clientVersion": "19.09.37"},
@@ -671,6 +672,127 @@ def api_xreels():
     import random
     random.shuffle(posts)
     return _json({"posts": posts[:limit * 2], "after": next_after, "count": len(posts), "source": "reddit", "debug": debug})
+
+
+# ═══════════════ SoundCloud (RE:music) ═══════════════
+
+SC_API = "https://api-v2.soundcloud.com"
+SC_CLIENT_ID = "Pb72ranhoyt6gw7hM7TkzUItXlMWSNSo"
+
+
+def sc_get(path: str, **params) -> dict | None:
+    if cf_requests is None:
+        return None
+    try:
+        r = cf_requests.get(
+            f"{SC_API}{path}",
+            impersonate="chrome",
+            timeout=20,
+            headers={"User-Agent": UA, "Accept": "application/json"},
+            params={"client_id": SC_CLIENT_ID, "app_locale": "en", **params},
+        )
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def sc_resolve_stream(track: dict) -> dict | None:
+    """Find a playable progressive MP3 (or HLS) stream URL for a track."""
+    if cf_requests is None:
+        return None
+    tc = (track.get("media") or {}).get("transcodings") or []
+    if not tc:
+        return None
+    # 1) progressive mp3 — simplest, plays everywhere
+    prog = next((x for x in tc if x.get("format", {}).get("protocol") == "progressive"), None)
+    if prog:
+        try:
+            r = cf_requests.get(
+                prog["url"] + f"?client_id={SC_CLIENT_ID}",
+                impersonate="chrome",
+                timeout=15,
+                headers={"User-Agent": UA, "Accept": "application/json"},
+            )
+            if r.status_code == 200:
+                d = r.json()
+                if d.get("url"):
+                    return {
+                        "url": d["url"],
+                        "mimeType": "audio/mpeg",
+                        "protocol": "progressive",
+                    }
+        except Exception:
+            pass
+    # 2) HLS (mp4 audio)
+    hls = next((x for x in tc if x.get("format", {}).get("protocol") == "hls"), None)
+    if hls:
+        try:
+            r = cf_requests.get(
+                hls["url"] + f"?client_id={SC_CLIENT_ID}",
+                impersonate="chrome",
+                timeout=15,
+                headers={"User-Agent": UA, "Accept": "application/json"},
+            )
+            if r.status_code == 200:
+                d = r.json()
+                if d.get("url"):
+                    return {"url": d["url"], "mimeType": "application/vnd.apple.mpegurl", "protocol": "hls"}
+        except Exception:
+            pass
+    return None
+
+
+@app.route("/api/sc/search")
+def sc_search():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return _json({"error": "Missing q param", "items": []}), 400
+    data = sc_get("/search/tracks", q=q, limit=24, offset=0)
+    if not data:
+        return _json({"error": "SoundCloud blocked the request", "items": []}), 502
+    items = []
+    for t in data.get("collection") or []:
+        if not t.get("id") or not t.get("title"):
+            continue
+        art = (t.get("artwork_url") or "").replace("large", "t500x500")
+        if not art:
+            art = (t.get("user") or {}).get("avatar_url") or ""
+        items.append({
+            "videoId": f"sc:{t['id']}",
+            "title": t.get("title", ""),
+            "author": (t.get("user") or {}).get("username", "Unknown"),
+            "thumb": art or "",
+            "duration": int((t.get("duration") or 0) / 1000),
+        })
+    return _json({"items": items, "count": len(items), "source": "soundcloud"})
+
+
+@app.route("/api/sc/stream")
+def sc_stream():
+    vid = (request.args.get("id") or "").strip()
+    if not vid:
+        return _json({"error": "Missing id param"}), 400
+    sc_id = vid.replace("sc:", "")
+    if not sc_id.isdigit():
+        return _json({"error": "Invalid id", "id": vid}), 400
+    # fetch the track by id
+    data = sc_get(f"/tracks/{sc_id}")
+    if not data:
+        return _json({"error": "Track not found", "id": vid}), 404
+    stream = sc_resolve_stream(data)
+    if not stream:
+        return _json({"error": "No playable stream", "id": vid}), 502
+    return _json({
+        "id": vid,
+        "title": data.get("title", ""),
+        "author": (data.get("user") or {}).get("username", ""),
+        "lengthSeconds": int((data.get("duration") or 0) / 1000),
+        "url": stream["url"],
+        "mimeType": stream["mimeType"],
+        "protocol": stream["protocol"],
+    })
 
 
 @app.route("/api/catalog")

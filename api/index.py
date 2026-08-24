@@ -163,13 +163,17 @@ def api_stream():
     if not slug:
         return jsonify({"status": False, "error": 'Missing "slug" query param'}), 400
 
-    watch_url = f"{BASE}/watch/{slug}/"
+    watch_candidates = []
     if ep and ep != "1":
-        watch_url = f"{BASE}/watch/{slug}/episode-{ep}/"
+        watch_candidates.append(f"{BASE}/watch/{slug}/episode-{ep}/")
+    watch_candidates.append(f"{BASE}/watch/{slug}/episode-1/")
+    watch_candidates.append(f"{BASE}/watch/{slug}/")
 
-    cfg = get_player_config(watch_url)
-    if not cfg:
-        cfg = get_player_config(f"{BASE}/watch/{slug}/")
+    cfg = None
+    for w in watch_candidates:
+        cfg = get_player_config(w)
+        if cfg:
+            break
     if not cfg:
         return jsonify({"status": False, "error": f"Could not resolve player config for {slug}"}), 404
 

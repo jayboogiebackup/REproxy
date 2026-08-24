@@ -20,7 +20,7 @@ import os
 import re
 from urllib.parse import quote
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 
 try:
     from curl_cffi import requests as cf_requests
@@ -265,6 +265,49 @@ def ytmusic_stream():
         except Exception:
             continue
     return jsonify({"error": "Could not get a playable stream (blocked)", "id": vid}), 502
+
+
+@app.route("/api/ytmusic/play")
+def ytmusic_play():
+    """Relay the audio stream through the proxy (avoids YouTube IP-locking the URL).
+
+    The /stream endpoint returns a direct googlevideo URL bound to the proxy's IP.
+    Browsers on other IPs get 403. This endpoint fetches the bytes server-side
+    and streams them back so playback always works. CORS * for the <audio> tag.
+    """
+    vid = (request.args.get("id") or "").strip()
+    if not vid:
+        return jsonify({"error": "Missing id param"}), 400
+    # Resolve the stream URL first (reuse the resolution logic)
+    import urllib.request as _ur
+
+    resolved = None
+    # quick inline resolution: hit our own stream endpoint
+    try:
+        with _ur.urlopen(f"{request.host_url}api/ytmusic/stream?id={vid}", timeout=25) as r:
+            data = json.loads(r.read().decode())
+        resolved = data.get("url") or data.get("hls")
+    except Exception:
+        resolved = None
+    if not resolved:
+        return jsonify({"error": "Could not resolve stream", "id": vid}), 502
+    if cf_requests is None:
+        return jsonify({"error": "curl_cffi unavailable"}), 502
+    try:
+        r = cf_requests.get(resolved, impersonate="chrome", timeout=30, stream=True)
+        if r.status_code != 200:
+            return jsonify({"error": f"Upstream {r.status_code}"}), 502
+        resp = Response(
+            r.iter_content(chunk_size=64 * 1024),
+            status=200,
+            mimetype=r.headers.get("Content-Type", "audio/mp4"),
+        )
+        resp.headers["Content-Disposition"] = "inline"
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp
+    except Exception as e:
+        return jsonify({"error": f"Relay failed: {e}"}), 502
 
 
 def _rot13(s: str) -> str:

@@ -316,15 +316,17 @@ def api_xreels():
     subs = XREELS_SUBS.get(cat) or XREELS_SUBS["for-you"]
     after = request.args.get("after")
 
-    posts, next_after = [], None
+    posts, next_after, debug = [], None, {}
     for sub in subs[:6]:
         url = f"https://www.reddit.com/r/{sub}/hot.json?limit={limit}"
         if after:
             url += f"&after={after}"
         data = _reddit_get(url)
         if not data:
+            debug[sub] = "blocked/err"
             continue
         children = (data.get("data") or {}).get("children") or []
+        debug[sub] = f"ok children={len(children)}"
         for c in children:
             p = c.get("data") or {}
             if not p.get("over_18"):
@@ -337,7 +339,7 @@ def api_xreels():
 
     import random
     random.shuffle(posts)
-    return jsonify({"posts": posts[:limit * 2], "after": next_after, "count": len(posts), "source": "reddit"})
+    return jsonify({"posts": posts[:limit * 2], "after": next_after, "count": len(posts), "source": "reddit", "debug": debug})
 
 
 @app.route("/api/catalog")

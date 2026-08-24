@@ -237,6 +237,109 @@ def api_search():
     )
 
 
+XREELS_SUBS = {
+    "for-you": ["nsfw", "gonewild", "realgirls", "nsfw_gif", "legalteens", "petitegonewild", "ass", "boobs", "thick", "asiansgonewild", "creampies", "cumsluts", "blowjobs", "milf", "mombod", "pawg", "tiktoknsfw"],
+    "amateur": ["realgirls", "gonewild", "amateur", "homegrown", "petitegonewild"],
+    "ass": ["ass", "bigasses", "pawg", "thick", "booty", "asstastic"],
+    "boobs": ["boobs", "bigboobs", "busty", "hugeboobs", "smallboobs"],
+    "blowjob": ["blowjobs", "blowjob", "girlsfinishingthejob", "deepthroat"],
+    "creampie": ["creampies", "creampie"],
+    "milf": ["milf", "mombod", "cougars", "hotmoms"],
+    "asian": ["asiansgonewild", "asiannsfw", "asiangirls"],
+    "lesbian": ["lesbians", "lesbian"],
+    "gifs": ["nsfw_gif", "porn_gifs"],
+}
+
+
+def _reddit_get(url: str) -> dict | None:
+    """Fetch reddit JSON with Chrome TLS impersonation (bypasses curl's fingerprint block)."""
+    if cf_requests is None:
+        return None
+    try:
+        r = cf_requests.get(
+            url,
+            impersonate="chrome",
+            timeout=25,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        if r.status_code != 200:
+            return None
+        try:
+            return r.json()
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _reel_from_post(p: dict) -> dict | None:
+    """Extract a playable reel from a reddit post dict."""
+    media = None
+    if p.get("is_video") and p.get("media", {}).get("reddit_video"):
+        media = p["media"]["reddit_video"]
+    cp = p.get("crosspost_parent_list") or []
+    if not media and cp and cp[0].get("is_video") and cp[0].get("media", {}).get("reddit_video"):
+        media = cp[0]["media"]["reddit_video"]
+        p = cp[0]
+    if not media:
+        return None
+    poster = None
+    try:
+        poster = (p.get("preview", {}).get("images", [{}])[0].get("source", {}).get("url") or "").replace("&amp;", "&") or None
+    except Exception:
+        poster = None
+    return {
+        "id": p.get("id"),
+        "title": p.get("title"),
+        "subreddit": p.get("subreddit"),
+        "video": media.get("hls_url") or media.get("dash_url") or media.get("fallback_url", "").split("?")[0],
+        "poster": poster or p.get("thumbnail") or None,
+        "duration": media.get("duration") or 0,
+        "width": media.get("width") or 0,
+        "height": media.get("height") or 0,
+        "ups": p.get("ups") or 0,
+        "num_comments": p.get("num_comments") or 0,
+        "url": "https://www.reddit.com" + (p.get("permalink") or ""),
+        "created": p.get("created_utc") or 0,
+    }
+
+
+@app.route("/api/xreels")
+def api_xreels():
+    """GET /api/xreels?cat=for-you&limit=12 — reddit video reels (kinkgrid-style feed)."""
+    cat = (request.args.get("cat") or "for-you").strip().lower()
+    limit = max(5, min(25, int(request.args.get("limit") or "12")))
+    subs = XREELS_SUBS.get(cat) or XREELS_SUBS["for-you"]
+    after = request.args.get("after")
+
+    posts, next_after = [], None
+    for sub in subs[:6]:
+        url = f"https://www.reddit.com/r/{sub}/hot.json?limit={limit}"
+        if after:
+            url += f"&after={after}"
+        data = _reddit_get(url)
+        if not data:
+            continue
+        children = (data.get("data") or {}).get("children") or []
+        for c in children:
+            p = c.get("data") or {}
+            if not p.get("over_18"):
+                continue
+            reel = _reel_from_post(p)
+            if reel and reel.get("video"):
+                posts.append(reel)
+        if not next_after and (data.get("data") or {}).get("after"):
+            next_after = data["data"]["after"]
+
+    import random
+    random.shuffle(posts)
+    return jsonify({"posts": posts[:limit * 2], "after": next_after, "count": len(posts), "source": "reddit"})
+
+
 @app.route("/api/catalog")
 def api_catalog():
     tag = (request.args.get("tag") or "hanime").strip().lower()

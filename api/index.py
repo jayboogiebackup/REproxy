@@ -16,6 +16,7 @@ Endpoints:
 """
 import base64
 import json
+import os
 import re
 from urllib.parse import quote
 
@@ -251,11 +252,67 @@ XREELS_SUBS = {
 }
 
 
-def _reddit_get(url: str) -> dict | None:
-    """Fetch reddit JSON with Chrome TLS impersonation (bypasses curl's fingerprint block)."""
-    if cf_requests is None:
+_reddit_token_cache = {"token": None, "expires": 0}
+
+
+def _reddit_oauth_token() -> str | None:
+    """Get an OAuth token for Reddit's official API (oauth.reddit.com).
+
+    Uses REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET env vars (script app,
+    read-only — free to create at reddit.com/prefs/apps). Without them,
+    falls back to the scraping endpoint.
+    """
+    now = int(__import__("time").time())
+    if _reddit_token_cache["token"] and _reddit_token_cache["expires"] > now + 60:
+        return _reddit_token_cache["token"]
+    cid = os.environ.get("REDDIT_CLIENT_ID")
+    sec = os.environ.get("REDDIT_CLIENT_SECRET")
+    if not cid or not sec or cf_requests is None:
         return None
     try:
+        r = cf_requests.post(
+            "https://www.reddit.com/api/v1/access_token",
+            data={"grant_type": "client_credentials"},
+            auth=(cid, sec),
+            impersonate="chrome",
+            timeout=20,
+            headers={"User-Agent": "linux:xreels.repeaks:v1.0 (by /u/xreels_bot)"},
+        )
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        tok = j.get("access_token")
+        if tok:
+            _reddit_token_cache["token"] = tok
+            _reddit_token_cache["expires"] = now + int(j.get("expires_in", 3600))
+        return tok
+    except Exception:
+        return None
+
+
+def _reddit_get(url: str) -> dict | None:
+    """Fetch reddit JSON — official OAuth API first, scraping fallback."""
+    if cf_requests is None:
+        return None
+    token = _reddit_oauth_token()
+    try:
+        if token:
+            r = cf_requests.get(
+                url.replace("https://www.reddit.com", "https://oauth.reddit.com"),
+                impersonate="chrome",
+                timeout=25,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "User-Agent": "linux:xreels.repeaks:v1.0 (by /u/xreels_bot)",
+                    "Accept": "application/json",
+                },
+            )
+            if r.status_code == 200:
+                try:
+                    return r.json()
+                except Exception:
+                    return None
+        # fallback: scraping (chrome impersonation)
         r = cf_requests.get(
             url,
             impersonate="chrome",
@@ -317,6 +374,7 @@ def api_xreels():
     after = request.args.get("after")
 
     posts, next_after, debug = [], None, {}
+    debug["oauth"] = "configured" if os.environ.get("REDDIT_CLIENT_ID") else "not-configured"
     for sub in subs[:6]:
         url = f"https://www.reddit.com/r/{sub}/hot.json?limit={limit}"
         if after:

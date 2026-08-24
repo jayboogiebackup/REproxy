@@ -69,6 +69,157 @@ def http_get(url: str) -> str | None:
         return None
 
 
+# ═══════════════ YouTube InnerTube (RE:music) ═══════════════
+
+YT_API = "https://www.youtube.com/youtubei/v1"
+YT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+def yt_post(endpoint: str, body: dict) -> dict | None:
+    if cf_requests is None:
+        return None
+    try:
+        r = cf_requests.post(
+            f"{YT_API}/{endpoint}?prettyPrint=false",
+            impersonate="chrome",
+            timeout=25,
+            headers={
+                "User-Agent": YT_UA,
+                "Content-Type": "application/json",
+                "Accept": "*/*",
+                "Origin": "https://www.youtube.com",
+                "Referer": "https://www.youtube.com/",
+            },
+            json={"context": {"client": {"clientName": "WEB", "clientVersion": "2.20240701.01.00"}}, **body},
+        )
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def yt_walk(node, out: list):
+    """Recursively collect videoRenderer items from InnerTube responses."""
+    if isinstance(node, dict):
+        if "videoRenderer" in node and isinstance(node["videoRenderer"], dict):
+            out.append(node["videoRenderer"])
+        if "videoWithContextRenderer" in node and isinstance(node["videoWithContextRenderer"], dict):
+            out.append(node["videoWithContextRenderer"])
+        for v in node.values():
+            yt_walk(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            yt_walk(v, out)
+
+
+def yt_dur(text) -> int:
+    if not text:
+        return 0
+    try:
+        parts = [int(x) for x in str(text).split(":")]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        return parts[0] or 0
+    except Exception:
+        return 0
+
+
+def yt_map(v: dict) -> dict | None:
+    vid = v.get("videoId")
+    if not vid:
+        return None
+    title_r = v.get("title") or {}
+    title = (title_r.get("runs") or [{}])[0].get("text") or title_r.get("simpleText") or ""
+    if not title:
+        return None
+    owner_r = v.get("ownerText") or {}
+    author = (owner_r.get("runs") or [{}])[0].get("text") or (v.get("shortBylineText") or {}).get("runs", [{}])[0].get("text") or "Unknown"
+    dt = v.get("lengthText") or {}
+    dur_text = dt.get("simpleText") or "".join(x.get("text", "") for x in (dt.get("runs") or []))
+    thumbs = (v.get("thumbnail") or {}).get("thumbnails") or []
+    thumb = (thumbs[-1].get("url") if thumbs else None) or f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+    thumb = thumb.split("?")[0]
+    return {"videoId": vid, "title": title, "author": author, "thumb": thumb, "duration": yt_dur(dur_text)}
+
+
+@app.route("/api/ytmusic/search")
+def ytmusic_search():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"error": "Missing q param", "items": []}), 400
+    data = yt_post("search", {"query": q, "params": "EgWKAQIIAWoKEAoQCRADEAA%3D"})
+    if not data:
+        return jsonify({"error": "YouTube blocked the request", "items": []}), 502
+    items: list = []
+    yt_walk(data.get("contents"), items)
+    tracks = [t for t in (yt_map(v) for v in items) if t]
+    return jsonify({"items": tracks, "count": len(tracks), "source": "innertube"})
+
+
+@app.route("/api/ytmusic/stream")
+def ytmusic_stream():
+    vid = (request.args.get("id") or "").strip()
+    if not vid:
+        return jsonify({"error": "Missing id param"}), 400
+    for client in [
+        {"clientName": "WEB", "clientVersion": "2.20240701.01.00"},
+        {"clientName": "ANDROID", "clientVersion": "19.09.37"},
+        {"clientName": "IOS", "clientVersion": "19.09.3"},
+        {"clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER", "clientVersion": "2.0"},
+    ]:
+        if cf_requests is None:
+            break
+        try:
+            r = cf_requests.post(
+                f"{YT_API}/player?prettyPrint=false",
+                impersonate="chrome",
+                timeout=25,
+                headers={
+                    "User-Agent": YT_UA,
+                    "Content-Type": "application/json",
+                    "Accept": "*/*",
+                    "Origin": "https://www.youtube.com",
+                    "Referer": f"https://www.youtube.com/watch?v={vid}",
+                },
+                json={
+                    "context": {"client": client},
+                    "videoId": vid,
+                    "playbackContext": {"contentPlaybackContext": {"html5Preference": "HTML5_PREF_WANTS"}},
+                },
+            )
+            if r.status_code != 200:
+                continue
+            d = r.json()
+            sd = d.get("streamingData") or {}
+            audio = [f for f in sd.get("adaptiveFormats", []) if str(f.get("mimeType", "")).startswith("audio")]
+            if not audio and not sd.get("hlsManifestUrl"):
+                continue
+            audio.sort(key=lambda f: f.get("bitrate") or 0, reverse=True)
+            pick = next((f for f in audio if "mp4" in str(f.get("mimeType", ""))), audio[0] if audio else None)
+            return jsonify({
+                "id": vid,
+                "title": (d.get("videoDetails") or {}).get("title", ""),
+                "author": (d.get("videoDetails") or {}).get("author", ""),
+                "lengthSeconds": int((d.get("videoDetails") or {}).get("lengthSeconds") or 0),
+                "url": (pick or {}).get("url", ""),
+                "mimeType": (pick or {}).get("mimeType", ""),
+                "itag": (pick or {}).get("itag", 0),
+                "bitrate": (pick or {}).get("bitrate", 0),
+                "hls": sd.get("hlsManifestUrl"),
+                "expiresInSeconds": sd.get("expiresInSeconds", 0),
+                "client": client["clientName"],
+            })
+        except Exception:
+            continue
+    return jsonify({"error": "Could not get a playable stream (blocked)", "id": vid}), 502
+
+
 def _rot13(s: str) -> str:
     out = []
     for c in s:

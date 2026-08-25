@@ -765,6 +765,7 @@ def sc_search():
             "author": (t.get("user") or {}).get("username", "Unknown"),
             "thumb": art or "",
             "duration": int((t.get("duration") or 0) / 1000),
+            "permalink": (t.get("permalink_url") or "") or f"https://soundcloud.com/{(t.get('user') or {}).get('permalink') or 'unknown'}/{t.get('permalink') or t.get('id')}",
         })
     return _json({"items": items, "count": len(items), "source": "soundcloud"})
 
@@ -789,6 +790,7 @@ def sc_trending():
             "author": (tr.get("user") or {}).get("username", "Unknown"),
             "thumb": art or "",
             "duration": int((tr.get("duration") or 0) / 1000),
+            "permalink": (tr.get("permalink_url") or "") or f"https://soundcloud.com/{(tr.get('user') or {}).get('permalink') or 'unknown'}/{tr.get('permalink') or tr.get('id')}",
         })
     return _json({"items": items, "count": len(items), "source": "soundcloud"})
 
@@ -812,6 +814,7 @@ def sc_stream():
         "id": vid,
         "title": data.get("title", ""),
         "author": (data.get("user") or {}).get("username", ""),
+        "permalink": (data.get("permalink_url") or "") or f"https://soundcloud.com/{(data.get('user') or {}).get('permalink') or 'unknown'}/{data.get('permalink') or sc_id}",
         "lengthSeconds": int((data.get("duration") or 0) / 1000),
         "url": stream["url"],
         "mimeType": stream["mimeType"],

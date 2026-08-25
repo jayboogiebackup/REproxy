@@ -769,6 +769,30 @@ def sc_search():
     return _json({"items": items, "count": len(items), "source": "soundcloud"})
 
 
+@app.route("/api/sc/trending")
+def sc_trending():
+    """SoundCloud trending/charts — top 24 tracks, same shape as /search."""
+    data = sc_get("/charts", kind="trending", genre="soundcloud:genres:all-music", limit=24, offset=0)
+    if not data:
+        return _json({"error": "SoundCloud blocked the request", "items": []}), 502
+    items = []
+    for t in data.get("collection") or []:
+        tr = t.get("track") or t
+        if not tr.get("id") or not tr.get("title"):
+            continue
+        art = (tr.get("artwork_url") or "").replace("large", "t500x500")
+        if not art:
+            art = (tr.get("user") or {}).get("avatar_url") or ""
+        items.append({
+            "videoId": f"sc:{tr['id']}",
+            "title": tr.get("title", ""),
+            "author": (tr.get("user") or {}).get("username", "Unknown"),
+            "thumb": art or "",
+            "duration": int((tr.get("duration") or 0) / 1000),
+        })
+    return _json({"items": items, "count": len(items), "source": "soundcloud"})
+
+
 @app.route("/api/sc/stream")
 def sc_stream():
     vid = (request.args.get("id") or "").strip()

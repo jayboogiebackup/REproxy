@@ -468,6 +468,8 @@ def api_replayer_relay():
             return f"https://reproxy-seven.vercel.app/api/replayer/relay?url={urllib.parse.quote(base + '/' + rel)}"
 
         body = _re.sub(r"(?m)^([^#\n][^\n]*)$", lambda m: fix(m.group(1)), body)
+        # Also rewrite quoted URIs inside attributes (EXT-X-MAP, EXT-X-KEY...)
+        body = _re.sub(r'URI="([^"]+)"', lambda m: f'URI="{fix(m.group(1))}"', body)
         data = body.encode()
     else:
         ct = "video/mp4" if url.endswith((".mp4", ".jpg", ".png", ".jpeg")) else "application/octet-stream"

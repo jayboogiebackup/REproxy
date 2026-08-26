@@ -196,16 +196,23 @@ async function main() {
     process.exit(2);
   }
 
-  // Primary = English if available; else vidking (originals) over foreign cinesrc; else first
+  // Primary: English if detected; else for TV prefer vidking (English originals)
+  // over cinesrc's often-dubbed tracks; for movies keep cinesrc unless foreign.
   const eng = found.find((f) => f.language === 'eng' || f.language === 'en');
   let primary = eng || null;
+  const FOREIGN = ['ita', 'spa', 'es', 'de', 'fr', 'por', 'pt', 'jpn', 'ja', 'kor', 'ko', 'zho', 'zh', 'ara', 'hi', 'tur', 'tr', 'pol', 'pl', 'rus', 'ru', 'tha', 'th', 'vie', 'vi'];
   if (!primary) {
-    // cinesrc often serves dubbed tracks (ita/spa/...); vidking usually originals
     const vk = found.find((f) => f.provider === 'vidking');
-    const foreignCinesrc = found.find((f) => f.provider === 'cinesrc' && ['ita', 'spa', 'es', 'de', 'fr', 'por', 'pt', 'jpn', 'ja', 'kor', 'ko', 'zho', 'zh', 'ara', 'hi', 'tur', 'tr', 'pol', 'pl', 'rus', 'ru', 'tha', 'th', 'vie', 'vi'].includes(f.language));
-    if (vk && foreignCinesrc) primary = vk;
-    else if (vk) primary = vk;
-    else primary = found[0];
+    const foreignCinesrc = found.find((f) => f.provider === 'cinesrc' && FOREIGN.includes(f.language));
+    if (type === 'tv') {
+      // TV: vidking first (originals); cinesrc backup
+      if (vk) primary = vk;
+      else primary = found[0];
+    } else {
+      // Movie: keep cinesrc unless it's a foreign dub, then vidking
+      if (foreignCinesrc && vk) primary = vk;
+      else primary = found[0];
+    }
   }
   const others = found.filter((f) => f !== primary);
 

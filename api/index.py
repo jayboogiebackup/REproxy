@@ -526,10 +526,12 @@ def api_replayer_stream():
             if data.get("url"):
                     url = data["url"]
                     servers = []
+                    active_provider = data.get("provider", "")
                     for s in data.get("servers", []):
+                        is_active = s.get("provider") == active_provider
                         servers.append({
                             "id": s.get("provider", "cinesrc"),
-                            "name": "VidKing" if s.get("provider") == "vidking" else "RE:player",
+                            "name": "RE:player" if is_active else "Backup",
                             "url": s.get("url"),
                             "language": s.get("language", "unknown"),
                         })

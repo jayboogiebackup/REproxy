@@ -444,10 +444,17 @@ def api_replayer_relay():
     import re as _re
 
     url = request.args.get("url") or ""
-    if not url.startswith("https://nebula.bright67.online/"):
+    allowed_prefixes = (
+        "https://nebula.bright67.online/",
+        "https://moon.peakstorm.top/",
+        "https://rapidnight.top/",
+        "https://stormgate.top/",
+    )
+    if not url.startswith(allowed_prefixes):
         return _json({"status": False, "error": "invalid url"}), 400
 
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://cinesrc.st/"})
+    referer = "https://www.vidking.net/" if url.startswith(("https://moon.peakstorm.top/", "https://rapidnight.top/", "https://stormgate.top/")) else "https://cinesrc.st/"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": referer})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = resp.read()
@@ -513,6 +520,14 @@ def api_replayer_stream():
                 data = json.loads(resp.read().decode())
             if data.get("url"):
                     url = data["url"]
+                    servers = []
+                    for s in data.get("servers", []):
+                        servers.append({
+                            "id": s.get("provider", "cinesrc"),
+                            "name": "VidKing" if s.get("provider") == "vidking" else "RE:player",
+                            "url": s.get("url"),
+                            "language": s.get("language", "unknown"),
+                        })
                     return _json({
                         "status": True,
                         "player": "RE:player",
@@ -522,9 +537,12 @@ def api_replayer_stream():
                         "season": int(season) if season else None,
                         "episode": int(episode) if episode else None,
                         "url": url,
+                        "provider": data.get("provider", "cinesrc"),
+                        "language": data.get("language", "unknown"),
                         "quality": data.get("quality", "1080p/720p/480p"),
                         "cached": data.get("cached", False),
                         "ms": data.get("ms"),
+                        "servers": servers,
                         "fallback_embed": f"https://cinesrc.st/embed/{'tv' if mtype == 'tv' else 'movie'}/{tmdb}" + (
                             f"?s={season or 1}&e={episode or 1}" if mtype == "tv" else ""
                         ),

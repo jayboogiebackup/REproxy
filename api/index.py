@@ -433,6 +433,193 @@ def api_health():
     )
 
 
+"""────────────────────────────────────────────────────────────
+HENTAIMAMA scraper (for the 18+ category on repeaks)
+────────────────────────────────────────────────────────────"""
+HMM_BASE = "https://hentaimama.io"
+
+def _hmm_get(url, timeout=25):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+        "Referer": HMM_BASE + "/",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def _hmm_post(url, data, timeout=25):
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode(),
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": HMM_BASE + "/",
+            "Content-Type": "application/x-www-form-urlencoded",
+        })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def _hmm_show_slug(url):
+    """/tvshows/{slug}/ or /hentai/{slug}/ → slug"""
+    m = re.search(r"/(?:tvshows|hentai)/([^/]+)/?$", url)
+    return m.group(1) if m else ""
+
+
+def _hmm_parse_show(h, url):
+    """Extract title, poster, episodes from a show page HTML."""
+    title = ""
+    m = re.search(r"<title>Stream ([^<]+?) hentai", h)
+    if m:
+        title = m.group(1).strip()
+    else:
+        m = re.search(r'<h1[^>]*class="text"[^>]*>([^<]+)<', h)
+        if m: title = m.group(1).strip()
+    poster = ""
+    m = re.search(r'class="poster"[^>]*>', h)
+    if m:
+        seg = h[m.start():m.start()+700]
+        im = re.search(r'(?:data-src|src)="([^"]+)"', seg)
+        if im: poster = im.group(1)
+    eps = sorted(set(re.findall(r'href="(https://hentaimama\.io/episodes/[^"]+)"', h)))
+    episodes = []
+    for e in eps:
+        em = re.search(r"/episodes/(.+?)-episode-(\d+)/?$", e)
+        if em:
+            episodes.append({"url": e, "slug": em.group(1), "episode": int(em.group(2))})
+    return {"title": title, "poster": poster, "url": url, "episodes": episodes}
+
+
+@app.route("/api/hmm/catalog")
+def api_hmm_catalog():
+    """Catalog of all shows. GET /api/hmm/catalog (page 0) or ?page=1..N
+    Each page scrapes ~50 shows from the alphabet listing."""
+    page = int(request.args.get("page") or 0)
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    pages = []
+    if page == 0:
+        # homepage: latest 32
+        try:
+            h = _hmm_get(f"{HMM_BASE}/")
+            seen = set()
+            for m in re.finditer(r'href="(https://hentaimama\.io/(?:tvshows|hentai)/[^"]+)"', h):
+                u = m.group(1)
+                if u not in seen:
+                    seen.add(u)
+                    pages.append({"url": u, "slug": _hmm_show_slug(u), "source": "home"})
+        except Exception:
+            pass
+    else:
+        letter = letters[(page - 1) % 26]
+        page_num = (page - 1) // 26
+        url = f"{HMM_BASE}/?letter=true&s=title-{letter}"
+        if page_num:
+            url += f"&page={page_num + 1}"
+        try:
+            h = _hmm_get(url)
+            for m in re.finditer(r'<article[^>]*class="[^"]*item tvshows[^"]*"[^>]*>(.*?)</article>', h, re.S):
+                it = m.group(1)
+                a = re.search(r'href="([^"]+)"', it)
+                img = re.search(r'(?:data-src|src)="([^"]+)"', it)
+                txt = re.sub(r"<[^>]+>", " ", it)
+                txt = " ".join(txt.split())
+                tm = re.search(r"^(\d+(?:\.\d+)?)\s*(.*?)\s*(\d{4})$", txt)
+                pages.append({
+                    "url": a.group(1) if a else "",
+                    "slug": _hmm_show_slug(a.group(1)) if a else "",
+                    "title": tm.group(2).strip() if tm else txt[:80],
+                    "rating": float(tm.group(1)) if tm else None,
+                    "year": int(tm.group(3)) if tm else None,
+                    "poster": img.group(1) if img else "",
+                })
+        except Exception:
+            pass
+    return _json({"status": True, "page": page, "results": pages})
+
+
+@app.route("/api/hmm/search")
+def api_hmm_search():
+    """Search hentaimama via the site's own search page.
+    GET /api/hmm/search?q=nekopara"""
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return _json({"status": False, "error": "missing q"}), 400
+    try:
+        h = _hmm_get(f"{HMM_BASE}/search/{urllib.parse.quote(q)}/")
+        shows = []
+        for m in re.finditer(r'<article[^>]*class="[^"]*item tvshows[^"]*"[^>]*>(.*?)</article>', h, re.S):
+            it = m.group(1)
+            a = re.search(r'href="([^"]+)"', it)
+            img = re.search(r'(?:data-src|src)="([^"]+)"', it)
+            txt = " ".join(re.sub(r"<[^>]+>", " ", it).split())
+            tm = re.search(r"^(\d+(?:\.\d+)?)\s*(.*?)\s*(\d{4})$", txt)
+            shows.append({
+                "url": a.group(1) if a else "",
+                "slug": _hmm_show_slug(a.group(1)) if a else "",
+                "title": tm.group(2).strip() if tm else txt[:80],
+                "rating": float(tm.group(1)) if tm else None,
+                "year": int(tm.group(3)) if tm else None,
+                "poster": img.group(1) if img else "",
+            })
+        # fallback: if no articles, grab any tvshows links
+        if not shows:
+            seen = set()
+            for m in re.finditer(r'href="(https://hentaimama\.io/(?:tvshows|hentai)/[^"]+)"', h):
+                u = m.group(1)
+                if u not in seen:
+                    seen.add(u)
+                    shows.append({"url": u, "slug": _hmm_show_slug(u)})
+        return _json({"status": True, "query": q, "results": shows[:24]})
+    except Exception as exc:
+        return _json({"status": False, "error": str(exc)}), 502
+
+
+@app.route("/api/hmm/show")
+def api_hmm_show():
+    """Show details + episodes. GET /api/hmm/show?url=<tvshows url>"""
+    url = request.args.get("url") or ""
+    if "hentaimama.io" not in url:
+        return _json({"status": False, "error": "invalid url"}), 400
+    try:
+        h = _hmm_get(url)
+        return _json({"status": True, **_hmm_parse_show(h, url)})
+    except Exception as exc:
+        return _json({"status": False, "error": str(exc)}), 502
+
+
+@app.route("/api/hmm/episode")
+def api_hmm_episode():
+    """Resolve an episode's video. GET /api/hmm/episode?url=<episode url>
+    Returns the direct MP4 (gdvid.info) + embed fallback."""
+    url = request.args.get("url") or ""
+    if "hentaimama.io" not in url or "/episodes/" not in url:
+        return _json({"status": False, "error": "invalid episode url"}), 400
+    try:
+        h = _hmm_get(url)
+        pm = re.search(r'data-id="(\d+)"', h)
+        if not pm:
+            return _json({"status": False, "error": "post id not found"}), 502
+        pid = pm.group(1)
+        ajax = _hmm_post(f"{HMM_BASE}/wp-admin/admin-ajax.php",
+                         {"action": "get_player_contents", "a": pid})
+        embeds = json.loads(ajax)
+        direct = ""
+        for emb in embeds:
+            fm = re.search(r'src="(https://hentaimama\.io/(?:new2|newjav)\.php\?p=[^"]+)"', emb)
+            if fm:
+                p_url = fm.group(1).replace("\\/", "/")
+                try:
+                    ph = _hmm_get(p_url)
+                    fm2 = re.search(r'file:\s*"([^"]+)"', ph)
+                    if fm2:
+                        direct = fm2.group(1)
+                        break
+                except Exception:
+                    continue
+        return _json({"status": True, "episode_url": url, "url": direct, "embeds": embeds})
+    except Exception as exc:
+        return _json({"status": False, "error": str(exc)}), 502
+
+
 @app.route("/api/replayer/relay")
 def api_replayer_relay():
     """Relay the nebula HLS stream with corrected content-types.
@@ -452,13 +639,15 @@ def api_replayer_relay():
         "https://papercobra.top/",
         "https://tiktoks.animanga.fun/",
         "https://streamvaultsrc.click/",
+        "https://gdvid.info/",
     )
     if not url.startswith(allowed_prefixes):
         return _json({"status": False, "error": "invalid url"}), 400
 
-    referer = "https://vidnest.fun/" if url.startswith(("https://tiktoks.animanga.fun/", "https://streamvaultsrc.click/")) else (
+    referer = "https://hentaimama.io/" if url.startswith("https://gdvid.info/") else (
+        "https://vidnest.fun/" if url.startswith(("https://tiktoks.animanga.fun/", "https://streamvaultsrc.click/")) else (
         "https://www.vidking.net/" if url.startswith(("https://moon.peakstorm.top/", "https://rapidnight.top/", "https://stormgate.top/", "https://papercobra.top/")) else "https://cinesrc.st/"
-    )
+    ))
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": referer})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:

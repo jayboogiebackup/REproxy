@@ -525,16 +525,6 @@ def api_replayer_stream():
                 data = json.loads(resp.read().decode())
             if data.get("url"):
                     url = data["url"]
-                    servers = []
-                    active_provider = data.get("provider", "")
-                    for s in data.get("servers", []):
-                        is_active = s.get("provider") == active_provider
-                        servers.append({
-                            "id": s.get("provider", "cinesrc"),
-                            "name": "RE:player" if is_active else "Backup",
-                            "url": s.get("url"),
-                            "language": s.get("language", "unknown"),
-                        })
                     return _json({
                         "status": True,
                         "player": "RE:player",
@@ -544,15 +534,11 @@ def api_replayer_stream():
                         "season": int(season) if season else None,
                         "episode": int(episode) if episode else None,
                         "url": url,
-                        "provider": data.get("provider", "cinesrc"),
-                        "language": data.get("language", "unknown"),
+                        "provider": data.get("provider", "vidking"),
                         "quality": data.get("quality", "1080p/720p/480p"),
                         "cached": data.get("cached", False),
                         "ms": data.get("ms"),
-                        "servers": servers,
-                        "fallback_embed": f"https://cinesrc.st/embed/{'tv' if mtype == 'tv' else 'movie'}/{tmdb}" + (
-                            f"?s={season or 1}&e={episode or 1}" if mtype == "tv" else ""
-                        ),
+                        "servers": [{"id": "vidking", "name": "RE:player", "url": url}],
                     })
         except Exception as exc:
             return _json({"status": False, "error": f"resolver error: {exc}"}), 502

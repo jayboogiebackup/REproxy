@@ -131,7 +131,7 @@ async function resolveCinesrc(tmdb, type, season, episode) {
   }
 }
 
-/** Resolve via vidking (rapidnight/moon CDN). */
+/** Resolve via vidking (rapidnight/moon CDN) — fast path. */
 async function resolveVidking(tmdb, type, season, episode) {
   const browser = await chromium.launch({ executablePath: CHROME, headless: true, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'] });
   try {
@@ -141,14 +141,16 @@ async function resolveVidking(tmdb, type, season, episode) {
     page.on('request', (req) => {
       const u = req.url();
       if (!streamUrl && /moon\.peakstorm\.top\/r2\/cdn2\/[^/]+\/.*\/index\.m3u8/.test(u)) streamUrl = u;
+      // Abort heavy media so we resolve the URL without buffering video
+      if (/stormgate\.top|\.mp4|\.m3u8/.test(u) && !streamUrl) req.abort();
     });
     const embedUrl = type === 'tv'
       ? `https://www.vidking.net/embed/tv/${tmdb}/${season}/${episode}?color=eee8dc&autoPlay=true`
       : `https://www.vidking.net/embed/movie/${tmdb}?color=eee8dc&autoPlay=true`;
-    await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    try { await page.waitForSelector('video', { timeout: 25000 }); } catch {}
-    const deadline = Date.now() + 20000;
-    while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(500);
+    await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    // Don't wait for the video element — just poll for the m3u8 request
+    const deadline = Date.now() + 12000;
+    while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(250);
     return streamUrl;
   } finally {
     await browser.close();
@@ -177,50 +179,23 @@ async function main() {
   }
 
   const t0 = Date.now();
-  const providers = provider === 'auto' ? ['cinesrc', 'vidking'] : [provider];
 
-  // Resolve ALL providers, probe each, return primary (English preferred) + full list
-  const found = [];
-  for (const prov of providers) {
-    let url = null;
-    try {
-      url = prov === 'vidking' ? await resolveVidking(tmdb, type, season, episode) : await resolveCinesrc(tmdb, type, season, episode);
-    } catch { url = null; }
-    if (!url) continue;
-    const lang = await probeAudioLanguage(url, prov === 'vidking' ? 'https://www.vidking.net/' : 'https://cinesrc.st/');
-    found.push({ provider: prov, url, language: lang });
-  }
+  // VIDKING ONLY — single fast path, no backup, no audio probing (saves ~5-8s)
+  let url = null;
+  try {
+    url = await resolveVidking(tmdb, type, season, episode);
+  } catch { url = null; }
 
-  if (!found.length) {
+  if (!url) {
     console.log(JSON.stringify({ error: 'resolve_failed', tmdb, type, season, episode, ms: Date.now() - t0 }));
     process.exit(2);
   }
 
-  // Primary: English if detected; else for TV prefer vidking (English originals)
-  // over cinesrc's often-dubbed tracks; for movies keep cinesrc unless foreign.
-  const eng = found.find((f) => f.language === 'eng' || f.language === 'en');
-  let primary = eng || null;
-  const FOREIGN = ['ita', 'spa', 'es', 'de', 'fr', 'por', 'pt', 'jpn', 'ja', 'kor', 'ko', 'zho', 'zh', 'ara', 'hi', 'tur', 'tr', 'pol', 'pl', 'rus', 'ru', 'tha', 'th', 'vie', 'vi'];
-  if (!primary) {
-    const vk = found.find((f) => f.provider === 'vidking');
-    const foreignCinesrc = found.find((f) => f.provider === 'cinesrc' && FOREIGN.includes(f.language));
-    if (type === 'tv') {
-      // TV: vidking first (originals); cinesrc backup
-      if (vk) primary = vk;
-      else primary = found[0];
-    } else {
-      // Movie: keep cinesrc unless it's a foreign dub, then vidking
-      if (foreignCinesrc && vk) primary = vk;
-      else primary = found[0];
-    }
-  }
-  const others = found.filter((f) => f !== primary);
-
   const result = {
     tmdb, type, season: season ?? null, episode: episode ?? null,
-    url: primary.url, provider: primary.provider, language: primary.language,
+    url, provider: 'vidking',
     quality: '1080p/720p/480p',
-    servers: found.map((f) => ({ provider: f.provider, url: f.url, language: f.language })),
+    servers: [{ provider: 'vidking', url }],
     cached: false, ms: Date.now() - t0,
   };
 

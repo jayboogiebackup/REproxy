@@ -18,6 +18,8 @@ import base64
 import json
 import os
 import re
+import urllib.request
+import urllib.parse
 from urllib.parse import quote
 
 from flask import Flask, jsonify, request, Response
@@ -456,10 +458,11 @@ def api_replayer_stream():
             if mtype == "tv":
                 params["season"] = season or "1"
                 params["episode"] = episode or "1"
-            r = requests.get(f"{resolver}/resolve", params=params, timeout=60)
-            if r.ok:
-                data = r.json()
-                if data.get("url"):
+            qs = urllib.parse.urlencode(params)
+            req = urllib.request.Request(f"{resolver}/resolve?{qs}", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode())
+            if data.get("url"):
                     url = data["url"]
                     return _json({
                         "status": True,

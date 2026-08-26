@@ -431,6 +431,69 @@ def api_health():
     )
 
 
+@app.route("/api/replayer/stream")
+def api_replayer_stream():
+    """RE:player standalone stream — direct HLS from the resolver service.
+    GET /api/replayer/stream?tmdb=387&type=tv&season=1&episode=1
+    Returns the resolved nebula m3u8 + metadata. Falls back to the cinesrc
+    embed URL if the resolver is down.
+    """
+    tmdb = (request.args.get("tmdb") or "").strip()
+    mtype = (request.args.get("type") or "").strip()
+    season = (request.args.get("season") or "").strip()
+    episode = (request.args.get("episode") or "").strip()
+    if not tmdb or mtype not in ("movie", "tv"):
+        return _json({"status": False, "error": "tmdb (number) + type (movie|tv) required"}), 400
+
+    resolver = os.environ.get("RESOLVER_URL", "").rstrip("/")
+    url = None
+    if resolver:
+        try:
+            params = {"tmdb": tmdb, "type": mtype}
+            if mtype == "tv":
+                params["season"] = season or "1"
+                params["episode"] = episode or "1"
+            r = requests.get(f"{resolver}/resolve", params=params, timeout=60)
+            if r.ok:
+                data = r.json()
+                if data.get("url"):
+                    url = data["url"]
+                    return _json({
+                        "status": True,
+                        "player": "RE:player",
+                        "source": "direct-hls",
+                        "tmdb": int(tmdb),
+                        "type": mtype,
+                        "season": int(season) if season else None,
+                        "episode": int(episode) if episode else None,
+                        "url": url,
+                        "quality": data.get("quality", "1080p/720p/480p"),
+                        "cached": data.get("cached", False),
+                        "ms": data.get("ms"),
+                        "fallback_embed": f"https://cinesrc.st/embed/{'tv' if mtype == 'tv' else 'movie'}/{tmdb}" + (
+                            f"?s={season or 1}&e={episode or 1}" if mtype == "tv" else ""
+                        ),
+                    })
+        except Exception as exc:
+            return _json({"status": False, "error": f"resolver error: {exc}"}), 502
+
+    # Resolver unavailable → give the embed fallback
+    if mtype == "tv":
+        embed = f"https://cinesrc.st/embed/tv/{tmdb}?s={season or 1}&e={episode or 1}"
+    else:
+        embed = f"https://cinesrc.st/embed/movie/{tmdb}"
+    return _json({
+        "status": True,
+        "player": "RE:player",
+        "source": "embed-fallback",
+        "tmdb": int(tmdb),
+        "type": mtype,
+        "season": int(season) if season else None,
+        "episode": int(episode) if episode else None,
+        "url": embed,
+    })
+
+
 @app.route("/api/stream")
 def api_stream():
     slug = (request.args.get("slug") or "").strip()

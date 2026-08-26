@@ -497,25 +497,41 @@ def api_hmm_catalog():
     letters = "abcdefghijklmnopqrstuvwxyz"
     pages = []
     if page == 0:
-        # homepage: latest items with titles
+        # homepage: latest items — title from the series span, dedupe by series
         try:
             h = _hmm_get(f"{HMM_BASE}/")
             seen = set()
-            # item blocks carry title + poster + link
-            for m in re.finditer(r'class="item (?:tvshows|se|episodes)[^"]*"[^>]*>(.*?)(?=class="item |<footer|</div>\s*</section)', h, re.S):
+            for m in re.finditer(r'<article[^>]*class="[^"]*item tvshows[^"]*"[^>]*>(.*?)</article>', h, re.S):
                 it = m.group(1)
-                a = re.search(r'href="(https://hentaimama\.io/(?:tvshows|hentai)/[^"]+)"', it)
+                # prefer the show link, else the episode link
+                a = re.search(r'href="(https://hentaimama\.io/tvshows/[^"]+)"', it)
+                if not a:
+                    a = re.search(r'href="(https://hentaimama\.io/(?:hentai|episodes)/[^"]+)"', it)
                 if not a:
                     continue
                 u = a.group(1)
-                if u in seen:
+                # normalize episode links to their show slug for dedupe
+                key = u
+                em = re.search(r"/episodes/(.+?)-episode-\d+/?$", u)
+                if em:
+                    key = "https://hentaimama.io/tvshows/" + em.group(1) + "/"
+                if key in seen:
                     continue
-                seen.add(u)
-                img = re.search(r'(?:data-src|src)="([^"]+)"', it)
-                tm = re.search(r"<h3[^>]*>([^<]+)<", it) or re.search(r'title="([^"]+)"', it)
+                seen.add(key)
+                img = re.search(r'data-src="([^"]+)"', it) or re.search(r'src="([^"]+)"', it)
+                sm = re.search(r'<span class="serie">([^<]+)<', it)
+                altm = re.search(r'alt="([^"]+)"', it)
+                rm = re.search(r'<div class="rating">[^0-9]*([\d.]+)', it)
+                title = ""
+                if sm:
+                    title = sm.group(1).strip()
+                elif altm:
+                    title = re.sub(r"\s*(Episode \d+|EP\s*\d+)\s*$", "", altm.group(1)).strip()
                 pages.append({
-                    "url": u, "slug": _hmm_show_slug(u),
-                    "title": tm.group(1).strip() if tm else _hmm_show_slug(u).replace("-", " ").title(),
+                    "url": key if key.startswith("https://hentaimama.io/tvshows") else u,
+                    "slug": _hmm_show_slug(key if key.startswith("https://hentaimama.io/tvshows") else u),
+                    "title": title or _hmm_show_slug(u).replace("-", " ").title(),
+                    "rating": float(rm.group(1)) if rm else None,
                     "poster": img.group(1) if img else "",
                     "source": "home",
                 })

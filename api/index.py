@@ -450,11 +450,15 @@ def api_replayer_relay():
         "https://rapidnight.top/",
         "https://stormgate.top/",
         "https://papercobra.top/",
+        "https://tiktoks.animanga.fun/",
+        "https://streamvaultsrc.click/",
     )
     if not url.startswith(allowed_prefixes):
         return _json({"status": False, "error": "invalid url"}), 400
 
-    referer = "https://www.vidking.net/" if url.startswith(("https://moon.peakstorm.top/", "https://rapidnight.top/", "https://stormgate.top/", "https://papercobra.top/")) else "https://cinesrc.st/"
+    referer = "https://vidnest.fun/" if url.startswith(("https://tiktoks.animanga.fun/", "https://streamvaultsrc.click/")) else (
+        "https://www.vidking.net/" if url.startswith(("https://moon.peakstorm.top/", "https://rapidnight.top/", "https://stormgate.top/", "https://papercobra.top/")) else "https://cinesrc.st/"
+    )
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": referer})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -474,7 +478,7 @@ def api_replayer_relay():
             if rel.startswith("#"):
                 return rel
             # Absolute vidking CDN URLs → route through the relay too (content-type fix)
-            if rel.startswith(("https://stormgate.top/", "https://rapidnight.top/", "https://moon.peakstorm.top/", "https://nebula.bright67.online/", "https://papercobra.top/")):
+            if rel.startswith(("https://stormgate.top/", "https://rapidnight.top/", "https://moon.peakstorm.top/", "https://nebula.bright67.online/", "https://papercobra.top/", "https://tiktoks.animanga.fun/", "https://streamvaultsrc.click/")):
                 return f"https://reproxy-seven.vercel.app/api/replayer/relay?url={urllib.parse.quote(rel)}"
             if rel.startswith("http"):
                 return rel

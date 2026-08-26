@@ -131,7 +131,7 @@ async function resolveCinesrc(tmdb, type, season, episode) {
   }
 }
 
-/** Resolve via vidking (rapidnight/moon CDN) — fast path. */
+/** Resolve via vidnest.fun (tiktoks.animanga.fun CDN) — fast path. */
 async function resolveVidking(tmdb, type, season, episode) {
   const browser = await chromium.launch({ executablePath: CHROME, headless: true, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'] });
   try {
@@ -140,11 +140,11 @@ async function resolveVidking(tmdb, type, season, episode) {
     let streamUrl = null;
     page.on('request', (req) => {
       const u = req.url();
-      if (!streamUrl && /moon\.peakstorm\.top\/(r2\/cdn2\/|vd\/)[^\s]+\.m3u8/.test(u)) streamUrl = u;
+      if (!streamUrl && /tiktoks\.animanga\.fun\/hls\/[^\s]+\.m3u8/.test(u)) streamUrl = u;
     });
     const embedUrl = type === 'tv'
-      ? `https://www.vidking.net/embed/tv/${tmdb}/${season}/${episode}?color=eee8dc&autoPlay=true`
-      : `https://www.vidking.net/embed/movie/${tmdb}?color=eee8dc&autoPlay=true`;
+      ? `https://vidnest.fun/tv/${tmdb}/${season}/${episode}`
+      : `https://vidnest.fun/movie/${tmdb}`;
     await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
     // Don't wait for the video element — just poll for the m3u8 request
     const deadline = Date.now() + 12000;

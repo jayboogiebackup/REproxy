@@ -433,6 +433,53 @@ def api_health():
     )
 
 
+@app.route("/api/replayer/relay")
+def api_replayer_relay():
+    """Relay the nebula HLS stream with corrected content-types.
+    The CDN labels every file image/jpeg which breaks hls.js. We fetch the
+    exact upstream URL and serve it with a proper content-type; playlist
+    bodies have their relative URLs rewritten to go through this relay.
+    GET /api/replayer/relay?url=<encoded nebula url>
+    """
+    import re as _re
+
+    url = request.args.get("url") or ""
+    if not url.startswith("https://nebula.bright67.online/"):
+        return _json({"status": False, "error": "invalid url"}), 400
+
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://cinesrc.st/"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+    except Exception as exc:
+        return _json({"status": False, "error": f"upstream: {exc}"}), 502
+
+    is_playlist = data[:20].startswith(b"#EXTM3U")
+
+    if is_playlist:
+        ct = "application/vnd.apple.mpegurl"
+        body = data.decode("utf-8", "replace")
+        base = url.rsplit("/", 1)[0]
+
+        def fix(rel):
+            rel = rel.strip()
+            if rel.startswith("http") or rel.startswith("#"):
+                return rel
+            return f"https://reproxy-seven.vercel.app/api/replayer/relay?url={urllib.parse.quote(base + '/' + rel)}"
+
+        body = _re.sub(r"(?m)^([^#\n][^\n]*)$", lambda m: fix(m.group(1)), body)
+        data = body.encode()
+    else:
+        ct = "video/mp4" if url.endswith((".mp4", ".jpg", ".png", ".jpeg")) else "application/octet-stream"
+
+    return Response(data, mimetype=ct, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "public, max-age=3600",
+    })
+
+
+
+
 @app.route("/api/replayer/stream")
 def api_replayer_stream():
     """RE:player standalone stream — direct HLS from the resolver service.

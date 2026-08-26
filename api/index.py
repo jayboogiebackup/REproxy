@@ -497,15 +497,28 @@ def api_hmm_catalog():
     letters = "abcdefghijklmnopqrstuvwxyz"
     pages = []
     if page == 0:
-        # homepage: latest 32
+        # homepage: latest items with titles
         try:
             h = _hmm_get(f"{HMM_BASE}/")
             seen = set()
-            for m in re.finditer(r'href="(https://hentaimama\.io/(?:tvshows|hentai)/[^"]+)"', h):
-                u = m.group(1)
-                if u not in seen:
-                    seen.add(u)
-                    pages.append({"url": u, "slug": _hmm_show_slug(u), "source": "home"})
+            # item blocks carry title + poster + link
+            for m in re.finditer(r'class="item (?:tvshows|se|episodes)[^"]*"[^>]*>(.*?)(?=class="item |<footer|</div>\s*</section)', h, re.S):
+                it = m.group(1)
+                a = re.search(r'href="(https://hentaimama\.io/(?:tvshows|hentai)/[^"]+)"', it)
+                if not a:
+                    continue
+                u = a.group(1)
+                if u in seen:
+                    continue
+                seen.add(u)
+                img = re.search(r'(?:data-src|src)="([^"]+)"', it)
+                tm = re.search(r"<h3[^>]*>([^<]+)<", it) or re.search(r'title="([^"]+)"', it)
+                pages.append({
+                    "url": u, "slug": _hmm_show_slug(u),
+                    "title": tm.group(1).strip() if tm else _hmm_show_slug(u).replace("-", " ").title(),
+                    "poster": img.group(1) if img else "",
+                    "source": "home",
+                })
         except Exception:
             pass
     else:

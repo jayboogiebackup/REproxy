@@ -445,7 +445,10 @@ def api_replayer_stream():
     if not tmdb or mtype not in ("movie", "tv"):
         return _json({"status": False, "error": "tmdb (number) + type (movie|tv) required"}), 400
 
-    resolver = os.environ.get("RESOLVER_URL", "").rstrip("/")
+    resolver = os.environ.get(
+        "RESOLVER_URL",
+        "https://england-successfully-jaguar-poems.trycloudflare.com",
+    ).rstrip("/")
     url = None
     if resolver:
         try:

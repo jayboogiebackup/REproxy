@@ -470,7 +470,12 @@ def api_replayer_relay():
 
         def fix(rel):
             rel = rel.strip()
-            if rel.startswith("http") or rel.startswith("#"):
+            if rel.startswith("#"):
+                return rel
+            # Absolute vidking CDN URLs → route through the relay too (content-type fix)
+            if rel.startswith(("https://stormgate.top/", "https://rapidnight.top/", "https://moon.peakstorm.top/", "https://nebula.bright67.online/")):
+                return f"https://reproxy-seven.vercel.app/api/replayer/relay?url={urllib.parse.quote(rel)}"
+            if rel.startswith("http"):
                 return rel
             return f"https://reproxy-seven.vercel.app/api/replayer/relay?url={urllib.parse.quote(base + '/' + rel)}"
 

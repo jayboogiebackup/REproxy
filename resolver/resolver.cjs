@@ -140,9 +140,7 @@ async function resolveVidking(tmdb, type, season, episode) {
     let streamUrl = null;
     page.on('request', (req) => {
       const u = req.url();
-      if (!streamUrl && /moon\.peakstorm\.top\/r2\/cdn2\/[^/]+\/.*\/index\.m3u8/.test(u)) streamUrl = u;
-      // Abort heavy media so we resolve the URL without buffering video
-      if (/stormgate\.top|\.mp4|\.m3u8/.test(u) && !streamUrl) req.abort();
+      if (!streamUrl && /moon\.peakstorm\.top\/(r2\/cdn2\/|vd\/)[^\s]+\.m3u8/.test(u)) streamUrl = u;
     });
     const embedUrl = type === 'tv'
       ? `https://www.vidking.net/embed/tv/${tmdb}/${season}/${episode}?color=eee8dc&autoPlay=true`

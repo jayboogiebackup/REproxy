@@ -131,7 +131,9 @@ async function resolveCinesrc(tmdb, type, season, episode) {
   }
 }
 
-/** Resolve via vidnest.fun (tiktoks.animanga.fun CDN) — fast path. */
+/** Resolve via vidnest.fun (tiktoks.animanga.fun CDN) — fast path.
+ *  Fallbacks: vidnest ?server=alfa / ?server=sigma, then player.videasy.to.
+ *  All share the speedracelight backend but surface different source pools. */
 async function resolveVidking(tmdb, type, season, episode) {
   const browser = await chromium.launch({ executablePath: CHROME, headless: true, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'] });
   try {
@@ -140,17 +142,44 @@ async function resolveVidking(tmdb, type, season, episode) {
     let streamUrl = null;
     page.on('request', (req) => {
       const u = req.url();
-      if (!streamUrl && /tiktoks\.animanga\.fun\/hls\/[^\s]+\.m3u8/.test(u)) streamUrl = u;
+      if (!streamUrl && /(tiktoks\.animanga\.fun\/hls\/[^\s]+\.m3u8|moon\.peakstorm\.top\/vd\/[^\s]+\.m3u8)/.test(u)) streamUrl = u;
     });
-    const embedUrl = type === 'tv'
-      ? `https://vidnest.fun/tv/${tmdb}/${season}/${episode}`
+
+    const base = type === 'tv'
+      ? (t, s, e, q) => `https://vidnest.fun/tv/${t}/${s}/${e}${q}`
       : type === 'anime'
-        ? `https://vidnest.fun/anime/${tmdb}/${episode}/sub`
-        : `https://vidnest.fun/movie/${tmdb}`;
-    await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-    // Don't wait for the video element — just poll for the m3u8 request
-    const deadline = Date.now() + 12000;
-    while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(250);
+        ? (t, s, e, q) => `https://vidnest.fun/anime/${t}/${e}/sub${q}`
+        : (t, s, e, q) => `https://vidnest.fun/movie/${t}${q}`;
+
+    const attempts = [
+      base(tmdb, season, episode, ''),
+      base(tmdb, season, episode, '?server=alfa'),
+      base(tmdb, season, episode, '?server=sigma'),
+    ];
+    if (type !== 'anime') {
+      const vd = type === 'tv'
+        ? `https://player.videasy.to/tv/${tmdb}/${season}/${episode}`
+        : `https://player.videasy.to/movie/${tmdb}`;
+      attempts.push(vd);
+    }
+
+    for (const url of attempts) {
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      } catch { continue; }
+      const deadline = Date.now() + 8000;
+      while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(250);
+      if (streamUrl) break;
+      // videasy needs a click on its play button to start
+      if (url.includes('videasy')) {
+        try {
+          const btn = page.locator('button').first();
+          if (await btn.count()) { await btn.click({ force: true }); }
+          const d2 = Date.now() + 6000;
+          while (!streamUrl && Date.now() < d2) await page.waitForTimeout(250);
+        } catch { /* ignore */ }
+      }
+    }
     return streamUrl;
   } finally {
     await browser.close();

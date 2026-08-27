@@ -152,35 +152,38 @@ async function resolveVidking(tmdb, type, season, episode) {
         : (t, s, e, q) => `https://vidnest.fun/movie/${t}${q}`;
 
     const attempts = [
-      base(tmdb, season, episode, ''),
-      base(tmdb, season, episode, '?server=alfa'),
-      base(tmdb, season, episode, '?server=sigma'),
+      { label: 'vidnest', url: base(tmdb, season, episode, '') },
+      { label: 'vidnest-alfa', url: base(tmdb, season, episode, '?server=alfa') },
+      { label: 'vidnest-sigma', url: base(tmdb, season, episode, '?server=sigma') },
     ];
     if (type !== 'anime') {
       const vd = type === 'tv'
         ? `https://player.videasy.to/tv/${tmdb}/${season}/${episode}`
         : `https://player.videasy.to/movie/${tmdb}`;
-      attempts.push(vd);
+      attempts.push({ label: 'videasy', url: vd });
     }
 
-    for (const url of attempts) {
+    let source = null;
+    for (const { label, url } of attempts) {
       try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
       } catch { continue; }
-      const deadline = Date.now() + 8000;
-      while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(250);
-      if (streamUrl) break;
+      // Fast poll: m3u8 usually arrives in the first 3s
+      const deadline = Date.now() + 3500;
+      while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(150);
+      if (streamUrl) { source = label; break; }
       // videasy needs a click on its play button to start
-      if (url.includes('videasy')) {
+      if (label === 'videasy') {
         try {
           const btn = page.locator('button').first();
-          if (await btn.count()) { await btn.click({ force: true }); }
-          const d2 = Date.now() + 6000;
-          while (!streamUrl && Date.now() < d2) await page.waitForTimeout(250);
+          if (await btn.count()) await btn.click({ force: true });
+          const d2 = Date.now() + 4000;
+          while (!streamUrl && Date.now() < d2) await page.waitForTimeout(150);
         } catch { /* ignore */ }
+        if (streamUrl) { source = label; break; }
       }
     }
-    return streamUrl;
+    return { url: streamUrl, source };
   } finally {
     await browser.close();
   }
@@ -209,10 +212,12 @@ async function main() {
 
   const t0 = Date.now();
 
-  // VIDKING ONLY — single fast path, no backup, no audio probing (saves ~5-8s)
+  // Fast path: speedracelight pool (vidnest → alfa → sigma → videasy)
   let url = null;
+  let source = null;
   try {
-    url = await resolveVidking(tmdb, type, season, episode);
+    const r = await resolveVidking(tmdb, type, season, episode);
+    url = r.url; source = r.source;
   } catch { url = null; }
 
   if (!url) {
@@ -222,16 +227,11 @@ async function main() {
 
   const result = {
     tmdb, type, season: season ?? null, episode: episode ?? null,
-    url, provider: 'vidking',
+    url, provider: source || 'speedracelight',
     quality: '1080p/720p/480p',
-    servers: [{ provider: 'vidking', url }],
+    servers: [{ provider: source || 'speedracelight', url }],
     cached: false, ms: Date.now() - t0,
   };
-
-  if (!result || !result.url) {
-    console.log(JSON.stringify({ error: 'resolve_failed', tmdb, type, season, episode, ms: Date.now() - t0 }));
-    process.exit(2);
-  }
 
   cache.set(key, { t: Date.now(), data: result });
   console.log(JSON.stringify(result));

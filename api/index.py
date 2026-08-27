@@ -565,6 +565,45 @@ def api_hmm_catalog():
     return _json({"status": True, "page": page, "results": pages})
 
 
+@app.route("/api/hmm/genre")
+def api_hmm_genre():
+    """Titles in a genre. GET /api/hmm/genre?g=uncensored (or 3d, harem, ...)
+    Uses hentaimama's genre pages; falls back to searching."""
+    g = (request.args.get("g") or "").strip().lower()
+    if not g:
+        return _json({"status": False, "error": "missing g"}), 400
+    slug = re.sub(r"[^a-z0-9]+", "-", g).strip("-")
+    try:
+        h = _hmm_get(f"{HMM_BASE}/genre/{slug}/")
+        results = []
+        seen = set()
+        for m in re.finditer(r'<article[^>]*class="[^"]*item tvshows[^"]*"[^>]*>(.*?)</article>', h, re.S):
+            it = m.group(1)
+            a = re.search(r'href="(https://hentaimama\.io/tvshows/[^"]+)"', it)
+            if not a:
+                continue
+            u = a.group(1)
+            if u in seen:
+                continue
+            seen.add(u)
+            img = re.search(r'data-src="([^"]+)"', it) or re.search(r'src="([^"]+)"', it)
+            altm = re.search(r'alt="([^"]+)"', it)
+            hm = re.search(r"<h3[^>]*>\s*<a[^>]*>([^<]+)<", it)
+            ym = re.search(r"<span>(\d{4})</span>", it)
+            rm = re.search(r'<div class="rating">[^0-9]*([\d.]+)', it)
+            results.append({
+                "url": u,
+                "slug": _hmm_show_slug(u),
+                "title": (hm.group(1).strip() if hm else (altm.group(1).strip() if altm else "")),
+                "year": int(ym.group(1)) if ym else None,
+                "rating": float(rm.group(1)) if rm else None,
+                "poster": img.group(1) if img else "",
+            })
+        return _json({"status": True, "genre": g, "results": results})
+    except Exception as exc:
+        return _json({"status": False, "error": str(exc)}), 502
+
+
 @app.route("/api/hmm/search")
 def api_hmm_search():
     """Search hentaimama via the site's own search page.
@@ -728,8 +767,8 @@ def api_replayer_stream():
     mtype = (request.args.get("type") or "").strip()
     season = (request.args.get("season") or "").strip()
     episode = (request.args.get("episode") or "").strip()
-    if not tmdb or mtype not in ("movie", "tv"):
-        return _json({"status": False, "error": "tmdb (number) + type (movie|tv) required"}), 400
+    if not tmdb or mtype not in ("movie", "tv", "anime"):
+        return _json({"status": False, "error": "tmdb (number) + type (movie|tv|anime) required"}), 400
 
     resolver = os.environ.get(
         "RESOLVER_URL",
@@ -739,7 +778,7 @@ def api_replayer_stream():
     if resolver:
         try:
             params = {"tmdb": tmdb, "type": mtype}
-            if mtype == "tv":
+            if mtype in ("tv", "anime"):
                 params["season"] = season or "1"
                 params["episode"] = episode or "1"
             qs = urllib.parse.urlencode(params)

@@ -144,7 +144,9 @@ async function resolveVidking(tmdb, type, season, episode) {
     });
     const embedUrl = type === 'tv'
       ? `https://vidnest.fun/tv/${tmdb}/${season}/${episode}`
-      : `https://vidnest.fun/movie/${tmdb}`;
+      : type === 'anime'
+        ? `https://vidnest.fun/anime/${tmdb}/${episode}/sub`
+        : `https://vidnest.fun/movie/${tmdb}`;
     await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
     // Don't wait for the video element — just poll for the m3u8 request
     const deadline = Date.now() + 12000;

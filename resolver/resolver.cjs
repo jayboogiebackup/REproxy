@@ -159,16 +159,21 @@ async function resolveVidking(tmdb, type, season, episode) {
     }));
 
     let source = null;
+    const found = [];
     for (const { label, url } of attempts) {
+      streamUrl = null; // reset per attempt
       try {
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
       } catch { continue; }
       // Fast poll: m3u8 fires within ~1-2s when a server has the title
       const deadline = Date.now() + 2000;
       while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(100);
-      if (streamUrl) { source = label; break; }
+      if (streamUrl) {
+        source = source || label;
+        found.push({ provider: label, url: streamUrl });
+      }
     }
-    return { url: streamUrl, source };
+    return { url: found.length ? found[0].url : null, source, servers: found };
   } finally {
     await browser.close();
   }
@@ -229,18 +234,23 @@ async function main() {
 
   const t0 = Date.now();
 
-  // Scan all vidnest servers first; if none have it, fall back to cinesrc
+  // Scan all vidnest servers first; if none have it, fall back to cinesrc.
+  // Every server that yielded an m3u8 is returned so the player can try them
+  // one-by-one with visible status (spinner → ✕ → next).
+  let servers = [];
   let url = null;
   let source = null;
   try {
     const r = await resolveVidking(tmdb, type, season, episode);
     url = r.url; source = r.source;
+    servers = r.servers || [];
   } catch { url = null; }
 
   if (!url) {
     try {
       url = await resolveCinesrc(tmdb, type, season, episode);
       source = url ? 'cinesrc' : null;
+      if (url) servers.push({ provider: 'cinesrc', url });
     } catch { url = null; }
   }
 
@@ -253,7 +263,7 @@ async function main() {
     tmdb, type, season: season ?? null, episode: episode ?? null,
     url, provider: source || 'vidnest',
     quality: '1080p/720p/480p',
-    servers: [{ provider: source || 'vidnest', url }],
+    servers: servers.length ? servers : [{ provider: source || 'vidnest', url }],
     cached: false, ms: Date.now() - t0,
   };
 

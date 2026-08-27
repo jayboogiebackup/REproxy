@@ -800,7 +800,15 @@ def api_replayer_stream():
                         "quality": data.get("quality", "1080p/720p/480p"),
                         "cached": data.get("cached", False),
                         "ms": data.get("ms"),
-                        "servers": [{"id": "vidking", "name": "RE:player", "url": url}],
+                        "servers": [
+                            {
+                                "id": s.get("provider", "vidnest"),
+                                "name": s.get("provider", "vidnest").replace("vidnest:", "VidNest ").replace("vidnest", "VidNest"),
+                                "url": s["url"],
+                            }
+                            for s in (data.get("servers") or [])
+                            if s.get("url")
+                        ] or [{"id": "replayer", "name": "RE:player", "url": url}],
                     })
         except Exception as exc:
             return _json({"status": False, "error": f"resolver error: {exc}"}), 502

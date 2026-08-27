@@ -151,39 +151,56 @@ async function resolveVidking(tmdb, type, season, episode) {
         ? (t, s, e, q) => `https://vidnest.fun/anime/${t}/${e}/sub${q}`
         : (t, s, e, q) => `https://vidnest.fun/movie/${t}${q}`;
 
-    const attempts = [
-      { label: 'vidnest', url: base(tmdb, season, episode, '') },
-      { label: 'vidnest-alfa', url: base(tmdb, season, episode, '?server=alfa') },
-      { label: 'vidnest-sigma', url: base(tmdb, season, episode, '?server=sigma') },
-    ];
-    if (type !== 'anime') {
-      const vd = type === 'tv'
-        ? `https://player.videasy.to/tv/${tmdb}/${season}/${episode}`
-        : `https://player.videasy.to/movie/${tmdb}`;
-      attempts.push({ label: 'videasy', url: vd });
-    }
+    // Scan ALL vidnest servers (default + 8 named) — any may have the stream
+    const servers = ['', 'alfa', 'sigma', 'lamda', 'primesrc', 'beta', 'gama', 'catflix', 'hexa', 'delta'];
+    const attempts = servers.map((srv) => ({
+      label: srv ? `vidnest:${srv}` : 'vidnest',
+      url: base(tmdb, season, episode, srv ? `?server=${srv}` : ''),
+    }));
 
     let source = null;
     for (const { label, url } of attempts) {
       try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
       } catch { continue; }
-      // Fast poll: m3u8 usually arrives in the first 3s
-      const deadline = Date.now() + 3500;
-      while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(150);
+      // Fast poll: m3u8 fires within ~1-2s when a server has the title
+      const deadline = Date.now() + 2000;
+      while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(100);
       if (streamUrl) { source = label; break; }
-      // videasy needs a click on its play button to start
-      if (label === 'videasy') {
-        try {
-          const btn = page.locator('button').first();
-          if (await btn.count()) await btn.click({ force: true });
-          const d2 = Date.now() + 4000;
-          while (!streamUrl && Date.now() < d2) await page.waitForTimeout(150);
-        } catch { /* ignore */ }
-        if (streamUrl) { source = label; break; }
-      }
     }
     return { url: streamUrl, source };
+  } finally {
+    await browser.close();
+  }
+}
+
+/** Resolve via cinesrc.st (nebula CDN) — independent backup pool.
+ *  Cinesrc solves its own PoW challenge in real Chromium, then AUTO-CYCLES
+ *  its servers (Nebula, Lisbon, Surge, Spark, Storm, Aurora, Rush, Blizzard,
+ *  Mist, Thunder, Wave, Paris, Luna, Sturm, Brisa) until one yields a stream.
+ *  The first server that succeeds fires nebula.bright67.online/hls/{uuid}/master.m3u8. */
+async function resolveCinesrc(tmdb, type, season, episode) {
+  const browser = await chromium.launch({ executablePath: CHROME, headless: true, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'] });
+  try {
+    const ctx = await browser.newContext({ userAgent: UA, viewport: { width: 1280, height: 720 }, locale: 'en-US' });
+    const page = await ctx.newPage();
+    let streamUrl = null;
+    page.on('request', (req) => {
+      const u = req.url();
+      if (!streamUrl && /nebula\.bright67\.online\/hls\/[^/]+\/master\.m3u8/.test(u)) streamUrl = u;
+    });
+    const embedUrl = type === 'tv'
+      ? `https://cinesrc.st/embed/tv/${tmdb}?s=${season}&e=${episode}`
+      : type === 'anime'
+        ? `https://cinesrc.st/embed/tv/${tmdb}?s=1&e=${episode}`
+        : `https://cinesrc.st/embed/movie/${tmdb}`;
+    try {
+      await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch { /* nav may hang — rely on capture */ }
+    // Server auto-cycling can take up to ~45s; poll for the whole window
+    const deadline = Date.now() + 45000;
+    while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(400);
+    return streamUrl;
   } finally {
     await browser.close();
   }
@@ -212,7 +229,7 @@ async function main() {
 
   const t0 = Date.now();
 
-  // Fast path: speedracelight pool (vidnest → alfa → sigma → videasy)
+  // Scan all vidnest servers first; if none have it, fall back to cinesrc
   let url = null;
   let source = null;
   try {
@@ -221,15 +238,22 @@ async function main() {
   } catch { url = null; }
 
   if (!url) {
+    try {
+      url = await resolveCinesrc(tmdb, type, season, episode);
+      source = url ? 'cinesrc' : null;
+    } catch { url = null; }
+  }
+
+  if (!url) {
     console.log(JSON.stringify({ error: 'resolve_failed', tmdb, type, season, episode, ms: Date.now() - t0 }));
     process.exit(2);
   }
 
   const result = {
     tmdb, type, season: season ?? null, episode: episode ?? null,
-    url, provider: source || 'speedracelight',
+    url, provider: source || 'vidnest',
     quality: '1080p/720p/480p',
-    servers: [{ provider: source || 'speedracelight', url }],
+    servers: [{ provider: source || 'vidnest', url }],
     cached: false, ms: Date.now() - t0,
   };
 

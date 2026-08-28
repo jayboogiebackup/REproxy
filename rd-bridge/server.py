@@ -111,9 +111,10 @@ def search_torrentio(imdb, mtype, season=None, episode=None):
             import re as _re
             m = _re.search(r"[\U0001F464]\s*(\d+)", title)
             seeders = int(m.group(1)) if m else 0
+            bh = s.get("behaviorHints") or {}
             hits.append({"name": title[:90], "info_hash": ih, "file_idx": s.get("fileIdx"),
-                         "seeders": seeders, "source": "torrentio",
-                         "quality": s.get("name", "")[:30]})
+                         "filename": bh.get("filename", ""), "seeders": seeders,
+                         "source": "torrentio", "quality": s.get("name", "")[:30]})
         return hits
     except Exception:
         return []
@@ -154,8 +155,10 @@ def rd_instant_available(hashes):
         return {}
 
 
-def rd_find_by_title(q):
-    """Search the account's existing torrents by title keywords → first link."""
+def rd_find_by_title(q, season=None, episode=None):
+    """Search the account's existing torrents by title keywords → link.
+       If season+episode given, finds the matching SxxExx file inside a
+       season pack (selects the right file, not just the first link)."""
     try:
         req = urllib.request.Request(f"{RD_API}/torrents", headers={"Authorization": f"Bearer {RD_KEY}", "User-Agent": UA})
         with urllib.request.urlopen(req, timeout=25) as r:
@@ -166,12 +169,38 @@ def rd_find_by_title(q):
                 continue
             fn = (t.get("filename") or "").lower()
             # match if ANY distinctive word hits (handles title aliases)
-            if any(w in fn for w in words):
+            if not any(w in fn for w in words):
+                continue
+            # If asking for a specific episode, find the matching file
+            if season is not None and episode is not None:
                 try:
-                    ur = rd_post("/unrestrict/link", {"link": t["links"][0]})
-                    return ur.get("download") or ur.get("streamable")
+                    info = rd_get(f"/torrents/info/{t['id']}")
+                    tag = f"s{int(season):02d}e{int(episode):02d}"
+                    for f in info.get("files", []):
+                        if tag in f.get("path", "").lower():
+                            # RD keeps one link per selected file, ordered by
+                            # file id — pick the link for this file directly
+                            # (re-selecting on a completed torrent 404s).
+                            links = info.get("links") or []
+                            idx = f["id"] - 1
+                            if 0 <= idx < len(links):
+                                for lf in (links[idx],):
+                                    try:
+                                        ur = rd_post("/unrestrict/link", {"link": lf})
+                                        dl = ur.get("download") or ur.get("streamable")
+                                        if dl:
+                                            return dl
+                                    except Exception:
+                                        continue
+                                return links[idx]
+                            break
                 except Exception:
-                    return t["links"][0]
+                    pass
+            try:
+                ur = rd_post("/unrestrict/link", {"link": t["links"][0]})
+                return ur.get("download") or ur.get("streamable")
+            except Exception:
+                return t["links"][0]
     except Exception:
         pass
     return None
@@ -191,11 +220,15 @@ def rd_find_existing(info_hash):
     return None
 
 
-def rd_add_and_stream(info_hash, file_idx=None):
-    """addMagnet → selectFiles → wait → unrestrict → direct URL."""
-    # 0. Already in the account? Use the existing link (instant, no re-add)
+def rd_add_and_stream(info_hash, file_idx=None, filename=None):
+    """addMagnet → selectFiles → wait → unrestrict → direct URL.
+       filename (from Torrentio behaviorHints) picks the exact episode file
+       from RD's real file list, avoiding fileIdx mismatches on packs."""
+    # 0. Already in the account? Use the existing link (instant, no re-add).
+    #    BUT skip this when we have a filename hint — the existing link may
+    #    point at a different episode file of a season pack.
     existing = rd_find_existing(info_hash)
-    if existing:
+    if existing and not filename:
         try:
             ur = rd_post("/unrestrict/link", {"link": existing})
             return ur.get("download") or ur.get("streamable")
@@ -219,12 +252,27 @@ def rd_add_and_stream(info_hash, file_idx=None):
     video = [f for f in files if re.search(r"\.(mp4|mkv|avi|mov|webm)$", f.get("path", ""), re.I)]
     if not video:
         return None
-    chosen = file_idx if file_idx is not None else max(video, key=lambda f: f.get("bytes", 0)).get("id")
+    chosen = None
+    # 1) exact filename match (Torrentio behaviorHints.filename)
+    if filename:
+        for f in video:
+            if filename.lower() in f.get("path", "").lower() or f.get("path", "").lower().endswith(filename.lower()):
+                chosen = f.get("id")
+                break
+    # 2) fileIdx (RD ids are 1-based; Torrentio is usually 0-based → try both)
+    if chosen is None and file_idx is not None:
+        for fid in (int(file_idx) + 1, int(file_idx)):
+            if any(f.get("id") == fid for f in video):
+                chosen = fid
+                break
+    # 3) largest video file
+    if chosen is None:
+        chosen = max(video, key=lambda f: f.get("bytes", 0)).get("id")
     # 3. Select it — RD expects `files` + `torrent_id` (verified: 204 success)
     rd_post("/torrents/selectFiles", {"files": str(chosen), "torrent_id": str(tid)})
     # 4. Wait for the link (RD processes instantly for cached, downloads for new)
     link = None
-    for _ in range(20):
+    for _ in range(40):  # up to 60s — RD downloads non-cached torrents itself
         time.sleep(1.5)
         try:
             info = rd_get(f"/torrents/info/{tid}")
@@ -253,8 +301,25 @@ def resolve_stream(tmdb, mtype, season=None, episode=None):
     if not imdb:
         return {"error": "no imdb id"}
 
-    # 0. The user's OWN RD library first — already-downloaded content always
-    #    works (no 451 walls) and streams instantly. Match by all known titles.
+    # Torrentio first — per-episode releases give the exact file (an account
+    # season-pack may point at E01 even when asking for E13)
+    candidates = []
+    candidates.extend(search_torrentio(imdb, mtype, season, episode))
+    if candidates:
+        order = sorted(candidates, key=lambda c: -int(c.get("seeders") or 0))
+        tried = 0
+        for c in order:
+            if tried >= 30:
+                break
+            tried += 1
+            try:
+                url = rd_add_and_stream(c["info_hash"], file_idx=c.get("file_idx"), filename=c.get("filename"))
+                if url:
+                    return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
+            except Exception:
+                continue
+    # Fall back to the user's OWN RD library — already-downloaded content
+    # always works (no 451 walls) and streams instantly.
     try:
         st, body = http_get(f"https://api.themoviedb.org/3/{'movie' if mtype == 'movie' else 'tv'}/{tmdb}?api_key={TMDB_KEY}", timeout=15)
         tdata = json.loads(body)
@@ -278,9 +343,7 @@ def resolve_stream(tmdb, mtype, season=None, episode=None):
     except Exception:
         pass
 
-    candidates = []
-    # Torrentio — aggregates 100+ indexers by IMDb id (best coverage)
-    candidates.extend(search_torrentio(imdb, mtype, season, episode))
+    # Remaining sources (APIBay / EZTV)
 
     if mtype == "movie":
         # APIBay fallback by title + year (filter by imdb id after)
@@ -331,17 +394,22 @@ def resolve_stream(tmdb, mtype, season=None, episode=None):
     # NOTE: RD's instantAvailability endpoint is currently disabled (error 37),
     # so we try torrents directly — best-seeded first. RD downloads
     # non-cached torrents on their servers; cached ones are instant.
+    # Torrentio-style: try EVERY candidate — RD 451-skips silently and
+    # cached/unflagged hashes resolve instantly. Also wait longer for RD to
+    # fetch non-cached torrents (RD does the downloading, not us).
     order = sorted(candidates, key=lambda c: -int(c.get("seeders") or 0))
-    last_err = None
-    for c in order[:10]:
+    tried = 0
+    for c in order:
+        if tried >= 40:
+            break
+        tried += 1
         try:
             url = rd_add_and_stream(c["info_hash"], file_idx=c.get("file_idx"))
             if url:
                 return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
-        except Exception as e:
-            last_err = str(e)
-            continue
-    return {"error": f"could not resolve via real-debrid ({last_err or 'no valid torrents'})", "imdb": imdb}
+        except Exception:
+            continue  # 451 / invalid — next candidate
+    return {"error": "could not resolve via real-debrid (all candidates rejected)", "imdb": imdb}
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -708,6 +708,8 @@ def api_replayer_relay():
         "https://tiktoks.animanga.fun/",
         "https://streamvaultsrc.click/",
         "https://gdvid.info/",
+        "https://download.real-debrid.com/",
+        "https://cache.vdrk.site/",
     )
     if not url.startswith(allowed_prefixes):
         return _json({"status": False, "error": "invalid url"}), 400

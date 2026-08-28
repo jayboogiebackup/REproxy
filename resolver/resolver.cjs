@@ -179,6 +179,42 @@ async function resolveVidking(tmdb, type, season, episode) {
   }
 }
 
+/** Resolve via embed.filmu.in — ad-gated iframe player aggregating
+ *  MovieBox/NoTorrent/animex scrapers. Often produces a direct m3u8 when
+ *  the ad chain completes; if not, the player falls back to the filmu
+ *  iframe embed (works on the user's own network). */
+async function resolveFilmu(tmdb, type, season, episode) {
+  const browser = await chromium.launch({ executablePath: CHROME, headless: true, args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'] });
+  try {
+    const ctx = await browser.newContext({ userAgent: UA, viewport: { width: 1280, height: 720 }, locale: 'en-US' });
+    const page = await ctx.newPage();
+    let streamUrl = null;
+    // Block the worst ad domains so the player can render
+    await page.route('**/*', (route) => {
+      const u = route.request().url();
+      if (/luugy|doubleclick|popunder|adsterra|exoclick|taboola|outbrain/i.test(u)) return route.abort();
+      route.continue();
+    });
+    page.on('request', (req) => {
+      const u = req.url();
+      if (!streamUrl && /(\.m3u8|\.mp4|\.m4s|\.ts\b)/i.test(u) && !/embed\.filmu\.in\/assets/.test(u)) streamUrl = u;
+    });
+    const embedUrl = type === 'tv'
+      ? `https://embed.filmu.in/embed/tv/${tmdb}/${season}/${episode}`
+      : type === 'anime'
+        ? `https://embed.filmu.in/embed/anime/${tmdb}/${episode}`
+        : `https://embed.filmu.in/embed/movie/${tmdb}`;
+    try {
+      await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
+    } catch { /* ad nav may interfere */ }
+    const deadline = Date.now() + 20000;
+    while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(300);
+    return streamUrl;
+  } finally {
+    await browser.close();
+  }
+}
+
 /** Resolve via cinesrc.st (nebula CDN) — independent backup pool.
  *  Cinesrc solves its own PoW challenge in real Chromium, then AUTO-CYCLES
  *  its servers (Nebula, Lisbon, Surge, Spark, Storm, Aurora, Rush, Blizzard,
@@ -251,6 +287,14 @@ async function main() {
       url = await resolveCinesrc(tmdb, type, season, episode);
       source = url ? 'cinesrc' : null;
       if (url) servers.push({ provider: 'cinesrc', url });
+    } catch { url = null; }
+  }
+
+  if (!url) {
+    try {
+      url = await resolveFilmu(tmdb, type, season, episode);
+      source = url ? 'filmu' : null;
+      if (url) servers.push({ provider: 'filmu', url });
     } catch { url = null; }
   }
 

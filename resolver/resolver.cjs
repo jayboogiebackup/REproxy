@@ -158,21 +158,36 @@ async function resolveVidking(tmdb, type, season, episode) {
       url: base(tmdb, season, episode, srv ? `?server=${srv}` : ''),
     }));
 
-    let source = null;
+    // Parallel scan — open up to 4 server pages at once, take the first m3u8.
+    // Each page captures its own stream URL via a per-page request listener.
+    const grab = (page) => new Promise((resolve) => {
+      let u = null;
+      page.on('request', (req) => {
+        const ru = req.url();
+        if (!u && /(tiktoks\.animanga\.fun\/hls\/[^\s]+\.m3u8|moon\.peakstorm\.top\/vd\/[^\s]+\.m3u8)/.test(ru)) u = ru;
+      });
+      const t = setInterval(() => {
+        if (u) { clearInterval(t); resolve(u); }
+      }, 80);
+      setTimeout(() => { clearInterval(t); resolve(u); }, 4000);
+    });
+
     const found = [];
-    for (const { label, url } of attempts) {
-      streamUrl = null; // reset per attempt
-      try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 8000 });
-      } catch { continue; }
-      // Fast poll: m3u8 fires within ~0.5-1s when a server has the title
-      const deadline = Date.now() + 1200;
-      while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(80);
-      if (streamUrl) {
-        source = source || label;
-        found.push({ provider: label, url: streamUrl });
-      }
+    const CONC = 4;
+    for (let i = 0; i < attempts.length; i += CONC) {
+      const batch = attempts.slice(i, i + CONC);
+      const results = await Promise.all(batch.map(async ({ label, url }) => {
+        const p = await ctx.newPage();
+        const got = grab(p);
+        try { await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 6000 }); } catch { /* ignore */ }
+        const m3u8 = await got;
+        await p.close().catch(() => {});
+        return m3u8 ? { provider: label, url: m3u8 } : null;
+      }));
+      for (const r of results) if (r) found.push(r);
+      if (found.length) break; // stop once any server found a stream
     }
+    const source = found.length ? found[0].label : null;
     return { url: found.length ? found[0].url : null, source, servers: found };
   } finally {
     await browser.close();

@@ -154,6 +154,29 @@ def rd_instant_available(hashes):
         return {}
 
 
+def rd_find_by_title(q):
+    """Search the account's existing torrents by title keywords → first link."""
+    try:
+        req = urllib.request.Request(f"{RD_API}/torrents", headers={"Authorization": f"Bearer {RD_KEY}", "User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            ts = json.loads(r.read())
+        words = [w.lower() for w in q.split() if len(w) > 2]
+        for t in ts:
+            if t.get("status") != "downloaded" or not t.get("links"):
+                continue
+            fn = (t.get("filename") or "").lower()
+            # match if ANY distinctive word hits (handles title aliases)
+            if any(w in fn for w in words):
+                try:
+                    ur = rd_post("/unrestrict/link", {"link": t["links"][0]})
+                    return ur.get("download") or ur.get("streamable")
+                except Exception:
+                    return t["links"][0]
+    except Exception:
+        pass
+    return None
+
+
 def rd_find_existing(info_hash):
     """Look for an already-added torrent with this hash → return its unrestrictable link."""
     try:
@@ -197,8 +220,8 @@ def rd_add_and_stream(info_hash, file_idx=None):
     if not video:
         return None
     chosen = file_idx if file_idx is not None else max(video, key=lambda f: f.get("bytes", 0)).get("id")
-    # 3. Select it (RD expects files[] array-style param)
-    rd_post("/torrents/selectFiles", {"files[]": str(chosen), "torrent_id": str(tid)})
+    # 3. Select it — RD expects `files` + `torrent_id` (verified: 204 success)
+    rd_post("/torrents/selectFiles", {"files": str(chosen), "torrent_id": str(tid)})
     # 4. Wait for the link (RD processes instantly for cached, downloads for new)
     link = None
     for _ in range(20):
@@ -252,6 +275,32 @@ def resolve_stream(tmdb, mtype, season=None, episode=None):
         candidates.extend(search_apibay(q, category="205"))
 
     if not candidates:
+        # Niche content may already be in the user's RD account — match by
+        # title, original name, or alternative titles (handles rebrands like
+        # "Life on Marbs" → "60 Days In")
+        try:
+            st, body = http_get(f"https://api.themoviedb.org/3/{'movie' if mtype == 'movie' else 'tv'}/{tmdb}?api_key={TMDB_KEY}", timeout=15)
+            tdata = json.loads(body)
+            names = set()
+            for k in ("title", "name", "original_title", "original_name"):
+                if tdata.get(k):
+                    names.add(tdata[k])
+            # alternative titles
+            try:
+                st2, body2 = http_get(f"https://api.themoviedb.org/3/{'movie' if mtype == 'movie' else 'tv'}/{tmdb}/alternative_titles?api_key={TMDB_KEY}", timeout=15)
+                alt = json.loads(body2)
+                for a in alt.get("titles", []):
+                    names.add(a.get("title", ""))
+            except Exception:
+                pass
+            for q in names:
+                if not q:
+                    continue
+                url = rd_find_by_title(q)
+                if url:
+                    return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
+        except Exception:
+            pass
         return {"error": "no torrents found", "imdb": imdb}
 
     # NOTE: RD's instantAvailability endpoint is currently disabled (error 37),

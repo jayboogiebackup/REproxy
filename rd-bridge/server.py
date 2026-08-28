@@ -31,7 +31,27 @@ import urllib.request
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from rd_flow import match_episode_file_index, pick_rd_files, pick_link_index  # noqa: E402
+from rd_flow import match_episode_file_index, pick_rd_files, pick_link_index, VIDEO_EXTS  # noqa: E402
+
+_dl_tries = 0  # per-torrent download poll counter
+_info_cache = {}  # torrent_id -> (timestamp, info) — big packs are slow to fetch
+
+
+def rd_get(path):
+    req = urllib.request.Request(f"{RD_API}{path}", headers={"Authorization": f"Bearer {RD_KEY}", "User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def rd_get_cached(tid, ttl=20):
+    """rd_get with a short cache — fetching a 71-file pack takes ~10s+."""
+    now = time.time()
+    c = _info_cache.get(tid)
+    if c and now - c[0] < ttl:
+        return c[1]
+    info = rd_get(f"/torrents/info/{tid}")
+    _info_cache[tid] = (now, info)
+    return info
 
 # Optional .env loader (key stays out of git)
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -54,12 +74,6 @@ def http_get(url, headers=None, timeout=20):
     req = urllib.request.Request(url, headers=headers or {"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status, r.read()
-
-
-def rd_get(path):
-    req = urllib.request.Request(f"{RD_API}{path}", headers={"Authorization": f"Bearer {RD_KEY}"})
-    with urllib.request.urlopen(req, timeout=25) as r:
-        return json.loads(r.read())
 
 
 def rd_post(path, data):
@@ -168,25 +182,38 @@ def rd_find_by_title(q, season=None, episode=None):
         req = urllib.request.Request(f"{RD_API}/torrents", headers={"Authorization": f"Bearer {RD_KEY}", "User-Agent": UA})
         with urllib.request.urlopen(req, timeout=25) as r:
             ts = json.loads(r.read())
-        words = [w.lower() for w in q.split() if len(w) > 2]
+        words = [w.lower() for w in q.split() if len(w) > 2 and w.lower() not in
+                 ("and", "the", "for", "with", "from", "that", "this", "not", "are", "was", "but", "you", "all", "she", "his", "her", "its", "has", "had", "have", "who", "which", "what", "when", "where", "why", "how")]
         for t in ts:
             if t.get("status") != "downloaded" or not t.get("links"):
                 continue
             fn = (t.get("filename") or "").lower()
-            # match if ANY distinctive word hits (handles title aliases)
-            if not any(w in fn for w in words):
+            # When asking for a specific episode, the TORRENT must contain the
+            # SxxExx tag — otherwise a "Rick and Morty" title match could hit a
+            # single-episode torrent of the wrong episode.
+            if season is not None and episode is not None:
+                tag = f"s{int(season):02d}e{int(episode):02d}"
+                if tag not in fn and not any(w in fn for w in words):
+                    continue
+            elif not any(re.search(rf"(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])", fn) for w in words):
                 continue
             # If asking for a specific episode, find the matching file
             if season is not None and episode is not None:
                 try:
-                    info = rd_get(f"/torrents/info/{t['id']}")
+                    info = rd_get_cached(t["id"])
                     tag = f"s{int(season):02d}e{int(episode):02d}"
+                    links = info.get("links") or []
                     for f in info.get("files", []):
                         if tag in f.get("path", "").lower():
-                            # RD keeps one link per selected file, ordered by
-                            # file id — pick the link for this file directly
-                            # (re-selecting on a completed torrent 404s).
-                            links = info.get("links") or []
+                            # RD keeps one link per SELECTED file. If the pack
+                            # has fewer links than files (partial selection),
+                            # we can't fetch this episode from this torrent —
+                            # return None so the caller tries Torrentio instead.
+                            if len(links) < len(info.get("files") or []):
+                                # verify a link exists for this specific file
+                                # (selected files are contiguous from 1)
+                                if f["id"] > len(links):
+                                    return None
                             idx = f["id"] - 1
                             if 0 <= idx < len(links):
                                 for lf in (links[idx],):
@@ -194,13 +221,22 @@ def rd_find_by_title(q, season=None, episode=None):
                                         ur = rd_post("/unrestrict/link", {"link": lf})
                                         dl = ur.get("download") or ur.get("streamable")
                                         if dl:
-                                            return dl
+                                            # verify the returned URL is the right
+                                            # episode (file-id → link order can be
+                                            # off on packs)
+                                            want = f"s{int(season):02d}e{int(episode):02d}"
+                                            if want in dl.lower().replace("-", "").replace("_", "").replace(".", "").replace(" ", ""):
+                                                return dl
                                     except Exception:
                                         continue
-                                return links[idx]
+                                return None
                             break
                 except Exception:
                     pass
+                # If we asked for a specific episode but this torrent has no
+                # matching file/link, move on — NEVER fall back to links[0]
+                # (that could be a different episode of a pack).
+                continue
             try:
                 ur = rd_post("/unrestrict/link", {"link": t["links"][0]})
                 return ur.get("download") or ur.get("streamable")
@@ -225,18 +261,69 @@ def rd_find_existing(info_hash):
     return None
 
 
+def rd_find_existing_torrent(info_hash):
+    """Find the torrent id of an already-added hash (any status).
+    Returns (id, link_count) — link_count from the fast /torrents list,
+    so we can skip big packs with no links for the wanted episode without
+    fetching the (slow) full file list."""
+    try:
+        req = urllib.request.Request(f"{RD_API}/torrents", headers={"Authorization": f"Bearer {RD_KEY}", "User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            ts = json.loads(r.read())
+        for t in ts:
+            if (t.get("hash") or "").lower() == info_hash.lower():
+                return t["id"], len(t.get("links") or [])
+    except Exception:
+        pass
+    return None, 0
+
+
 def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, episode=None):
     """Harbor-proven flow: addMagnet → poll → selectFiles/{id} (files=1,2,3)
        → poll downloaded → pickLinkIndex → unrestrict → direct URL.
        Returns None fast for non-cached (Torrentio-style)."""
     # 0. Already in the account? Use the existing link (instant, no re-add).
-    existing = rd_find_existing(info_hash)
-    if existing and not filename and season is None:
-        try:
-            ur = rd_post("/unrestrict/link", {"link": existing})
-            return ur.get("download") or ur.get("streamable")
-        except Exception:
-            return existing
+    #    Re-adding the same hash makes RD re-download the whole pack — slow.
+    #    Instead, find the original torrent and pick the matching episode link.
+    existing_t = rd_find_existing_torrent(info_hash)
+    if existing_t:
+        existing_id, existing_links = existing_t
+        # Big pack with no/few links: the wanted episode isn't selected in the
+        # original torrent. Re-add it — the FRESH instance is in
+        # waiting_files_selection where selectFiles WORKS (RD downloads all
+        # selected files on their servers).
+        if season is not None and episode is not None and existing_links < 10:
+            pass  # fall through to re-add below
+        else:
+            try:
+                info = rd_get_cached(existing_id)
+                links = info.get("links") or []
+                if links:
+                    # if we want a specific episode, map file → link
+                    if season is not None and episode is not None:
+                        tag = f"s{int(season):02d}e{int(episode):02d}"
+                        for f in info.get("files") or []:
+                            if tag in f.get("path", "").lower():
+                                idx = f["id"] - 1
+                                if 0 <= idx < len(links):
+                                    try:
+                                        ur = rd_post("/unrestrict/link", {"link": links[idx]})
+                                        dl = ur.get("download") or ur.get("streamable")
+                                        # verify the returned URL is the right episode
+                                        # (file-id → link order can be off on packs)
+                                        if dl:
+                                            want = f"s{int(season):02d}e{int(episode):02d}"
+                                            if want in dl.lower().replace("-", "").replace("_", "").replace(".", "").replace(" ", ""):
+                                                return dl
+                                        return None
+                                    except Exception:
+                                        continue
+                                return None  # file not selected/linked — can't play
+                        return None  # no matching episode file in this torrent
+                    ur = rd_post("/unrestrict/link", {"link": links[0]})
+                    return ur.get("download") or ur.get("streamable")
+            except Exception:
+                pass
 
     # 1. Add magnet — FULL magnet with trackers bypasses RD's 451 filter
     #    (hash-only magnets get flagged as infringing; full magnet+trackers
@@ -270,17 +357,27 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
             if status == "magnet_error":
                 break
             if status in ("magnet_conversion", "waiting_files_selection") and not selected:
-                # resolve the episode file index from the filename hint or SxxExx
-                if eff_idx is None and filename:
-                    for i, f in enumerate(files):
-                        if filename.lower() in f.get("path", "").lower() or f.get("path", "").lower().endswith(filename.lower()):
-                            eff_idx = i
-                            break
-                if eff_idx is None and season is not None and episode is not None:
-                    mi = match_episode_file_index([f.get("path", "") for f in files], season, episode)
-                    if mi >= 0:
-                        eff_idx = mi
-                file_ids = pick_rd_files(files, eff_idx)
+                # For a pack re-add (episode requested but pack has few links),
+                # select ALL video files so every episode becomes playable —
+                # RD downloads them all on their servers.
+                if file_idx is not None or filename or (season is not None and episode is not None):
+                    select_all = True
+                else:
+                    select_all = False
+                if select_all:
+                    file_ids = [f["id"] for f in files if f.get("path", "").lower().endswith(VIDEO_EXTS)] or [f["id"] for f in files]
+                else:
+                    # resolve the episode file index from the filename hint or SxxExx
+                    if eff_idx is None and filename:
+                        for i, f in enumerate(files):
+                            if filename.lower() in f.get("path", "").lower() or f.get("path", "").lower().endswith(filename.lower()):
+                                eff_idx = i
+                                break
+                    if eff_idx is None and season is not None and episode is not None:
+                        mi = match_episode_file_index([f.get("path", "") for f in files], season, episode)
+                        if mi >= 0:
+                            eff_idx = mi
+                    file_ids = pick_rd_files(files, eff_idx)
                 if not file_ids:
                     break
                 try:
@@ -293,8 +390,14 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
             if status == "downloaded":
                 break
             if status in ("downloading", "queued"):
-                # RD is fetching it on THEIR servers (Stremio-style). Keep
-                # polling — popular torrents finish in 30s-3min, then stream.
+                # RD is fetching it on THEIR servers (Stremio-style). For huge
+                # packs this can take minutes — don't block the whole resolve;
+                # give it a few polls then give up (caller tries next hash).
+                global _dl_tries
+                _dl_tries += 1
+                if _dl_tries >= 8:
+                    _dl_tries = 0
+                    break
                 time.sleep(2)
                 continue
             if status in ("error", "virus", "dead"):
@@ -517,9 +620,9 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None):
                         return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
                 except Exception:
                     continue
-    # If the deadline fired with no URL and we still have candidates, skip the
-    # slow APIBay/EZTV tail entirely and report honestly.
-    if not candidates or (tried > 0 and time.time() >= deadline):
+    # If we already tried candidates and none streamed, report honestly —
+    # don't fall into the slow APIBay/EZTV tail (search_eztv can take 30s+).
+    if not candidates or tried > 0:
         return {"error": "no stream available on real-debrid yet (try again in a few minutes)", "imdb": imdb}
 
     # Remaining sources (APIBay / EZTV)

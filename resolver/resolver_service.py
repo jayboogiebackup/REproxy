@@ -44,7 +44,7 @@ def resolve(tmdb, mtype, season, episode):
         args += [str(season or 1), str(episode or 1)]
 
     env = dict(os.environ, NODE_PATH=NODE_PATH)
-    proc = subprocess.run(args, capture_output=True, text=True, timeout=90, env=env)
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=40, env=env)
     if proc.returncode != 0:
         return {"error": "resolve_failed", "detail": proc.stdout.strip() or proc.stderr.strip()}
 

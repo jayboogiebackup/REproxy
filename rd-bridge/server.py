@@ -325,6 +325,34 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
         return None
 
 
+def codec_rank(name):
+    """Browser-friendly + English-first ranking. Lower = better.
+    Penalizes: HEVC/AV1/2160p (unplayable), non-English dubs (RUS/CZ/SK/ES/IT/
+    PT/DE/HI), HDCAM (cam). Prefers: H264, 1080p/720p, MP4, English tags."""
+    n = (name or "").upper()
+    score = 0
+    if any(x in n for x in ("X265", "H265", "HEVC", "AV1", "VP9", "2160P", "4K")):
+        score += 100  # unplayable in most browsers
+    if "HDCAM" in n or "CAMRIP" in n or "TELESYNC" in n or "TS-" in n:
+        score += 200  # cam/telecine quality
+    # Non-English audio markers (dubbed/foreign releases)
+    if any(x in n for x in ("DUB", "RUS", "CZ", "SK", "ESP", "ITA", "POR", "GER", "HIN", "ARAB", "TUR", "UKR", "POL", "FRE", "NLD")):
+        score += 50
+    if "MULTI" in n:
+        score += 10  # multi-audio usually includes English, but not guaranteed
+    if "ENGLISH" in n or "ENG." in n or " EN " in n:
+        score -= 30
+    if "X264" in n or "H264" in n or "AVC" in n:
+        score += 0
+    if "720P" in n:
+        score += 5
+    if "1080P" in n:
+        score += 3
+    if n.endswith(".MP4") or ".MP4 " in n:
+        score -= 2  # MP4 container plays more reliably than MKV
+    return score
+
+
 def resolve_stream(tmdb, mtype, season=None, episode=None):
     """Full flow → direct stream URL."""
     if not RD_KEY:
@@ -356,14 +384,19 @@ def resolve_stream(tmdb, mtype, season=None, episode=None):
     # return instantly; 451s skip in ~1.5s each. Tight 20s budget.
     candidates = []
     candidates.extend(search_torrentio(imdb, mtype, season, episode))
+    order = []
+    tried = 0
+    deadline = time.time() + 115
     if candidates:
-        order = sorted(candidates, key=lambda c: -int(c.get("seeders") or 0))
-        # Stremio-style: try best-seeded first. Cached = instant; non-cached =
-        # RD downloads on their servers (30s-3min). Budget ~2.5min total.
-        deadline = time.time() + 130
+        # Browser-playable first (H264 > HEVC/AV1), then by seeders
+        order = sorted(candidates,
+                       key=lambda c: (codec_rank(c.get("name", "")), -int(c.get("seeders") or 0)))
+        # Stremio-style: try candidates until one streams. Cached = instant;
+        # non-cached = RD downloads on their servers (30s-3min).
+        deadline = time.time() + 115
         tried = 0
         for c in order:
-            if tried >= 3 or time.time() > deadline:
+            if tried >= 8 or time.time() > deadline:
                 break
             tried += 1
             try:
@@ -373,9 +406,26 @@ def resolve_stream(tmdb, mtype, season=None, episode=None):
                     return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
             except Exception:
                 continue
+        # Second pass: try the best-seeded candidates (may include cached HEVC
+        # that browsers with hardware decode CAN play)
+        if time.time() < deadline:
+            byseed = sorted(candidates, key=lambda c: -int(c.get("seeders") or 0))
+            for c in byseed:
+                if tried >= 14 or time.time() > deadline:
+                    break
+                if c["info_hash"] in [x["info_hash"] for x in order[:8]]:
+                    continue
+                tried += 1
+                try:
+                    url = rd_add_and_stream(c["info_hash"], file_idx=c.get("file_idx"),
+                                            filename=c.get("filename"), season=season, episode=episode)
+                    if url:
+                        return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
+                except Exception:
+                    continue
     # If the deadline fired with no URL and we still have candidates, skip the
     # slow APIBay/EZTV tail entirely and report honestly.
-    if not candidates or tried >= 3 or time.time() >= deadline:
+    if not candidates or (tried > 0 and time.time() >= deadline):
         return {"error": "no stream available on real-debrid yet (try again in a few minutes)", "imdb": imdb}
 
     # Remaining sources (APIBay / EZTV)

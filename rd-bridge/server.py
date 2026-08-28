@@ -655,11 +655,11 @@ def url_matches_type(url, mtype, season=None, episode=None):
     return bool(re.search(r"\be\d{1,3}\b", fn)) or bool(re.search(r"\bs\d{1,2}\b", fn))
 
 
-def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None):
+def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False):
     """Full flow → direct stream URL, with STRICT show/movie separation:
     a show never plays a movie and vice versa. Any resolved URL that fails
     the type check is rejected."""
-    result = _resolve_stream_impl(tmdb, mtype, season, episode, quality)
+    result = _resolve_stream_impl(tmdb, mtype, season, episode, quality, skip_account)
     url = result.get("url") if isinstance(result, dict) else None
     if url and not url_matches_type(url, mtype, season, episode):
         return {"error": "resolved link is the wrong type (show/movie mismatch)",
@@ -667,7 +667,7 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None):
     return result
 
 
-def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None):
+def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False):
     """Full flow → direct stream URL."""
     if not RD_KEY:
         return {"error": "REALDEBRID_API_KEY not set"}
@@ -678,21 +678,24 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None):
     # 0. The user's OWN RD library first (Harbor-style, instant) — already-
     #    downloaded content always works, no 451, no waiting. Only check the
     #    PRIMARY titles (alt-titles in every language would take 40s+).
-    try:
-        st, body = http_get(f"https://api.themoviedb.org/3/{'movie' if mtype == 'movie' else 'tv'}/{tmdb}?api_key={TMDB_KEY}", timeout=15)
-        tdata = json.loads(body)
-        names = set()
-        for k in ("title", "name", "original_title", "original_name"):
-            if tdata.get(k):
-                names.add(tdata[k])
-        for q in list(names)[:4]:
-            if not q:
-                continue
-            url = rd_find_by_title(q, season, episode)
-            if url:
-                return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
-    except Exception:
-        pass
+    #    skip_account=True (player detected a silent stream) bypasses this so
+    #    Torrentio candidates with browser-playable audio get picked instead.
+    if not skip_account:
+        try:
+            st, body = http_get(f"https://api.themoviedb.org/3/{'movie' if mtype == 'movie' else 'tv'}/{tmdb}?api_key={TMDB_KEY}", timeout=15)
+            tdata = json.loads(body)
+            names = set()
+            for k in ("title", "name", "original_title", "original_name"):
+                if tdata.get(k):
+                    names.add(tdata[k])
+            for q in list(names)[:4]:
+                if not q:
+                    continue
+                url = rd_find_by_title(q, season, episode)
+                if url:
+                    return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
+        except Exception:
+            pass
 
     # Torrentio — aggregates 100+ indexers by IMDb id. Only cached adds
     # return instantly; 451s skip in ~1.5s each. Tight 20s budget.
@@ -835,6 +838,7 @@ class Handler(BaseHTTPRequestHandler):
             season = q.get("season", [None])[0]
             episode = q.get("episode", [None])[0]
             quality = q.get("quality", [None])[0]
+            skip_account = q.get("skip_account", ["0"])[0] == "1"
             # Run the resolve in a SUBPROCESS with a hard timeout — a hung
             # RD call can never deadlock the server thread pool this way.
             import subprocess as _sp
@@ -847,6 +851,8 @@ class Handler(BaseHTTPRequestHandler):
                 args.append(episode)
             if quality:
                 args.append(quality)
+            if skip_account:
+                args.append("--skip-account")
             try:
                 proc = _sp.run(args, capture_output=True, text=True, timeout=150)
                 out = proc.stdout.strip()

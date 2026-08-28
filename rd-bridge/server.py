@@ -495,6 +495,12 @@ def codec_rank(name, want_height=None):
     score = 0
     if any(x in n for x in ("X265", "H265", "HEVC", "AV1", "VP9", "2160P", "4K")):
         score += 100  # unplayable in most browsers
+    # Audio codecs: browsers can't play DTS/TrueHD/DTS-HD/FLAC-lossless audio
+    # (video plays with NO sound). Prefer AAC/AC-3/E-AC-3/MP3/Opus.
+    if any(x in n for x in ("DTS", "TRUEHD", "TRUE-HD", "ATMOS", "FLAC", "PCM")):
+        score += 40  # video plays but audio is silent in browsers
+    if any(x in n for x in ("AAC", "AC3", "AC-3", "EAC3", "E-AC-3", "MP3", "OPUS", "AUDIO")):
+        score -= 15
     if "HDCAM" in n or "CAMRIP" in n or "TELESYNC" in n or "TS-" in n:
         score += 200  # cam/telecine quality
     # Non-English audio markers (dubbed/foreign releases)

@@ -163,11 +163,11 @@ async function resolveVidking(tmdb, type, season, episode) {
     for (const { label, url } of attempts) {
       streamUrl = null; // reset per attempt
       try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 10000 });
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 8000 });
       } catch { continue; }
-      // Fast poll: m3u8 fires within ~1-2s when a server has the title
-      const deadline = Date.now() + 2000;
-      while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(100);
+      // Fast poll: m3u8 fires within ~0.5-1s when a server has the title
+      const deadline = Date.now() + 1200;
+      while (!streamUrl && Date.now() < deadline) await page.waitForTimeout(80);
       if (streamUrl) {
         source = source || label;
         found.push({ provider: label, url: streamUrl });
@@ -287,14 +287,6 @@ async function main() {
       url = await resolveCinesrc(tmdb, type, season, episode);
       source = url ? 'cinesrc' : null;
       if (url) servers.push({ provider: 'cinesrc', url });
-    } catch { url = null; }
-  }
-
-  if (!url) {
-    try {
-      url = await resolveFilmu(tmdb, type, season, episode);
-      source = url ? 'filmu' : null;
-      if (url) servers.push({ provider: 'filmu', url });
     } catch { url = null; }
   }
 

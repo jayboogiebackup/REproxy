@@ -334,8 +334,32 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
                                         continue
                                 return None  # file not selected/linked — can't play
                         return None  # no matching episode file in this torrent
-                    ur = rd_post("/unrestrict/link", {"link": links[0]})
-                    return ur.get("download") or ur.get("streamable")
+                    # Movie / no-episode: map via file_idx or filename hint
+                    # (a pack contains MANY movies — links[0] is wrong unless
+                    # the requested title is the first file).
+                    eff_idx2 = file_idx
+                    if eff_idx2 is None and filename:
+                        for i, f in enumerate(info.get("files") or []):
+                            if filename.lower() in f.get("path", "").lower() or f.get("path", "").lower().endswith(filename.lower()):
+                                eff_idx2 = i
+                                break
+                    li2 = pick_link_index(info.get("files"), eff_idx2, len(links))
+                    for probe in ([li2] + [i for i in range(len(links)) if i != li2][:5]):
+                        if probe < 0 or probe >= len(links):
+                            continue
+                        try:
+                            ur = rd_post("/unrestrict/link", {"link": links[probe]})
+                            dl = ur.get("download") or ur.get("streamable")
+                            if dl:
+                                if filename:
+                                    want = filename.lower()[:20].replace("-", "").replace("_", "").replace(".", "").replace(" ", "")
+                                    if want in dl.lower().replace("-", "").replace("_", "").replace(".", "").replace(" ", ""):
+                                        return dl
+                                else:
+                                    return dl
+                        except Exception:
+                            continue
+                    return None
             except Exception:
                 pass
 
@@ -435,11 +459,31 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
         if mi >= 0:
             eff_idx = mi
     link_idx = pick_link_index(info.get("files"), eff_idx, len(links))
-    try:
-        ur = rd_post("/unrestrict/link", {"link": links[link_idx]})
-        return ur.get("download") or ur.get("streamable")
-    except Exception:
-        return None
+    # Verify the chosen link is actually the right FILE: try the mapped link
+    # first; if its filename doesn't match the requested title/episode, walk
+    # nearby links (file-id order can drift on freshly-added packs).
+    import re as _re
+    for probe in ([link_idx] + [i for i in range(len(links)) if i != link_idx][:4]):
+        if probe < 0 or probe >= len(links):
+            continue
+        try:
+            ur = rd_post("/unrestrict/link", {"link": links[probe]})
+            dl = ur.get("download") or ur.get("streamable")
+            if dl:
+                fnl = dl.lower().replace("-", "").replace("_", "").replace(".", "").replace(" ", "")
+                want_pat = None
+                if season is not None and episode is not None:
+                    want_pat = f"s{int(season):02d}e{int(episode):02d}"
+                elif filename:
+                    want_pat = filename.lower()[:20].replace("-", "").replace("_", "").replace(".", "").replace(" ", "")
+                if want_pat:
+                    if want_pat in fnl:
+                        return dl
+                else:
+                    return dl  # no way to verify — trust the mapping
+        except Exception:
+            continue
+    return None
 
 
 def codec_rank(name, want_height=None):
@@ -667,8 +711,8 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None):
                         return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
                 except Exception:
                     continue
-    # If we already tried candidates and none streamed, report honestly —
-    # don't fall into the slow APIBay/EZTV tail (search_eztv can take 30s+).
+    # All candidates tried and none streamed — report honestly, skip the slow
+    # APIBay/EZTV tail (search_eztv can take 30s+).
     if not candidates or tried > 0:
         return {"error": "no stream available on real-debrid yet (try again in a few minutes)", "imdb": imdb}
 

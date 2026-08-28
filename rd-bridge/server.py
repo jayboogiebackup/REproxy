@@ -353,6 +353,90 @@ def codec_rank(name):
     return score
 
 
+def os_subs(tmdb, mtype, season=None, episode=None):
+    """OpenSubtitles search by IMDb id → list of subtitle files.
+    Downloads the SRT and converts to VTT (browser-playable via <track>)."""
+    try:
+        imdb = tmdb_to_imdb(tmdb, "movie" if mtype == "movie" else "tv")
+        if not imdb:
+            return []
+        url = f"https://api.opensubtitles.com/api/v1/subtitles?imdb_id={imdb}&languages=en"
+        if season and episode:
+            url += f"&season_number={season}&episode_number={episode}"
+        req = urllib.request.Request(url, headers={"Api-Key": os.environ.get("OPENSUBTITLES_API_KEY", ""),
+                                                   "User-Agent": "repeaks v1"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read())
+        out = []
+        seen = set()
+        for s in (d.get("data") or []):
+            att = s.get("attributes", {})
+            lang = att.get("language", "en")
+            fn = att.get("release_name", "") or att.get("title", "") or f"Subtitle {s.get('id')}"
+            fid = str(s.get("id"))
+            if lang in seen:
+                continue
+            seen.add(lang)
+            out.append({"label": lang.capitalize(), "file_id": fid, "name": fn[:60], "file": None})
+        return out
+    except Exception:
+        return []
+
+
+def os_download_vtt(file_id):
+    """Fetch the SRT (legacy direct link first — the API download endpoint
+    503s from datacenter IPs) → convert to VTT → cache locally."""
+    import tempfile
+    try:
+        srt = None
+        # 1) Legacy direct download link (works from server IPs)
+        try:
+            req0 = urllib.request.Request(
+                f"https://dl.opensubtitles.org/en/download/subad/{file_id}",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0"})
+            with urllib.request.urlopen(req0, timeout=30) as r0:
+                raw = r0.read()
+                if b"WEBVTT" in raw[:20] or b"--> " in raw[:2000] or b"<" not in raw[:2000]:
+                    srt = raw.decode("utf-8", "replace")
+                else:
+                    srt = None  # HTML error page
+        except Exception:
+            srt = None
+        # 2) API download endpoint (falls back if legacy blocked)
+        if srt is None:
+            body = urllib.parse.urlencode({"file_id": file_id}).encode()
+            req = urllib.request.Request("https://api.opensubtitles.com/api/v1/download", data=body, method="POST",
+                                         headers={"Api-Key": os.environ.get("OPENSUBTITLES_API_KEY", ""),
+                                                  "User-Agent": "repeaks v1",
+                                                  "Content-Type": "application/x-www-form-urlencoded"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                dl = json.loads(r.read())
+            srt_url = dl.get("link")
+            if srt_url:
+                req2 = urllib.request.Request(srt_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req2, timeout=30) as r2:
+                    srt = r2.read().decode("utf-8", "replace")
+        if not srt:
+            return None
+        # SRT → VTT conversion
+        srt = srt.replace("\r\n", "\n").replace("\r", "\n")
+        lines = []
+        for ln in srt.split("\n"):
+            if "-->" in ln:
+                ln = ln.replace(",", ".")
+            lines.append(ln)
+        vtt = "WEBVTT\n\n" + "\n".join(lines).lstrip("\n")
+        # cache to disk so the player can fetch it repeatedly
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "os_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        path = os.path.join(cache_dir, f"{file_id}.vtt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(vtt)
+        return path
+    except Exception:
+        return None
+
+
 def resolve_stream(tmdb, mtype, season=None, episode=None):
     """Full flow → direct stream URL."""
     if not RD_KEY:
@@ -545,6 +629,38 @@ class Handler(BaseHTTPRequestHandler):
             if not qq:
                 return self._json({"error": "q required"}, 400)
             return self._json(search_apibay(qq, q.get("cat", ["0"])[0]))
+        # OpenSubtitles: list subs for a title
+        if url.path == "/api/rd/subs":
+            tmdb = q.get("tmdb", [None])[0]
+            mtype = q.get("type", [None])[0]
+            if not tmdb or not mtype:
+                return self._json({"error": "tmdb + type required"}, 400)
+            season = q.get("season", [None])[0]
+            episode = q.get("episode", [None])[0]
+            subs = os_subs(int(tmdb), mtype,
+                           int(season) if season else None,
+                           int(episode) if episode else None)
+            return self._json({"subs": subs})
+        # OpenSubtitles: get the converted VTT for a file_id
+        if url.path == "/api/rd/sub":
+            fid = q.get("file_id", [None])[0]
+            if not fid:
+                return self._json({"error": "file_id required"}, 400)
+            path = os_download_vtt(fid)
+            if not path:
+                return self._json({"error": "download failed"}, 404)
+            try:
+                with open(path, "rb") as f:
+                    vtt = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/vtt; charset=utf-8")
+                self.send_header("Content-Length", str(len(vtt)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(vtt)
+            except Exception:
+                return self._json({"error": "read failed"}, 500)
+            return
         self._json({"error": "not found"}, 404)
 
     def log_message(self, format, *args):

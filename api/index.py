@@ -873,6 +873,59 @@ def api_rd_stream():
         return _json({"status": False, "error": f"rd bridge error: {exc}"}), 502
 
 
+@app.route("/api/rd/subs")
+def api_rd_subs():
+    """OpenSubtitles subtitle list — forwards to the Pi RD bridge."""
+    bridge = os.environ.get("RD_BRIDGE_URL", "https://albums-bedrooms-mods-cow.trycloudflare.com").rstrip("/")
+    try:
+        params = {k: request.args.get(k) for k in ("tmdb", "type", "season", "episode") if request.args.get(k)}
+        qs = urllib.parse.urlencode(params)
+        req = urllib.request.Request(f"{bridge}/api/rd/subs?{qs}", headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return _json(json.loads(resp.read().decode()))
+    except Exception as exc:
+        return _json({"error": f"subs bridge error: {exc}"}), 502
+
+
+@app.route("/api/rd/sub")
+def api_rd_sub():
+    """OpenSubtitles VTT — fetch via OpenSubtitles API from Vercel's IP
+    (the Pi/datacenter IPs get 503, Vercel's usually works)."""
+    fid = request.args.get("file_id")
+    if not fid:
+        return _json({"error": "file_id required"}), 400
+    key = os.environ.get("OPENSUBTITLES_API_KEY", "")
+    if not key:
+        return _json({"error": "OPENSUBTITLES_API_KEY not set"}), 503
+    try:
+        body = urllib.parse.urlencode({"file_id": fid}).encode()
+        req = urllib.request.Request(
+            "https://api.opensubtitles.com/api/v1/download", data=body, method="POST",
+            headers={"Api-Key": key, "User-Agent": "repeaks v1",
+                     "Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            dl = json.loads(resp.read().decode())
+        srt_url = dl.get("link")
+        if not srt_url:
+            return _json({"error": "no link"}), 404
+        req2 = urllib.request.Request(srt_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req2, timeout=40) as resp2:
+            srt = resp2.read().decode("utf-8", "replace")
+        # SRT → VTT
+        srt = srt.replace("\r\n", "\n").replace("\r", "\n")
+        lines = []
+        for ln in srt.split("\n"):
+            if "-->" in ln:
+                ln = ln.replace(",", ".")
+            lines.append(ln)
+        vtt = "WEBVTT\n\n" + "\n".join(lines).lstrip("\n")
+        return Response(vtt, content_type="text/vtt; charset=utf-8",
+                        headers={"Access-Control-Allow-Origin": "*",
+                                 "Cache-Control": "public, max-age=86400"})
+    except Exception as exc:
+        return _json({"error": f"opensubtitles: {exc}"}), 502
+
+
 @app.route("/api/stream")
 def api_stream():
     slug = (request.args.get("slug") or "").strip()

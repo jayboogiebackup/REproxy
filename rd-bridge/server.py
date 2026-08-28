@@ -184,6 +184,7 @@ def rd_find_by_title(q, season=None, episode=None):
             ts = json.loads(r.read())
         words = [w.lower() for w in q.split() if (w.isdigit() or len(w) > 2) and w.lower() not in
                  ("and", "the", "for", "with", "from", "that", "this", "not", "are", "was", "but", "you", "all", "she", "his", "her", "its", "has", "had", "have", "who", "which", "what", "when", "where", "why", "how")]
+        movie_hits = []  # (codec_score, filename, torrent) for movie mode
         for t in ts:
             if t.get("status") != "downloaded" or not t.get("links"):
                 continue
@@ -207,6 +208,8 @@ def rd_find_by_title(q, season=None, episode=None):
                     continue
                 if re.search(r"\bseason\b|\bs\d{1,2}\b.*(pack|complete|collection)|(pack|complete|collection).*\bs\d{1,2}\b", fn):
                     continue
+                movie_hits.append((codec_rank(t.get("filename", "")), t))
+                continue
             elif season is not None and episode is not None:
                 tag = f"s{int(season):02d}e{int(episode):02d}"
                 if tag not in fn:
@@ -253,9 +256,24 @@ def rd_find_by_title(q, season=None, episode=None):
                 continue
             try:
                 ur = rd_post("/unrestrict/link", {"link": t["links"][0]})
-                return ur.get("download") or ur.get("streamable")
+                dl = ur.get("download") or ur.get("streamable")
+                if dl:
+                    return dl
+                return t["links"][0]
             except Exception:
                 return t["links"][0]
+        # Movie mode: return the BEST (audio-safe, H264) account match
+        if movie_hits:
+            movie_hits.sort(key=lambda x: x[0])
+            best = movie_hits[0][1]
+            try:
+                ur = rd_post("/unrestrict/link", {"link": best["links"][0]})
+                dl = ur.get("download") or ur.get("streamable")
+                if dl:
+                    return dl
+                return best["links"][0]
+            except Exception:
+                return best["links"][0]
     except Exception:
         pass
     return None
@@ -495,12 +513,15 @@ def codec_rank(name, want_height=None):
     score = 0
     if any(x in n for x in ("X265", "H265", "HEVC", "AV1", "VP9", "2160P", "4K")):
         score += 100  # unplayable in most browsers
-    # Audio codecs: browsers can't play DTS/TrueHD/DTS-HD/FLAC-lossless audio
-    # (video plays with NO sound). Prefer AAC/AC-3/E-AC-3/MP3/Opus.
-    if any(x in n for x in ("DTS", "TRUEHD", "TRUE-HD", "ATMOS", "FLAC", "PCM")):
-        score += 40  # video plays but audio is silent in browsers
-    if any(x in n for x in ("AAC", "AC3", "AC-3", "EAC3", "E-AC-3", "MP3", "OPUS", "AUDIO")):
-        score -= 15
+    # Audio codecs: Chrome only decodes AAC/MP3/Opus/Vorbis/FLAC. AC-3,
+    # E-AC-3, DTS, TrueHD, Atmos, PCM → video plays with NO sound.
+    # (MP4 + AC-3 also silent in Chrome — DolbyD/Dolby Digital = AC-3.)
+    if any(x in n for x in ("DTS", "TRUEHD", "TRUE-HD", "ATMOS", "PCM", "AC3", "AC-3", "EAC3", "E-AC-3", "DOLBYD", "DOLBY DIGITAL", "DD 5.1", "DD5.1", "DDP")):
+        score += 60  # silent in Chrome/Edge/Firefox
+    if "FLAC" in n:
+        score += 20  # Chrome MKV/MP4 FLAC works, but less common — mild penalty
+    if any(x in n for x in ("AAC", "AAC2.0", "MP3", "OPUS", "VORBIS", "AUDIO")):
+        score -= 25  # always plays in browsers
     if "HDCAM" in n or "CAMRIP" in n or "TELESYNC" in n or "TS-" in n:
         score += 200  # cam/telecine quality
     # Non-English audio markers (dubbed/foreign releases)

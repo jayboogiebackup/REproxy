@@ -253,8 +253,33 @@ def resolve_stream(tmdb, mtype, season=None, episode=None):
     if not imdb:
         return {"error": "no imdb id"}
 
+    # 0. The user's OWN RD library first — already-downloaded content always
+    #    works (no 451 walls) and streams instantly. Match by all known titles.
+    try:
+        st, body = http_get(f"https://api.themoviedb.org/3/{'movie' if mtype == 'movie' else 'tv'}/{tmdb}?api_key={TMDB_KEY}", timeout=15)
+        tdata = json.loads(body)
+        names = set()
+        for k in ("title", "name", "original_title", "original_name"):
+            if tdata.get(k):
+                names.add(tdata[k])
+        try:
+            st2, body2 = http_get(f"https://api.themoviedb.org/3/{'movie' if mtype == 'movie' else 'tv'}/{tmdb}/alternative_titles?api_key={TMDB_KEY}", timeout=15)
+            alt = json.loads(body2)
+            for a in alt.get("titles", []):
+                names.add(a.get("title", ""))
+        except Exception:
+            pass
+        for q in names:
+            if not q:
+                continue
+            url = rd_find_by_title(q)
+            if url:
+                return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
+    except Exception:
+        pass
+
     candidates = []
-    # Torrentio first — aggregates 100+ indexers by IMDb id (best coverage)
+    # Torrentio — aggregates 100+ indexers by IMDb id (best coverage)
     candidates.extend(search_torrentio(imdb, mtype, season, episode))
 
     if mtype == "movie":

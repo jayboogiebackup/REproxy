@@ -851,8 +851,15 @@ def api_rd_stream():
                 params[k] = request.args[k]
         qs = urllib.parse.urlencode(params)
         req = urllib.request.Request(f"{bridge}/api/rd/stream?{qs}", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            data = json.loads(resp.read().decode())
+        try:
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            # bridge returns 404 with a JSON error body when it can't resolve
+            try:
+                data = json.loads(e.read().decode() or "{}")
+            except Exception:
+                data = {"error": f"bridge http {e.code}"}
         if data.get("url"):
             return _json({"status": True, "source": "realdebrid", "tmdb": int(tmdb), "type": mtype,
                           "season": int(params.get("season")) if params.get("season") else None,

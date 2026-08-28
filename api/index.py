@@ -838,7 +838,10 @@ def api_rd_stream():
     mtype = (request.args.get("type") or "").strip()
     if not tmdb or mtype not in ("movie", "tv", "anime"):
         return _json({"status": False, "error": "tmdb + type required"}), 400
-    bridge = os.environ.get("RD_BRIDGE_URL", "").rstrip("/")
+    bridge = os.environ.get(
+        "RD_BRIDGE_URL",
+        "https://albums-bedrooms-mods-cow.trycloudflare.com",
+    ).rstrip("/")
     if not bridge:
         return _json({"status": False, "error": "RD_BRIDGE_URL not set"}), 503
     try:

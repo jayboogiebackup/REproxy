@@ -830,6 +830,36 @@ def api_replayer_stream():
     })
 
 
+@app.route("/api/rd/stream")
+def api_rd_stream():
+    """Real-Debrid stream — forwards to the Pi's RD bridge (addMagnet→select→unrestrict).
+       Returns a direct MP4/MKV URL playable in our native player."""
+    tmdb = (request.args.get("tmdb") or "").strip()
+    mtype = (request.args.get("type") or "").strip()
+    if not tmdb or mtype not in ("movie", "tv", "anime"):
+        return _json({"status": False, "error": "tmdb + type required"}), 400
+    bridge = os.environ.get("RD_BRIDGE_URL", "").rstrip("/")
+    if not bridge:
+        return _json({"status": False, "error": "RD_BRIDGE_URL not set"}), 503
+    try:
+        params = {"tmdb": tmdb, "type": mtype}
+        for k in ("season", "episode"):
+            if request.args.get(k):
+                params[k] = request.args[k]
+        qs = urllib.parse.urlencode(params)
+        req = urllib.request.Request(f"{bridge}/api/rd/stream?{qs}", headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("url"):
+            return _json({"status": True, "source": "realdebrid", "tmdb": int(tmdb), "type": mtype,
+                          "season": int(params.get("season")) if params.get("season") else None,
+                          "episode": int(params.get("episode")) if params.get("episode") else None,
+                          "url": data["url"], "provider": "realdebrid", "servers": [{"id": "realdebrid", "name": "Real-Debrid", "url": data["url"]}]})
+        return _json({"status": False, "error": data.get("error", "rd failed")}), 404
+    except Exception as exc:
+        return _json({"status": False, "error": f"rd bridge error: {exc}"}), 502
+
+
 @app.route("/api/stream")
 def api_stream():
     slug = (request.args.get("slug") or "").strip()

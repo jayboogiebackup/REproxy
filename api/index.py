@@ -849,7 +849,7 @@ def api_rd_stream():
         return _json({"status": False, "error": "RD_BRIDGE_URL not set"}), 503
     try:
         params = {"tmdb": tmdb, "type": mtype}
-        for k in ("season", "episode"):
+        for k in ("season", "episode", "quality"):
             if request.args.get(k):
                 params[k] = request.args[k]
         qs = urllib.parse.urlencode(params)

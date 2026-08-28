@@ -325,10 +325,11 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
         return None
 
 
-def codec_rank(name):
+def codec_rank(name, want_height=None):
     """Browser-friendly + English-first ranking. Lower = better.
     Penalizes: HEVC/AV1/2160p (unplayable), non-English dubs (RUS/CZ/SK/ES/IT/
-    PT/DE/HI), HDCAM (cam). Prefers: H264, 1080p/720p, MP4, English tags."""
+    PT/DE/HI), HDCAM (cam). Prefers: H264, 1080p/720p, MP4, English tags.
+    want_height (e.g. 720) biases toward that resolution."""
     n = (name or "").upper()
     score = 0
     if any(x in n for x in ("X265", "H265", "HEVC", "AV1", "VP9", "2160P", "4K")):
@@ -344,10 +345,18 @@ def codec_rank(name):
         score -= 30
     if "X264" in n or "H264" in n or "AVC" in n:
         score += 0
-    if "720P" in n:
-        score += 5
-    if "1080P" in n:
-        score += 3
+    # Resolution bias: prefer the requested height when set
+    if want_height:
+        h = 1080 if "1080P" in n else 720 if "720P" in n else 480 if "480P" in n else None
+        if h is None:
+            score += 8  # unknown resolution — slight penalty
+        else:
+            score += abs(h - want_height) // 200  # closer = better
+    else:
+        if "720P" in n:
+            score += 5
+        if "1080P" in n:
+            score += 3
     if n.endswith(".MP4") or ".MP4 " in n:
         score -= 2  # MP4 container plays more reliably than MKV
     return score
@@ -437,7 +446,7 @@ def os_download_vtt(file_id):
         return None
 
 
-def resolve_stream(tmdb, mtype, season=None, episode=None):
+def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None):
     """Full flow → direct stream URL."""
     if not RD_KEY:
         return {"error": "REALDEBRID_API_KEY not set"}
@@ -472,9 +481,10 @@ def resolve_stream(tmdb, mtype, season=None, episode=None):
     tried = 0
     deadline = time.time() + 115
     if candidates:
-        # Browser-playable first (H264 > HEVC/AV1), then by seeders
+        # Browser-playable first (H264 > HEVC/AV1), biased to requested quality
+        want_h = 1080 if quality == "1080" else 720 if quality == "720" else 480 if quality == "480" else None
         order = sorted(candidates,
-                       key=lambda c: (codec_rank(c.get("name", "")), -int(c.get("seeders") or 0)))
+                       key=lambda c: (codec_rank(c.get("name", ""), want_h), -int(c.get("seeders") or 0)))
         # Stremio-style: try candidates until one streams. Cached = instant;
         # non-cached = RD downloads on their servers (30s-3min).
         deadline = time.time() + 115
@@ -603,6 +613,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "tmdb + type required"}, 400)
             season = q.get("season", [None])[0]
             episode = q.get("episode", [None])[0]
+            quality = q.get("quality", [None])[0]
             # Run the resolve in a SUBPROCESS with a hard timeout — a hung
             # RD call can never deadlock the server thread pool this way.
             import subprocess as _sp
@@ -613,6 +624,8 @@ class Handler(BaseHTTPRequestHandler):
                 args.append(season)
             if episode:
                 args.append(episode)
+            if quality:
+                args.append(quality)
             try:
                 proc = _sp.run(args, capture_output=True, text=True, timeout=150)
                 out = proc.stdout.strip()

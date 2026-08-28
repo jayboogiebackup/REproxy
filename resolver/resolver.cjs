@@ -169,23 +169,27 @@ async function resolveVidking(tmdb, type, season, episode) {
       const t = setInterval(() => {
         if (u) { clearInterval(t); resolve(u); }
       }, 80);
-      setTimeout(() => { clearInterval(t); resolve(u); }, 4000);
+      setTimeout(() => { clearInterval(t); resolve(u); }, 2000);
     });
 
+    // Two full passes over ALL servers. First pass collects any hits;
+    // if nothing, a second pass retries (servers are flaky) before giving up.
     const found = [];
     const CONC = 4;
-    for (let i = 0; i < attempts.length; i += CONC) {
-      const batch = attempts.slice(i, i + CONC);
-      const results = await Promise.all(batch.map(async ({ label, url }) => {
-        const p = await ctx.newPage();
-        const got = grab(p);
-        try { await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 6000 }); } catch { /* ignore */ }
-        const m3u8 = await got;
-        await p.close().catch(() => {});
-        return m3u8 ? { provider: label, url: m3u8 } : null;
-      }));
-      for (const r of results) if (r) found.push(r);
-      if (found.length) break; // stop once any server found a stream
+    for (let pass = 0; pass < 2 && found.length === 0; pass++) {
+      for (let i = 0; i < attempts.length; i += CONC) {
+        const batch = attempts.slice(i, i + CONC);
+        const results = await Promise.all(batch.map(async ({ label, url }) => {
+          const p = await ctx.newPage();
+          const got = grab(p);
+          try { await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 4000 }); } catch { /* ignore */ }
+          const m3u8 = await got;
+          await p.close().catch(() => {});
+          return m3u8 ? { provider: label, url: m3u8 } : null;
+        }));
+        for (const r of results) if (r) found.push(r);
+        if (found.length) break; // stop once any server found a stream
+      }
     }
     const source = found.length ? found[0].label : null;
     return { url: found.length ? found[0].url : null, source, servers: found };

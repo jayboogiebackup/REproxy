@@ -182,21 +182,35 @@ def rd_find_by_title(q, season=None, episode=None):
         req = urllib.request.Request(f"{RD_API}/torrents", headers={"Authorization": f"Bearer {RD_KEY}", "User-Agent": UA})
         with urllib.request.urlopen(req, timeout=25) as r:
             ts = json.loads(r.read())
-        words = [w.lower() for w in q.split() if len(w) > 2 and w.lower() not in
+        words = [w.lower() for w in q.split() if (w.isdigit() or len(w) > 2) and w.lower() not in
                  ("and", "the", "for", "with", "from", "that", "this", "not", "are", "was", "but", "you", "all", "she", "his", "her", "its", "has", "had", "have", "who", "which", "what", "when", "where", "why", "how")]
         for t in ts:
             if t.get("status") != "downloaded" or not t.get("links"):
                 continue
             fn = (t.get("filename") or "").lower()
-            # When asking for a specific episode, the TORRENT must contain the
-            # SxxExx tag — otherwise a "Rick and Morty" title match could hit a
-            # single-episode torrent of the wrong episode.
-            if season is not None and episode is not None:
-                tag = f"s{int(season):02d}e{int(episode):02d}"
-                if tag not in fn and not any(w in fn for w in words):
-                    continue
-            elif not any(re.search(rf"(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])", fn) for w in words):
+            # Title words must ALWAYS match (word boundaries). The episode tag
+            # is an additional filter when an episode is requested — but the
+            # tag alone (e.g. Loki S02E01 matching "60 Days In" S2E1 request
+            # via s02e01) must NEVER pass without a title word match.
+            if not any(re.search(rf"(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])", fn) for w in words):
                 continue
+            if season is None and episode is None:
+                # Movie mode: the torrent must NOT look like TV content and
+                # must match MULTIPLE title words (a single shared word like
+                # "days" in "60 Days In" must never match "X-Men: Days of
+                # Future Past"). A movie must never resolve to an episode or
+                # a season pack.
+                matched_words = [w for w in words if re.search(rf"(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])", fn)]
+                if len(matched_words) < 2 and len(words) >= 2:
+                    continue
+                if re.search(r"s\d{1,2}e\d{1,2}", fn) or re.search(r"\b\d{1,2}x\d{2}\b", fn):
+                    continue
+                if re.search(r"\bseason\b|\bs\d{1,2}\b.*(pack|complete|collection)|(pack|complete|collection).*\bs\d{1,2}\b", fn):
+                    continue
+            elif season is not None and episode is not None:
+                tag = f"s{int(season):02d}e{int(episode):02d}"
+                if tag not in fn:
+                    continue
             # If asking for a specific episode, find the matching file
             if season is not None and episode is not None:
                 try:
@@ -549,7 +563,40 @@ def os_download_vtt(file_id):
         return None
 
 
+def url_matches_type(url, mtype, season=None, episode=None):
+    """STRICT show/movie separation: a show must never play a movie and
+    vice versa. Verifies the resolved URL's filename against the request:
+      - type=tv:  URL must contain the SxxExx episode pattern (or at least
+                  a season/episode marker). A bare movie filename fails.
+      - type=movie: URL must NOT contain an SxxExx pattern (that's an episode).
+    Returns True when the URL is type-compatible."""
+    if not url:
+        return False
+    fn = (url.split("/")[-1] or "").lower().replace("%20", " ").replace("-", "").replace("_", "").replace(".", "")
+    has_ep = bool(re.search(r"s\d{1,2}e\d{1,2}", fn)) or bool(re.search(r"(?<!\d)\d{1,2}x\d{2}(?!\d)", fn))
+    if mtype == "movie":
+        return not has_ep
+    # tv/anime: need an episode marker
+    if has_ep:
+        return True
+    # some releases name files like "Show.Name.1x03" or "S01E03" already caught;
+    # also accept a lone "E03" style or season pack folders with s01/s02
+    return bool(re.search(r"\be\d{1,3}\b", fn)) or bool(re.search(r"\bs\d{1,2}\b", fn))
+
+
 def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None):
+    """Full flow → direct stream URL, with STRICT show/movie separation:
+    a show never plays a movie and vice versa. Any resolved URL that fails
+    the type check is rejected."""
+    result = _resolve_stream_impl(tmdb, mtype, season, episode, quality)
+    url = result.get("url") if isinstance(result, dict) else None
+    if url and not url_matches_type(url, mtype, season, episode):
+        return {"error": "resolved link is the wrong type (show/movie mismatch)",
+                "imdb": result.get("imdb")}
+    return result
+
+
+def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None):
     """Full flow → direct stream URL."""
     if not RD_KEY:
         return {"error": "REALDEBRID_API_KEY not set"}

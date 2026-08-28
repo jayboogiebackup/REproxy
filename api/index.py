@@ -708,10 +708,11 @@ def api_replayer_relay():
         "https://tiktoks.animanga.fun/",
         "https://streamvaultsrc.click/",
         "https://gdvid.info/",
-        "https://download.real-debrid.com/",
         "https://cache.vdrk.site/",
     )
-    if not url.startswith(allowed_prefixes):
+    # Real-Debrid CDN: subdomain-per-server hosts (mia5-4.download.real-debrid.com)
+    is_rd = re.match(r"^https://([a-z0-9-]+\.)*download\.real-debrid\.com/", url, re.I) is not None
+    if not url.startswith(allowed_prefixes) and not is_rd:
         return _json({"status": False, "error": "invalid url"}), 400
 
     referer = "https://hentaimama.io/" if url.startswith("https://gdvid.info/") else (

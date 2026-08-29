@@ -58,7 +58,7 @@ def audio_codec_is_browser_safe(url, ttl=3600, filename_hint=None):
         if any(x in n for x in ("AC3", "AC-3", "EAC3", "E-AC-3", "DTS", "TRUEHD", "TRUE-HD", "ATMOS", "DOLBYD", "DOLBY DIGITAL", "DD 5.1", "DD5.1", "DDP", "DTS-HD")):
             _codec_cache[url.split("/d/")[-1].split("/")[0] if "/d/" in url else url] = (time.time(), False)
             return False
-        if any(x in n for x in ("AAC", "AAC2.0", "MP3", "OPUS", "VORBIS", "FLAC")):
+        if any(x in n for x in ("AAC", "AAC2.0", "MP3", "OPUS", "VORBIS", "FLAC", "MP4A", "MPEG-4 AUDIO", "LC-AAC")):
             _codec_cache[url.split("/d/")[-1].split("/")[0] if "/d/" in url else url] = (time.time(), True)
             return True
     import subprocess as _sp
@@ -260,6 +260,7 @@ def rd_find_by_title(q, season=None, episode=None):
         words = [w.lower() for w in q.split() if (w.isdigit() or len(w) > 2) and w.lower() not in
                  ("and", "the", "for", "with", "from", "that", "this", "not", "are", "was", "but", "you", "all", "she", "his", "her", "its", "has", "had", "have", "who", "which", "what", "when", "where", "why", "how")]
         movie_hits = []  # (codec_score, filename, torrent) for movie mode
+        tv_hits = []  # (codec_score, torrent) for tv mode — ranked after
         for t in ts:
             if t.get("status") != "downloaded" or not t.get("links"):
                 continue
@@ -286,9 +287,12 @@ def rd_find_by_title(q, season=None, episode=None):
                 movie_hits.append((codec_rank(t.get("filename", "")), t))
                 continue
             elif season is not None and episode is not None:
-                tag = f"s{int(season):02d}e{int(episode):02d}"
-                if tag not in fn:
-                    continue
+                # TV mode: collect ALL title-matching torrents (packs named
+                # "S1-7" AND singles with the SxxExx tag). The best one is
+                # chosen after by codec rank + episode availability — a pack
+                # with good audio beats a first-found AC-3 single.
+                tv_hits.append((codec_rank(t.get("filename", "")), t))
+                continue
             # If asking for a specific episode, find the matching file
             if season is not None and episode is not None:
                 try:
@@ -337,6 +341,44 @@ def rd_find_by_title(q, season=None, episode=None):
                 return t["links"][0]
             except Exception:
                 return t["links"][0]
+        # TV mode: try ranked candidates — best audio first. For each, find
+        # the episode's file→link, unrestrict, verify the episode tag, and
+        # SKIP silent (AC-3/DTS) files — a pack with AAC beats an AC-3 single.
+        if season is not None and episode is not None and tv_hits:
+            tv_hits.sort(key=lambda x: x[0])
+            tag = f"s{int(season):02d}e{int(episode):02d}"
+            for _score, t in tv_hits:
+                try:
+                    info = rd_get_cached(t["id"])
+                    links = info.get("links") or []
+                    for f in info.get("files", []):
+                        if tag in f.get("path", "").lower():
+                            idx = f["id"] - 1
+                            if 0 <= idx < len(links):
+                                try:
+                                    ur = rd_post("/unrestrict/link", {"link": links[idx]})
+                                    dl = ur.get("download") or ur.get("streamable")
+                                    if dl:
+                                        want = f"s{int(season):02d}e{int(episode):02d}"
+                                        if want in dl.lower().replace("-", "").replace("_", "").replace(".", "").replace(" ", ""):
+                                            # skip silent files (AC-3/DTS).
+                                            # Fast-path on the filename; if the
+                                            # name is ambiguous, ffprobe (cached).
+                                            safe = audio_codec_is_browser_safe(dl, filename_hint=f.get("path", ""))
+                                            if safe is False:
+                                                break  # try next torrent
+                                            if safe is None:
+                                                # ambiguous name — ffprobe once
+                                                safe = audio_codec_is_browser_safe(dl)
+                                                if safe is False:
+                                                    break  # silent — next torrent
+                                            return dl
+                                except Exception:
+                                    continue
+                            break
+                except Exception:
+                    continue
+            return None
         # Movie mode: return the BEST (audio-safe, H264) account match
         if movie_hits:
             movie_hits.sort(key=lambda x: x[0])
@@ -601,6 +643,10 @@ def codec_rank(name, want_height=None):
         score += 10  # multi-audio usually includes English, but not guaranteed
     if "ENGLISH" in n or "ENG." in n or " EN " in n:
         score -= 30
+    # Explicit browser-safe audio markers are a STRONG preference — a pack
+    # named "AVC1-MP4A" (AAC) must beat AC-3 singles.
+    if any(x in n for x in ("MP4A", "AAC", "AAC2.0", "LC-AAC", "MPEG-4 AUDIO")):
+        score -= 40
     if "X264" in n or "H264" in n or "AVC" in n:
         score += 0
     # Resolution bias: prefer the requested height when set

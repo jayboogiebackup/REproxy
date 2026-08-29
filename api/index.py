@@ -873,6 +873,33 @@ def api_rd_stream():
         return _json({"status": False, "error": f"rd bridge error: {exc}"}), 502
 
 
+@app.route("/api/rd/track")
+def api_rd_track():
+    """RD file remuxed to a single audio track (dual-audio anime → eng).
+    Streams the bridge's ffmpeg -c copy output directly to the player."""
+    bridge = os.environ.get("RD_BRIDGE_URL", "https://albums-bedrooms-mods-cow.trycloudflare.com").rstrip("/")
+    raw_url = (request.args.get("url") or "").strip()
+    lang = (request.args.get("lang") or "eng").strip()
+    if not raw_url:
+        return _json({"error": "url required"}), 400
+    try:
+        qs = urllib.parse.urlencode({"url": raw_url, "lang": lang})
+        req = urllib.request.Request(f"{bridge}/api/rd/track?{qs}", headers={"User-Agent": "Mozilla/5.0"})
+        resp = urllib.request.urlopen(req, timeout=600)
+        def gen():
+            try:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                resp.close()
+        return Response(gen(), mimetype="video/mp4", headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*", "Accept-Ranges": "bytes"})
+    except Exception as exc:
+        return _json({"error": f"rd track error: {exc}"}), 502
+
+
 @app.route("/api/rd/subs")
 def api_rd_subs():
     """OpenSubtitles subtitle list — forwards to the Pi RD bridge."""

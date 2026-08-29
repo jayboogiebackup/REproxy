@@ -1071,7 +1071,45 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 return self._json({"error": "read failed"}, 500)
             return
+        if url.path == "/api/rd/track":
+            return self.do_GET_track(q)
         self._json({"error": "not found"}, 404)
+
+    # GET /api/rd/track?url=<rd-url>&lang=eng — stream the RD file remuxed
+    # with ONLY the requested audio track (dual-audio anime: pick eng over jpn).
+    # Uses -c copy (no re-encode) so it's fast and CPU-light. The player points
+    # <video> at this endpoint when lang=dub is requested on a multi-track file.
+    def do_GET_track(self, q):
+        import subprocess as _sp
+        raw_url = q.get("url", [None])[0]
+        lang = (q.get("lang", ["eng"])[0] or "eng").lower()
+        if not raw_url:
+            return self._json({"error": "url required"}, 400)
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+        try:
+            cmd = ["ffmpeg", "-v", "error", "-i", raw_url,
+                   "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
+                   "-c", "copy", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"]
+            proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL)
+            try:
+                while True:
+                    chunk = proc.stdout.read(65536)
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                    except Exception:
+                        break  # client gone
+            finally:
+                proc.kill()
+        except Exception:
+            pass
+        return
 
     def log_message(self, format, *args):
         pass

@@ -45,8 +45,14 @@ def audio_codec_is_browser_safe(url, ttl=3600):
     None when it can't be determined (play anyway, don't block)."""
     import subprocess as _sp
     try:
+        # cache key = the RD file id (stable across CDN host rotations)
+        key = url
+        for frag in ("/d/", "/stream/"):
+            if frag in url:
+                key = url.split(frag)[1].split("/")[0]
+                break
         now = time.time()
-        c = _codec_cache.get(url)
+        c = _codec_cache.get(key)
         if c and now - c[0] < ttl:
             return c[1]
         proc = _sp.run(["ffprobe", "-v", "error", "-select_streams", "a:0",
@@ -59,7 +65,7 @@ def audio_codec_is_browser_safe(url, ttl=3600):
         # mark AC-3 family explicitly unsafe
         if codec in ("ac3", "eac3", "dts", "dts-hd", "mlp"):
             safe = False
-        _codec_cache[url] = (now, safe)
+        _codec_cache[key] = (now, safe)
         return safe
     except Exception:
         return None  # can't probe — don't block playback

@@ -14,8 +14,11 @@ if __name__ == "__main__":
     quality = sys.argv[5] if len(sys.argv) > 5 and not sys.argv[5].startswith("--") else None
     skip_account = "--skip-account" in sys.argv
     codec = None
+    lang = None
     for a in sys.argv:
         if a.startswith("--codec="):
             codec = a.split("=", 1)[1]
-    result = server.resolve_stream(tmdb, mtype, season, episode, quality, skip_account, codec)
+        if a.startswith("--lang="):
+            lang = a.split("=", 1)[1]
+    result = server.resolve_stream(tmdb, mtype, season, episode, quality, skip_account, codec, lang)
     print(__import__("json").dumps(result))

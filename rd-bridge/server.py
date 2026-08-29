@@ -771,12 +771,13 @@ def url_matches_type(url, mtype, season=None, episode=None):
     return bool(re.search(r"\be\d{1,3}\b", fn)) or bool(re.search(r"\bs\d{1,2}\b", fn))
 
 
-def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None):
+def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None):
     """Full flow → direct stream URL, with STRICT show/movie separation:
     a show never plays a movie and vice versa. Any resolved URL that fails
     the type check is rejected. codec='h264' → H.264/AVC only (Firefox
-    has NO HEVC/AV1 support, so those would fail to load there)."""
-    result = _resolve_stream_impl(tmdb, mtype, season, episode, quality, skip_account, codec)
+    has NO HEVC/AV1 support, so those would fail to load there).
+    lang='dub' (anime) → prefer English-dubbed releases."""
+    result = _resolve_stream_impl(tmdb, mtype, season, episode, quality, skip_account, codec, lang)
     url = result.get("url") if isinstance(result, dict) else None
     if url and not url_matches_type(url, mtype, season, episode):
         return {"error": "resolved link is the wrong type (show/movie mismatch)",
@@ -791,8 +792,9 @@ def _is_hevc_name(name):
     return any(x in n for x in ("HEVC", "X265", "H265", "AV1", "VP9", "X.265", "H.265"))
 
 
-def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None):
-    """Full flow → direct stream URL. codec='h264' filters to H.264/AVC only."""
+def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None):
+    """Full flow → direct stream URL. codec='h264' filters to H.264/AVC only.
+    lang='dub' prefers English-dubbed releases for anime."""
     if not RD_KEY:
         return {"error": "REALDEBRID_API_KEY not set"}
     imdb = tmdb_to_imdb(tmdb, "movie" if mtype == "movie" else "tv")
@@ -842,8 +844,16 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
         want_h = 1080 if quality == "1080" else 720 if quality == "720" else 480 if quality == "480" else None
         if codec == "h264":
             candidates = [c for c in candidates if not _is_hevc_name(c.get("name", ""))]
+        # lang=dub (anime): boost English-dub/dual-audio releases in the order.
+        def _lang_rank(c):
+            n = (c.get("name", "") or "").upper()
+            if lang == "dub":
+                if any(x in n for x in ("DUB", "DUAL", "ENGLISH", "EN.")):
+                    return 0  # dubbed — try first
+                return 1
+            return 0
         order = sorted(candidates,
-                       key=lambda c: (codec_rank(c.get("name", ""), want_h), -int(c.get("seeders") or 0)))
+                       key=lambda c: (_lang_rank(c), codec_rank(c.get("name", ""), want_h), -int(c.get("seeders") or 0)))
         # Stremio-style: try candidates until one streams. Cached = instant;
         # non-cached = RD downloads on their servers (30s-3min).
         # PARALLEL batches (3 at a time): each add is independent, so this
@@ -994,6 +1004,7 @@ class Handler(BaseHTTPRequestHandler):
             quality = q.get("quality", [None])[0]
             skip_account = q.get("skip_account", ["0"])[0] == "1"
             codec = q.get("codec", [None])[0]
+            lang = q.get("lang", [None])[0]
             # Run the resolve in a SUBPROCESS with a hard timeout — a hung
             # RD call can never deadlock the server thread pool this way.
             import subprocess as _sp
@@ -1008,6 +1019,8 @@ class Handler(BaseHTTPRequestHandler):
                 args.append(quality)
             if codec:
                 args.append(f"--codec={codec}")
+            if lang:
+                args.append(f"--lang={lang}")
             if skip_account:
                 args.append("--skip-account")
             try:

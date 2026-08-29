@@ -36,47 +36,6 @@ from rd_flow import match_episode_file_index, pick_rd_files, pick_link_index, VI
 _info_cache = {}  # torrent_id -> (timestamp, info) — big packs are slow to fetch
 _codec_cache = {}  # url -> (timestamp, codec_name) — ffprobe is ~3s, cache it
 
-# Persistent cache file — HTTP requests spawn a fresh subprocess each time,
-# so in-memory caches die between requests. Persist the expensive results
-# (ffprobe codec probes, tmdb→imdb lookups) to disk so the 2nd request for
-# a title is fast.
-_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bridge_cache.json")
-_loaded_persist = False
-
-
-def _persist_load():
-    global _loaded_persist
-    if _loaded_persist:
-        return
-    _loaded_persist = True
-    try:
-        if os.path.exists(_CACHE_FILE):
-            with open(_CACHE_FILE) as f:
-                d = json.load(f)
-            now = time.time()
-            for k, v in d.get("codec", {}).items():
-                _codec_cache[k] = (now, v)
-            for k, v in d.get("imdb", {}).items():
-                _imdb_cache[tuple(k.split("|"))] = v
-    except Exception:
-        pass
-
-
-def _persist_save():
-    try:
-        now = time.time()
-        d = {
-            "codec": {k: v for k, (ts, v) in _codec_cache.items() if now - ts < 7200},
-            "imdb": {f"{k[0]}|{k[1]}": v for k, v in _imdb_cache.items()},
-        }
-        with open(_CACHE_FILE, "w") as f:
-            json.dump(d, f)
-    except Exception:
-        pass
-
-
-_persist_load()  # load persisted caches at import time
-
 
 def audio_codec_is_browser_safe(url, ttl=3600, filename_hint=None):
     """Probe the file's audio codec via ffprobe (header-only, ~3s, cached).
@@ -125,7 +84,6 @@ def audio_codec_is_browser_safe(url, ttl=3600, filename_hint=None):
         if codec in ("ac3", "eac3", "dts", "dts-hd", "mlp"):
             safe = False
         _codec_cache[key] = (now, safe)
-        _persist_save()
         return safe
     except Exception:
         return None  # can't probe — don't block playback
@@ -196,7 +154,6 @@ def tmdb_to_imdb(tmdb, mtype):
         d = json.loads(body)
         imdb = d.get("imdb_id")
         _imdb_cache[key] = imdb
-        _persist_save()
         return imdb
     except Exception:
         return None
@@ -602,10 +559,15 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
             if status == "downloaded":
                 break
             if status in ("downloading", "queued"):
-                # RD is fetching it. Don't wait — a CACHED candidate returns
-                # instantly; anything downloading would take 30s+, and the
-                # player falls back to CineSrc after 15s. Skip it.
-                break
+                # RD is fetching it on THEIR servers (Stremio-style). For huge
+                # packs this can take minutes — don't block the whole resolve;
+                # give it a few polls then give up (caller tries next hash).
+                # Local counter (not global) — concurrent candidates must not
+                # share this.
+                if attempt >= 10:
+                    break
+                time.sleep(2)
+                continue
             if status in ("error", "virus", "dead"):
                 break
             time.sleep(0.6)
@@ -863,21 +825,17 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
 
     order = []
     tried = 0
-    # 12s budget: account-cached content resolves in 2-4s. Fresh downloads
-    # take 30s+ — fail fast so the player falls back to CineSrc quickly.
-    deadline = time.time() + 12
+    deadline = time.time() + 115
     if candidates:
-        # Browser-playable first (H264 > HEVC/AV1), biased to requested quality.
-        # Within playable, SEEDERS first — RD's cache is almost always the
-        # most-seeded release, so this finds cached content in the first batch.
+        # Browser-playable first (H264 > HEVC/AV1), biased to requested quality
         want_h = 1080 if quality == "1080" else 720 if quality == "720" else 480 if quality == "480" else None
         order = sorted(candidates,
-                       key=lambda c: (codec_rank(c.get("name", ""), want_h) // 50, -int(c.get("seeders") or 0)))
+                       key=lambda c: (codec_rank(c.get("name", ""), want_h), -int(c.get("seeders") or 0)))
         # Stremio-style: try candidates until one streams. Cached = instant;
         # non-cached = RD downloads on their servers (30s-3min).
         # PARALLEL batches (3 at a time): each add is independent, so this
         # cuts the sequential ~1s-per-451 loop to ~1s per batch.
-        deadline = time.time() + 12
+        deadline = time.time() + 115
         tried = 0
         import concurrent.futures as _cf
 
@@ -891,36 +849,19 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
             except Exception:
                 return None
 
-        BATCH = 6
-        MAX_TRIES = 12  # hard cap — beyond this, fall back (player → CineSrc)
+        BATCH = 3
         for start in range(0, len(order), BATCH):
-            if time.time() > deadline or tried >= MAX_TRIES:
+            if time.time() > deadline:
                 break
             batch = order[start:start + BATCH]
-            # as_completed with a per-batch cap: a slow RD call must never
-            # block past the deadline (ex.map waits for ALL members).
-            ex = _cf.ThreadPoolExecutor(max_workers=BATCH)
-            try:
-                futs = {ex.submit(_try_one, c): c for c in batch}
-                try:
-                    done = _cf.as_completed(futs, timeout=max(1, deadline - time.time()))
-                    for fut in done:
-                        tried += 1
-                        try:
-                            res = fut.result()
-                        except Exception:
-                            continue
-                        if not res:
-                            continue
-                        url, c = res
-                        if url:
-                            return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
-                except _cf.TimeoutError:
-                    break  # batch exceeded the deadline — stop trying
-            finally:
-                # DON'T wait for stragglers — shutdown(wait=False) lets the
-                # executor exit without blocking past the deadline
-                ex.shutdown(wait=False, cancel_futures=True)
+            with _cf.ThreadPoolExecutor(max_workers=BATCH) as ex:
+                for res in ex.map(_try_one, batch):
+                    tried += 1
+                    if not res:
+                        continue
+                    url, c = res
+                    if url:
+                        return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
         # Second pass: try the best-seeded candidates (may include cached HEVC
         # that browsers with hardware decode CAN play)
         if time.time() < deadline:
@@ -1054,14 +995,14 @@ class Handler(BaseHTTPRequestHandler):
             if skip_account:
                 args.append("--skip-account")
             try:
-                proc = _sp.run(args, capture_output=True, text=True, timeout=14)
+                proc = _sp.run(args, capture_output=True, text=True, timeout=150)
                 out = proc.stdout.strip()
                 if out:
                     result = json.loads(out.splitlines()[-1])
                     return self._json(result, 200 if result.get("url") else 404)
                 return self._json({"error": "resolve failed"}, 404)
             except _sp.TimeoutExpired:
-                return self._json({"error": "resolve timeout"}, 504)
+                return self._json({"error": "resolve timeout (55s)"}, 504)
             except Exception as e:
                 return self._json({"error": str(e)}, 500)
         if url.path == "/api/rd/search":

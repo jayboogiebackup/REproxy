@@ -855,7 +855,7 @@ def api_rd_stream():
         qs = urllib.parse.urlencode(params)
         req = urllib.request.Request(f"{bridge}/api/rd/stream?{qs}", headers={"User-Agent": "Mozilla/5.0"})
         try:
-            with urllib.request.urlopen(req, timeout=25) as resp:
+            with urllib.request.urlopen(req, timeout=155) as resp:
                 data = json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
             # bridge returns 404 with a JSON error body when it can't resolve

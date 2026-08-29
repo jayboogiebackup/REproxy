@@ -33,16 +33,34 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from rd_flow import match_episode_file_index, pick_rd_files, pick_link_index, VIDEO_EXTS  # noqa: E402
 
-_dl_tries = 0  # per-torrent download poll counter
 _info_cache = {}  # torrent_id -> (timestamp, info) — big packs are slow to fetch
 _codec_cache = {}  # url -> (timestamp, codec_name) — ffprobe is ~3s, cache it
 
 
-def audio_codec_is_browser_safe(url, ttl=3600):
+def audio_codec_is_browser_safe(url, ttl=3600, filename_hint=None):
     """Probe the file's audio codec via ffprobe (header-only, ~3s, cached).
     Returns True when the audio will play in browsers (AAC/MP3/Opus/Vorbis/
     FLAC/PCM), False for AC-3/DTS/TrueHD/E-AC-3 (silent in Chrome) — or
-    None when it can't be determined (play anyway, don't block)."""
+    None when it can't be determined (play anyway, don't block).
+
+    filename_hint: when the torrent filename explicitly names the audio codec,
+    decide from the name and skip the ~3s ffprobe entirely."""
+    # Fast path: explicit codec markers in the filename → no ffprobe needed.
+    # (The URL's last segment IS the file name — e.g. .../Zootopia%202...DolbyD%205.1.mp4)
+    if not filename_hint:
+        try:
+            import urllib.parse as _up
+            filename_hint = _up.unquote(url.split("/")[-1] or "")
+        except Exception:
+            pass
+    if filename_hint:
+        n = (filename_hint or "").upper()
+        if any(x in n for x in ("AC3", "AC-3", "EAC3", "E-AC-3", "DTS", "TRUEHD", "TRUE-HD", "ATMOS", "DOLBYD", "DOLBY DIGITAL", "DD 5.1", "DD5.1", "DDP", "DTS-HD")):
+            _codec_cache[url.split("/d/")[-1].split("/")[0] if "/d/" in url else url] = (time.time(), False)
+            return False
+        if any(x in n for x in ("AAC", "AAC2.0", "MP3", "OPUS", "VORBIS", "FLAC")):
+            _codec_cache[url.split("/d/")[-1].split("/")[0] if "/d/" in url else url] = (time.time(), True)
+            return True
     import subprocess as _sp
     try:
         # cache key = the RD file id (stable across CDN host rotations)
@@ -123,12 +141,20 @@ def rd_post(path, data):
         return json.loads(raw)
 
 
+_imdb_cache = {}  # (tmdb, mtype) -> imdb_id
+
+
 def tmdb_to_imdb(tmdb, mtype):
-    """TMDB id → IMDb id via external_ids."""
+    """TMDB id → IMDb id via external_ids (cached — 0.4s saved per call)."""
+    key = (tmdb, mtype)
+    if key in _imdb_cache:
+        return _imdb_cache[key]
     try:
         st, body = http_get(f"https://api.themoviedb.org/3/{mtype}/{tmdb}/external_ids?api_key={TMDB_KEY}", timeout=15)
         d = json.loads(body)
-        return d.get("imdb_id")
+        imdb = d.get("imdb_id")
+        _imdb_cache[key] = imdb
+        return imdb
     except Exception:
         return None
 
@@ -208,14 +234,29 @@ def rd_instant_available(hashes):
         return {}
 
 
+_torrents_cache = {}  # timestamp -> torrents list (RD list is 100+ entries, ~1s)
+
+
+def rd_get_torrents(ttl=5):
+    """GET /torrents with a short cache — the list is fetched many times per
+    resolve (account-first + rd_find_existing_torrent per candidate)."""
+    now = time.time()
+    c = _torrents_cache.get("list")
+    if c and now - c[0] < ttl:
+        return c[1]
+    req = urllib.request.Request(f"{RD_API}/torrents", headers={"Authorization": f"Bearer {RD_KEY}", "User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        ts = json.loads(r.read())
+    _torrents_cache["list"] = (now, ts)
+    return ts
+
+
 def rd_find_by_title(q, season=None, episode=None):
     """Search the account's existing torrents by title keywords → link.
        If season+episode given, finds the matching SxxExx file inside a
        season pack (selects the right file, not just the first link)."""
     try:
-        req = urllib.request.Request(f"{RD_API}/torrents", headers={"Authorization": f"Bearer {RD_KEY}", "User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=25) as r:
-            ts = json.loads(r.read())
+        ts = rd_get_torrents()
         words = [w.lower() for w in q.split() if (w.isdigit() or len(w) > 2) and w.lower() not in
                  ("and", "the", "for", "with", "from", "that", "this", "not", "are", "was", "but", "you", "all", "she", "his", "her", "its", "has", "had", "have", "who", "which", "what", "when", "where", "why", "how")]
         movie_hits = []  # (codec_score, filename, torrent) for movie mode
@@ -299,15 +340,15 @@ def rd_find_by_title(q, season=None, episode=None):
         # Movie mode: return the BEST (audio-safe, H264) account match
         if movie_hits:
             movie_hits.sort(key=lambda x: x[0])
-            best = movie_hits[0][1]
-            try:
-                ur = rd_post("/unrestrict/link", {"link": best["links"][0]})
-                dl = ur.get("download") or ur.get("streamable")
-                if dl:
-                    return dl
-                return best["links"][0]
-            except Exception:
-                return best["links"][0]
+            for _score, best in movie_hits:
+                try:
+                    ur = rd_post("/unrestrict/link", {"link": best["links"][0]})
+                    dl = ur.get("download") or ur.get("streamable")
+                    if dl:
+                        return dl
+                except Exception:
+                    continue  # 451 / dead link — try the next account match
+            return None
     except Exception:
         pass
     return None
@@ -316,9 +357,7 @@ def rd_find_by_title(q, season=None, episode=None):
 def rd_find_existing(info_hash):
     """Look for an already-added torrent with this hash → return its unrestrictable link."""
     try:
-        req = urllib.request.Request(f"{RD_API}/torrents", headers={"Authorization": f"Bearer {RD_KEY}", "User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=25) as r:
-            ts = json.loads(r.read())
+        ts = rd_get_torrents()
         for t in ts:
             if (t.get("hash") or "").lower() == info_hash.lower() and t.get("status") == "downloaded" and t.get("links"):
                 return t["links"][0]
@@ -333,9 +372,7 @@ def rd_find_existing_torrent(info_hash):
     so we can skip big packs with no links for the wanted episode without
     fetching the (slow) full file list."""
     try:
-        req = urllib.request.Request(f"{RD_API}/torrents", headers={"Authorization": f"Bearer {RD_KEY}", "User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=25) as r:
-            ts = json.loads(r.read())
+        ts = rd_get_torrents()
         for t in ts:
             if (t.get("hash") or "").lower() == info_hash.lower():
                 return t["id"], len(t.get("links") or [])
@@ -483,10 +520,9 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
                 # RD is fetching it on THEIR servers (Stremio-style). For huge
                 # packs this can take minutes — don't block the whole resolve;
                 # give it a few polls then give up (caller tries next hash).
-                global _dl_tries
-                _dl_tries += 1
-                if _dl_tries >= 8:
-                    _dl_tries = 0
+                # Local counter (not global) — concurrent candidates must not
+                # share this.
+                if attempt >= 10:
                     break
                 time.sleep(2)
                 continue
@@ -559,7 +595,7 @@ def codec_rank(name, want_height=None):
     if "HDCAM" in n or "CAMRIP" in n or "TELESYNC" in n or "TS-" in n:
         score += 200  # cam/telecine quality
     # Non-English audio markers (dubbed/foreign releases)
-    if any(x in n for x in ("DUB", "RUS", "CZ", "SK", "ESP", "ITA", "POR", "GER", "HIN", "ARAB", "TUR", "UKR", "POL", "FRE", "NLD")):
+    if any(x in n for x in ("DUB", "RUS", "CZ", "SK", "ESP", "SPANISH", "LATINO", "LATIN", "SPA.", "ITA", "ITALIAN", "POR", "PORTUGUESE", "GER", "GERMAN", "HIN", "HINDI", "ARAB", "TUR", "TURKISH", "UKR", "POL", "POLISH", "FRE", "FRENCH", "NLD", "DUTCH", "DAN", "NOR", "SWE", "FIN", "HEB", "THA", "VIE", "IND", "MAL", "TAG", "KOR", "CHI", "JAP")):
         score += 50
     if "MULTI" in n:
         score += 10  # multi-audio usually includes English, but not guaranteed
@@ -709,11 +745,15 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
     if not imdb:
         return {"error": "no imdb id"}
 
-    # 0. The user's OWN RD library first (Harbor-style, instant) — already-
+    # 0. Fetch Torrentio candidates FIRST (0.1s, parallel-safe) so the slow
+    #    account codec probe below overlaps with candidate prep.
+    candidates = []
+    candidates.extend(search_torrentio(imdb, mtype, season, episode))
+
+    # 1. The user's OWN RD library (Harbor-style, instant) — already-
     #    downloaded content always works, no 451, no waiting. Only check the
-    #    PRIMARY titles (alt-titles in every language would take 40s+).
-    #    skip_account=True (player detected a silent stream) bypasses this so
-    #    Torrentio candidates with browser-playable audio get picked instead.
+    #    PRIMARY titles. skip_account=True bypasses this so Torrentio
+    #    candidates with browser-playable audio get picked instead.
     if not skip_account:
         try:
             st, body = http_get(f"https://api.themoviedb.org/3/{'movie' if mtype == 'movie' else 'tv'}/{tmdb}?api_key={TMDB_KEY}", timeout=15)
@@ -729,18 +769,14 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                 if not url:
                     continue
                 # Skip AC-3/DTS account files — they're silent in Chrome.
-                # (Probe is cached ~1h, ~3s first time.)
-                safe = audio_codec_is_browser_safe(url)
+                # Filename hint avoids the ~3s ffprobe when the name says it.
+                safe = audio_codec_is_browser_safe(url, filename_hint=q)
                 if safe is False:
                     continue
                 return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
         except Exception:
             pass
 
-    # Torrentio — aggregates 100+ indexers by IMDb id. Only cached adds
-    # return instantly; 451s skip in ~1.5s each. Tight 20s budget.
-    candidates = []
-    candidates.extend(search_torrentio(imdb, mtype, season, episode))
     order = []
     tried = 0
     deadline = time.time() + 115
@@ -751,23 +787,35 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                        key=lambda c: (codec_rank(c.get("name", ""), want_h), -int(c.get("seeders") or 0)))
         # Stremio-style: try candidates until one streams. Cached = instant;
         # non-cached = RD downloads on their servers (30s-3min).
+        # PARALLEL batches (3 at a time): each add is independent, so this
+        # cuts the sequential ~1s-per-451 loop to ~1s per batch.
         deadline = time.time() + 115
         tried = 0
-        for c in order:
-            if tried >= 8 or time.time() > deadline:
-                break
-            tried += 1
+        import concurrent.futures as _cf
+
+        def _try_one(c):
             try:
                 url = rd_add_and_stream(c["info_hash"], file_idx=c.get("file_idx"),
                                         filename=c.get("filename"), season=season, episode=episode)
-                if url:
-                    # skip silent (AC-3/DTS) candidates — probe is cached ~1h
-                    safe = audio_codec_is_browser_safe(url)
-                    if safe is False:
-                        continue
-                    return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
+                if url and audio_codec_is_browser_safe(url) is False:
+                    return None  # silent codec — skip
+                return url, c
             except Exception:
-                continue
+                return None
+
+        BATCH = 3
+        for start in range(0, len(order), BATCH):
+            if time.time() > deadline:
+                break
+            batch = order[start:start + BATCH]
+            with _cf.ThreadPoolExecutor(max_workers=BATCH) as ex:
+                for res in ex.map(_try_one, batch):
+                    tried += 1
+                    if not res:
+                        continue
+                    url, c = res
+                    if url:
+                        return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
         # Second pass: try the best-seeded candidates (may include cached HEVC
         # that browsers with hardware decode CAN play)
         if time.time() < deadline:

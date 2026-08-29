@@ -35,6 +35,34 @@ from rd_flow import match_episode_file_index, pick_rd_files, pick_link_index, VI
 
 _dl_tries = 0  # per-torrent download poll counter
 _info_cache = {}  # torrent_id -> (timestamp, info) — big packs are slow to fetch
+_codec_cache = {}  # url -> (timestamp, codec_name) — ffprobe is ~3s, cache it
+
+
+def audio_codec_is_browser_safe(url, ttl=3600):
+    """Probe the file's audio codec via ffprobe (header-only, ~3s, cached).
+    Returns True when the audio will play in browsers (AAC/MP3/Opus/Vorbis/
+    FLAC/PCM), False for AC-3/DTS/TrueHD/E-AC-3 (silent in Chrome) — or
+    None when it can't be determined (play anyway, don't block)."""
+    import subprocess as _sp
+    try:
+        now = time.time()
+        c = _codec_cache.get(url)
+        if c and now - c[0] < ttl:
+            return c[1]
+        proc = _sp.run(["ffprobe", "-v", "error", "-select_streams", "a:0",
+                        "-show_entries", "stream=codec_name", "-of", "csv=p=0", url],
+                       capture_output=True, text=True, timeout=25)
+        codec = (proc.stdout or "").strip().split(",")[0].strip().lower()
+        safe = codec in ("aac", "mp3", "opus", "vorbis", "flac", "pcm_s16le",
+                         "pcm_s24le", "pcm_f32le", "pcm_u8", "truehd") if codec else None
+        # TrueHD actually decodes in Chrome sometimes (FLAC-compatible core);
+        # mark AC-3 family explicitly unsafe
+        if codec in ("ac3", "eac3", "dts", "dts-hd", "mlp"):
+            safe = False
+        _codec_cache[url] = (now, safe)
+        return safe
+    except Exception:
+        return None  # can't probe — don't block playback
 
 
 def rd_get(path):
@@ -692,8 +720,14 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                 if not q:
                     continue
                 url = rd_find_by_title(q, season, episode)
-                if url:
-                    return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
+                if not url:
+                    continue
+                # Skip AC-3/DTS account files — they're silent in Chrome.
+                # (Probe is cached ~1h, ~3s first time.)
+                safe = audio_codec_is_browser_safe(url)
+                if safe is False:
+                    continue
+                return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
         except Exception:
             pass
 
@@ -721,6 +755,10 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                 url = rd_add_and_stream(c["info_hash"], file_idx=c.get("file_idx"),
                                         filename=c.get("filename"), season=season, episode=episode)
                 if url:
+                    # skip silent (AC-3/DTS) candidates — probe is cached ~1h
+                    safe = audio_codec_is_browser_safe(url)
+                    if safe is False:
+                        continue
                     return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
             except Exception:
                 continue
@@ -738,6 +776,9 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                     url = rd_add_and_stream(c["info_hash"], file_idx=c.get("file_idx"),
                                             filename=c.get("filename"), season=season, episode=episode)
                     if url:
+                        safe = audio_codec_is_browser_safe(url)
+                        if safe is False:
+                            continue
                         return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
                 except Exception:
                     continue

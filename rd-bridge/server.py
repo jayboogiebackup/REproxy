@@ -251,10 +251,11 @@ def rd_get_torrents(ttl=5):
     return ts
 
 
-def rd_find_by_title(q, season=None, episode=None):
+def rd_find_by_title(q, season=None, episode=None, codec=None):
     """Search the account's existing torrents by title keywords → link.
        If season+episode given, finds the matching SxxExx file inside a
-       season pack (selects the right file, not just the first link)."""
+       season pack (selects the right file, not just the first link).
+       codec='h264' skips HEVC/AV1 torrents (returns the next matching one)."""
     try:
         ts = rd_get_torrents()
         words = [w.lower() for w in q.split() if (w.isdigit() or len(w) > 2) and w.lower() not in
@@ -265,6 +266,9 @@ def rd_find_by_title(q, season=None, episode=None):
             if t.get("status") != "downloaded" or not t.get("links"):
                 continue
             fn = (t.get("filename") or "").lower()
+            # codec=h264: skip HEVC/AV1 torrents entirely (try the next match)
+            if codec == "h264" and _is_hevc_name(t.get("filename", "")):
+                continue
             # Title words must ALWAYS match (word boundaries). The episode tag
             # is an additional filter when an episode is requested — but the
             # tag alone (e.g. Loki S02E01 matching "60 Days In" S2E1 request
@@ -351,8 +355,32 @@ def rd_find_by_title(q, season=None, episode=None):
                 try:
                     info = rd_get_cached(t["id"])
                     links = info.get("links") or []
-                    for f in info.get("files", []):
-                        if tag in f.get("path", "").lower():
+                    # Strict tag first (s01e01), then looser episode patterns
+                    # (ep 1 / episode 01 / " 01 ") for releases with different
+                    # naming (BlueLobster etc.) — only when the strict tag
+                    # finds nothing usable.
+                    for pattern in (tag, None):
+                        for f in info.get("files", []):
+                            p = f.get("path", "").lower()
+                            if pattern is not None:
+                                ok = pattern in p
+                            else:
+                                ep_pat = rf"(?<![\w])e{int(episode):02d}(?![\w])|(?<![\w])ep[\s._-]?{int(episode):02d}(?![\w])|[\s._-]{int(episode):02d}[\s._-]"
+                                ok = bool(__import__("re").search(ep_pat, p))
+                            if not ok:
+                                continue
+                            # Loose matching can grab the wrong SEASON's file
+                            # (e.g. "Megalobox 2 - 01" when season 1 is wanted).
+                            # If the filename declares a season, it must agree.
+                            if pattern is None and season is not None:
+                                # only enforce when an obvious "season N" /
+                                # "Sxx" marker exists (not bare episode digits)
+                                m = re.search(r"\bseason\s*\d+\b|\bs\d{2}\b", p)
+                                if m and str(season) not in m.group(0):
+                                    continue
+                            # codec=h264: skip HEVC/AV1 files inside packs too
+                            if codec == "h264" and _is_hevc_name(f.get("path", "")):
+                                continue
                             idx = f["id"] - 1
                             if 0 <= idx < len(links):
                                 try:
@@ -360,7 +388,16 @@ def rd_find_by_title(q, season=None, episode=None):
                                     dl = ur.get("download") or ur.get("streamable")
                                     if dl:
                                         want = f"s{int(season):02d}e{int(episode):02d}"
-                                        if want in dl.lower().replace("-", "").replace("_", "").replace(".", "").replace(" ", ""):
+                                        import urllib.parse as _up
+                                        dl_dec = _up.unquote(dl).lower()
+                                        flat = dl_dec.replace("-", "").replace("_", "").replace(".", "").replace(" ", "")
+                                        # Verify: strict s01e01 tag, OR a loose
+                                        # episode marker for differently-named
+                                        # releases (npz/BlueLobster " - 01 ")
+                                        loose_ok = bool(__import__("re").search(
+                                            rf"(?<![\w])e{int(episode):02d}(?![\w])|(?<![\w])ep[\s._-]?{int(episode):02d}(?![\w])|[\s._-]{int(episode):02d}[\s._-]",
+                                            dl_dec))
+                                        if want in flat or loose_ok:
                                             # skip silent files (AC-3/DTS).
                                             # Fast-path on the filename; if the
                                             # name is ambiguous, ffprobe (cached).
@@ -375,7 +412,11 @@ def rd_find_by_title(q, season=None, episode=None):
                                             return dl
                                 except Exception:
                                     continue
-                            break
+                            # This file matched the pattern but failed
+                            # verification (e.g. loose pattern hit "ep 02"
+                            # when "ep 01" was requested). Try the NEXT file in
+                            # this torrent before giving up on it.
+                            continue
                 except Exception:
                     continue
             return None
@@ -768,7 +809,11 @@ def url_matches_type(url, mtype, season=None, episode=None):
         return True
     # some releases name files like "Show.Name.1x03" or "S01E03" already caught;
     # also accept a lone "E03" style or season pack folders with s01/s02
-    return bool(re.search(r"\be\d{1,3}\b", fn)) or bool(re.search(r"\bs\d{1,2}\b", fn))
+    if re.search(r"\be\d{1,3}\b", fn) or re.search(r"\bs\d{1,2}\b", fn):
+        return True
+    # loose episode patterns (" - 01 ", " Episode 5 ", " ep.03 ") used by
+    # some anime batches (npz/BlueLobster style)
+    return bool(re.search(r"(?:e|ep|episode)[\s._-]?\d{1,2}(?!\d)|[\s._-]\d{1,2}[\s._-]", fn))
 
 
 def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None):
@@ -786,10 +831,11 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_ac
 
 
 def _is_hevc_name(name):
-    """True when a filename indicates HEVC/AV1/VP9 video (unplayable in
-    Firefox, which has no HEVC support at all)."""
+    """True when a filename indicates HEVC video (unplayable in Firefox —
+    no HEVC support at all). AV1 is EXCLUDED from the list: Firefox/Chrome/
+    Edge all decode AV1 natively, so AV1 files are playable."""
     n = (name or "").upper()
-    return any(x in n for x in ("HEVC", "X265", "H265", "AV1", "VP9", "X.265", "H.265"))
+    return any(x in n for x in ("HEVC", "X265", "H265", "X.265", "H.265"))
 
 
 def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None):
@@ -821,10 +867,10 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
             for q in list(names)[:4]:
                 if not q:
                     continue
-                url = rd_find_by_title(q, season, episode)
+                url = rd_find_by_title(q, season, episode, codec)
                 if not url:
                     continue
-                # codec=h264: skip HEVC account files (Firefox can't play them)
+                # codec=h264: skip HEVC/AV1 FILES (torrent name may not say it)
                 if codec == "h264" and _is_hevc_name(url.split("/")[-1] if "/" in url else q):
                     continue
                 # Skip AC-3/DTS account files — they're silent in Chrome.
@@ -840,10 +886,18 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
     tried = 0
     deadline = time.time() + 115
     if candidates:
-        # Browser-playable first (H264 > HEVC/AV1), biased to requested quality
+        # Browser-playable first (H264 > HEVC/AV1), biased to requested quality.
+        # codec=h264: filter HEVC/AV1 out — but SOFT: if every candidate is
+        # HEVC (common for anime), keep them so the resolve still returns a
+        # stream (browsers with hardware decode can play it; the player's
+        # decode-error retry handles the rest). Never return "no stream" just
+        # because the only releases are HEVC.
         want_h = 1080 if quality == "1080" else 720 if quality == "720" else 480 if quality == "480" else None
         if codec == "h264":
-            candidates = [c for c in candidates if not _is_hevc_name(c.get("name", ""))]
+            h264_only = [c for c in candidates if not _is_hevc_name(c.get("name", ""))]
+            if h264_only:
+                candidates = h264_only
+            # else: keep all — HEVC-only title, prefer a stream over nothing
         # lang=dub (anime): boost English-dub/dual-audio releases in the order.
         def _lang_rank(c):
             n = (c.get("name", "") or "").upper()

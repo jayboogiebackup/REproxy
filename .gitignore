@@ -4,3 +4,4 @@ rd-bridge/.bridge_cache.json
 
 rd-bridge/.resolve_cache.json
 rd-bridge/track_cache/
+.codec_cache.json

@@ -71,6 +71,29 @@ def _resolve_cache_load():
 _resolve_cache_load()
 
 
+def _codec_cache_save():
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".codec_cache.json")
+        with open(p, "w") as f:
+            json.dump({k: (v[0], v[1]) for k, v in _codec_cache.items()}, f)
+    except Exception:
+        pass
+
+
+def _codec_cache_load():
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".codec_cache.json")
+        with open(p) as f:
+            data = json.load(f)
+        for k, (ts, v) in data.items():
+            _codec_cache[k] = (ts, v)
+    except Exception:
+        pass
+
+
+_codec_cache_load()
+
+
 def audio_codec_is_browser_safe(url, ttl=3600, filename_hint=None):
     """Probe the file's audio codec via ffprobe (header-only, ~3s, cached).
     Returns True when the audio will play in browsers (AAC/MP3/Opus/Vorbis/
@@ -118,6 +141,7 @@ def audio_codec_is_browser_safe(url, ttl=3600, filename_hint=None):
         if codec in ("ac3", "eac3", "dts", "dts-hd", "mlp"):
             safe = False
         _codec_cache[key] = (now, safe)
+        _codec_cache_save()
         return safe
     except Exception:
         return None  # can't probe — don't block playback
@@ -857,10 +881,20 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_ac
     has NO HEVC/AV1 support, so those would fail to load there).
     lang='dub' (anime) → prefer English-dubbed releases.
     Successful resolves are cached (6h) so repeat plays skip the 20s walk."""
-    ck = f"{tmdb}|{mtype}|{season}|{episode}|{quality}|{skip_account}|{codec}|{lang}"
+    ck = f"{tmdb}|{mtype}|{season}|{episode}|{quality}|{skip_account}|{lang}"
+    # codec is deliberately EXCLUDED from the key: it's a browser preference,
+    # not a different resolution — sharing the cache means Chrome's resolve
+    # (0.1s) serves Firefox instantly instead of Firefox re-walking the
+    # account (~19s) for the same file.
     cached = _resolve_cache_get(ck)
     if cached is not None:
-        return cached
+        # h264 requested but cached result is a HEVC/AV1 file Firefox can't
+        # play → re-resolve (don't serve an unplayable file)
+        cfn = cached.get("url", "")
+        if codec == "h264" and _is_hevc_name(cfn.split("/")[-1] if "/" in cfn else cfn):
+            pass
+        else:
+            return cached
     result = _resolve_stream_impl(tmdb, mtype, season, episode, quality, skip_account, codec, lang)
     url = result.get("url") if isinstance(result, dict) else None
     if url and not url_matches_type(url, mtype, season, episode):
@@ -1237,47 +1271,64 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
             return
-        # Not cached — remux to a temp file first (full remux, then stream:
-        # avoids ffmpeg pipe startup latency on every request and enables
-        # Range/seeking for the whole session).
+        # Not cached — STREAM the remux live (fragmented MP4 starts playing in
+        # ~3-4s, not 30s+) while tee-ing the bytes to the disk cache in the
+        # background. First play starts fast; later plays hit the cache with
+        # full Range support. If the client disconnects, the cache write
+        # continues in the background so the next play is instant.
         tmp_path = cache_path + ".tmp"
+        out_f = None
         try:
-            cmd = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
-                   "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
-                   "-c", "copy", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", tmp_path]
-            proc = _sp.Popen(cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-            proc.wait(timeout=300)
-            if proc.returncode != 0 or not os.path.exists(tmp_path):
-                # ffmpeg failed (no such lang?) — fall back to first audio
-                cmd2 = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
-                        "-map", "0:v:0", "-map", "0:a:0",
-                        "-c", "copy", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", tmp_path]
-                proc2 = _sp.Popen(cmd2, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-                proc2.wait(timeout=300)
-                if proc2.returncode != 0 or not os.path.exists(tmp_path):
-                    return self._json({"error": "remux failed"}, 500)
-            os.rename(tmp_path, cache_path)
+            out_f = open(tmp_path, "wb")
         except Exception:
-            try:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-            except Exception:
-                pass
-            return self._json({"error": "remux failed"}, 500)
-        # Stream the newly cached file (full body — client waits for remux)
-        size = os.path.getsize(cache_path)
+            out_f = None
+        cmd = ["ffmpeg", "-v", "error", "-i", raw_url,
+               "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
+               "-c", "copy", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"]
+        proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL)
+        po = proc.stdout  # non-None (stdout=PIPE)  # type: ignore[union-attr]
         self.send_response(200)
         self.send_header("Content-Type", "video/mp4")
-        self.send_header("Content-Length", str(size))
-        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        with open(cache_path, "rb") as f:
+        try:
             while True:
-                chunk = f.read(65536)
+                chunk = po.read(65536)  # type: ignore[union-attr]
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except Exception:
+                    # client gone — stop sending but keep filling the cache
+                    if out_f:
+                        while True:
+                            chunk = po.read(65536)  # type: ignore[union-attr]
+                            if not chunk:
+                                break
+                            out_f.write(chunk)
+                    break
+                if out_f:
+                    try:
+                        out_f.write(chunk)
+                    except Exception:
+                        pass
+        finally:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            if out_f:
+                try:
+                    out_f.close()
+                    # Rename to cache only if the remux completed (ffmpeg exit 0)
+                    if proc.poll() == 0:
+                        os.rename(tmp_path, cache_path)
+                    else:
+                        os.unlink(tmp_path)
+                except Exception:
+                    pass
         return
 
     def log_message(self, format, *args):

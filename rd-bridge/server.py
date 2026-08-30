@@ -35,6 +35,40 @@ from rd_flow import match_episode_file_index, pick_rd_files, pick_link_index, VI
 
 _info_cache = {}  # torrent_id -> (timestamp, info) — big packs are slow to fetch
 _codec_cache = {}  # url -> (timestamp, codec_name) — ffprobe is ~3s, cache it
+_resolve_cache = {}  # key -> (timestamp, result dict) — successful resolves,
+#                     # cached 6h so repeat plays skip the 20s account+Torrentio
+#                     # walk. Persisted to disk across restarts.
+
+
+def _resolve_cache_get(key):
+    entry = _resolve_cache.get(key)
+    if entry and time.time() - entry[0] < 21600:
+        return entry[1]
+    return None
+
+
+def _resolve_cache_set(key, result):
+    _resolve_cache[key] = (time.time(), result)
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".resolve_cache.json")
+        with open(p, "w") as f:
+            json.dump({k: (v[0], v[1]) for k, v in _resolve_cache.items()}, f)
+    except Exception:
+        pass
+
+
+def _resolve_cache_load():
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".resolve_cache.json")
+        with open(p) as f:
+            data = json.load(f)
+        for k, (ts, v) in data.items():
+            _resolve_cache[k] = (ts, v)
+    except Exception:
+        pass
+
+
+_resolve_cache_load()
 
 
 def audio_codec_is_browser_safe(url, ttl=3600, filename_hint=None):
@@ -821,12 +855,19 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_ac
     a show never plays a movie and vice versa. Any resolved URL that fails
     the type check is rejected. codec='h264' → H.264/AVC only (Firefox
     has NO HEVC/AV1 support, so those would fail to load there).
-    lang='dub' (anime) → prefer English-dubbed releases."""
+    lang='dub' (anime) → prefer English-dubbed releases.
+    Successful resolves are cached (6h) so repeat plays skip the 20s walk."""
+    ck = f"{tmdb}|{mtype}|{season}|{episode}|{quality}|{skip_account}|{codec}|{lang}"
+    cached = _resolve_cache_get(ck)
+    if cached is not None:
+        return cached
     result = _resolve_stream_impl(tmdb, mtype, season, episode, quality, skip_account, codec, lang)
     url = result.get("url") if isinstance(result, dict) else None
     if url and not url_matches_type(url, mtype, season, episode):
-        return {"error": "resolved link is the wrong type (show/movie mismatch)",
-                "imdb": result.get("imdb")}
+        result = {"error": "resolved link is the wrong type (show/movie mismatch)",
+                  "imdb": result.get("imdb")}
+    if url and isinstance(result, dict):
+        _resolve_cache_set(ck, result)
     return result
 
 
@@ -1133,36 +1174,110 @@ class Handler(BaseHTTPRequestHandler):
     # with ONLY the requested audio track (dual-audio anime: pick eng over jpn).
     # Uses -c copy (no re-encode) so it's fast and CPU-light. The player points
     # <video> at this endpoint when lang=dub is requested on a multi-track file.
+    # The remux is cached to disk (keyed by RD file hash): first play remuxes,
+    # later plays serve the cached file with full Range support (instant start,
+    # seekable) — this is what makes dub playback fast in Firefox.
     def do_GET_track(self, q):
         import subprocess as _sp
+        import urllib.parse as _up
         raw_url = q.get("url", [None])[0]
         lang = (q.get("lang", ["eng"])[0] or "eng").lower()
         if not raw_url:
             return self._json({"error": "url required"}, 400)
-        self.send_response(200)
-        self.send_header("Content-Type", "video/mp4")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Accept-Ranges", "bytes")
-        self.end_headers()
-        try:
-            cmd = ["ffmpeg", "-v", "error", "-i", raw_url,
-                   "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
-                   "-c", "copy", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"]
-            proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL)
-            try:
+        # Derive a stable cache key from the RD file ID in the URL
+        # (https://{server}.download.real-debrid.com/d/{ID}/{filename}) — the
+        # URL may be percent-encoded, so decode before matching.
+        import urllib.parse as _up
+        dec_url = _up.unquote(raw_url)
+        m = re.search(r"/d/([A-Z0-9]+)/", dec_url, re.I)
+        file_id = m.group(1).upper() if m else str(hash(raw_url) & 0xFFFFFFFF)
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "track_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, f"{file_id}_{lang}.mp4")
+        # Serve from cache when present (full Range support → fast Firefox)
+        if os.path.exists(cache_path):
+            size = os.path.getsize(cache_path)
+            rng = self.headers.get("Range", "")
+            if rng:
+                try:
+                    rng = rng.replace("bytes=", "").split("-")
+                    start = int(rng[0]) if rng[0] else 0
+                    end = int(rng[1]) if len(rng) > 1 and rng[1] else size - 1
+                    end = min(end, size - 1)
+                    length = end - start + 1
+                    self.send_response(206)
+                    self.send_header("Content-Type", "video/mp4")
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                    self.send_header("Content-Length", str(length))
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    with open(cache_path, "rb") as f:
+                        f.seek(start)
+                        remaining = length
+                        while remaining > 0:
+                            chunk = f.read(min(65536, remaining))
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            remaining -= len(chunk)
+                    return
+                except Exception:
+                    pass
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            with open(cache_path, "rb") as f:
                 while True:
-                    chunk = proc.stdout.read(65536)
+                    chunk = f.read(65536)
                     if not chunk:
                         break
-                    try:
-                        self.wfile.write(chunk)
-                    except Exception:
-                        break  # client gone
-            finally:
-                proc.kill()
+                    self.wfile.write(chunk)
+            return
+        # Not cached — remux to a temp file first (full remux, then stream:
+        # avoids ffmpeg pipe startup latency on every request and enables
+        # Range/seeking for the whole session).
+        tmp_path = cache_path + ".tmp"
+        try:
+            cmd = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
+                   "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
+                   "-c", "copy", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", tmp_path]
+            proc = _sp.Popen(cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+            proc.wait(timeout=300)
+            if proc.returncode != 0 or not os.path.exists(tmp_path):
+                # ffmpeg failed (no such lang?) — fall back to first audio
+                cmd2 = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
+                        "-map", "0:v:0", "-map", "0:a:0",
+                        "-c", "copy", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", tmp_path]
+                proc2 = _sp.Popen(cmd2, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                proc2.wait(timeout=300)
+                if proc2.returncode != 0 or not os.path.exists(tmp_path):
+                    return self._json({"error": "remux failed"}, 500)
+            os.rename(tmp_path, cache_path)
         except Exception:
-            pass
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
+            return self._json({"error": "remux failed"}, 500)
+        # Stream the newly cached file (full body — client waits for remux)
+        size = os.path.getsize(cache_path)
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        with open(cache_path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
         return
 
     def log_message(self, format, *args):

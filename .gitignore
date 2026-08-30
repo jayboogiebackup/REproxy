@@ -1,3 +1,6 @@
 __pycache__/
 rd-bridge/.env
 rd-bridge/.bridge_cache.json
+
+rd-bridge/.resolve_cache.json
+rd-bridge/track_cache/

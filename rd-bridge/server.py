@@ -418,6 +418,12 @@ def rd_find_by_title(q, season=None, episode=None, codec=None):
                     # naming (BlueLobster etc.) — only when the strict tag
                     # finds nothing usable.
                     for pattern in (tag, None):
+                        # Collect ALL matching files for this pattern, then pick
+                        # the best: prefer no A/B/C suffix (full episode), then
+                        # the 'A' part (first half) over 'B'. SpongeBob-style
+                        # packs tag S01E01A + S01E01B as separate files — the
+                        # matcher must not grab E01B for an E1 request.
+                        matched = []
                         for f in info.get("files", []):
                             p = f.get("path", "").lower()
                             if pattern is not None:
@@ -431,50 +437,60 @@ def rd_find_by_title(q, season=None, episode=None, codec=None):
                             # (e.g. "Megalobox 2 - 01" when season 1 is wanted).
                             # If the filename declares a season, it must agree.
                             if pattern is None and season is not None:
-                                # only enforce when an obvious "season N" /
-                                # "Sxx" marker exists (not bare episode digits)
                                 m = re.search(r"\bseason\s*\d+\b|\bs\d{2}\b", p)
                                 if m and str(season) not in m.group(0):
                                     continue
                             # codec=h264: skip HEVC/AV1 files inside packs too
                             if codec == "h264" and _is_hevc_name(f.get("path", "")):
                                 continue
-                            idx = f["id"] - 1
-                            if 0 <= idx < len(links):
-                                try:
-                                    ur = rd_post("/unrestrict/link", {"link": links[idx]})
-                                    dl = ur.get("download") or ur.get("streamable")
-                                    if dl:
-                                        want = f"s{int(season):02d}e{int(episode):02d}"
-                                        import urllib.parse as _up
-                                        dl_dec = _up.unquote(dl).lower()
-                                        flat = dl_dec.replace("-", "").replace("_", "").replace(".", "").replace(" ", "")
-                                        # Verify: strict s01e01 tag, OR a loose
-                                        # episode marker for differently-named
-                                        # releases (npz/BlueLobster " - 01 ")
-                                        loose_ok = bool(__import__("re").search(
-                                            rf"(?<![\w])e{int(episode):02d}(?![\w])|(?<![\w])ep[\s._-]?{int(episode):02d}(?![\w])|[\s._-]{int(episode):02d}[\s._-]",
-                                            dl_dec))
-                                        if want in flat or loose_ok:
-                                            # skip silent files (AC-3/DTS).
-                                            # Fast-path on the filename; if the
-                                            # name is ambiguous, ffprobe (cached).
-                                            safe = audio_codec_is_browser_safe(dl, filename_hint=f.get("path", ""))
-                                            if safe is False:
-                                                break  # try next torrent
-                                            if safe is None:
-                                                # ambiguous name — ffprobe once
-                                                safe = audio_codec_is_browser_safe(dl)
-                                                if safe is False:
-                                                    break  # silent — next torrent
-                                            return dl
-                                except Exception:
-                                    continue
-                            # This file matched the pattern but failed
-                            # verification (e.g. loose pattern hit "ep 02"
-                            # when "ep 01" was requested). Try the NEXT file in
-                            # this torrent before giving up on it.
+                            matched.append(f)
+                        if not matched:
                             continue
+                        # Sort: no-suffix first, then A, then B/C; stable so
+                        # same-episode duplicates keep file order
+                        def _ab_key(fx):
+                            n = fx.get("path", "").lower()
+                            m2 = re.search(rf"s{int(season):02d}e{int(episode):02d}([a-z])", n)
+                            suf = m2.group(1) if m2 else ""
+                            return (0 if not suf else (1 if suf == "a" else 2))
+                        matched.sort(key=_ab_key)
+                        f = matched[0]
+                        idx = f["id"] - 1
+                        if 0 <= idx < len(links):
+                            try:
+                                ur = rd_post("/unrestrict/link", {"link": links[idx]})
+                                dl = ur.get("download") or ur.get("streamable")
+                                if dl:
+                                    want = f"s{int(season):02d}e{int(episode):02d}"
+                                    import urllib.parse as _up
+                                    dl_dec = _up.unquote(dl).lower()
+                                    flat = dl_dec.replace("-", "").replace("_", "").replace(".", "").replace(" ", "")
+                                    # Verify: strict s01e01 tag, OR a loose
+                                    # episode marker for differently-named
+                                    # releases (npz/BlueLobster " - 01 ")
+                                    loose_ok = bool(__import__("re").search(
+                                        rf"(?<![\w])e{int(episode):02d}(?![\w])|(?<![\w])ep[\s._-]?{int(episode):02d}(?![\w])|[\s._-]{int(episode):02d}[\s._-]",
+                                        dl_dec))
+                                    if want in flat or loose_ok:
+                                        # skip silent files (AC-3/DTS).
+                                        # Fast-path on the filename; if the
+                                        # name is ambiguous, ffprobe (cached).
+                                        safe = audio_codec_is_browser_safe(dl, filename_hint=f.get("path", ""))
+                                        if safe is False:
+                                            break  # try next torrent
+                                        if safe is None:
+                                            # ambiguous name — ffprobe once
+                                            safe = audio_codec_is_browser_safe(dl)
+                                            if safe is False:
+                                                break  # silent — next torrent
+                                        return dl
+                            except Exception:
+                                continue
+                        # This file matched the pattern but failed
+                        # verification (e.g. loose pattern hit "ep 02"
+                        # when "ep 01" was requested). Try the NEXT file in
+                        # this torrent before giving up on it.
+                        continue
                 except Exception:
                     continue
             return None
@@ -1271,64 +1287,49 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
             return
-        # Not cached — STREAM the remux live (fragmented MP4 starts playing in
-        # ~3-4s, not 30s+) while tee-ing the bytes to the disk cache in the
-        # background. First play starts fast; later plays hit the cache with
-        # full Range support. If the client disconnects, the cache write
-        # continues in the background so the next play is instant.
+        # Not cached — remux to a file FIRST (faststart: moov atom at front),
+        # then serve the complete file with Content-Length. This makes the
+        # video load like a normal file (progressively buffered, seekable),
+        # NOT a live stream. First play waits for the remux; later plays hit
+        # the cache instantly with full Range support.
         tmp_path = cache_path + ".tmp"
-        out_f = None
         try:
-            out_f = open(tmp_path, "wb")
+            cmd = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
+                   "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
+                   "-c", "copy", "-movflags", "faststart", "-f", "mp4", tmp_path]
+            proc = _sp.Popen(cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+            proc.wait(timeout=600)
+            if proc.returncode != 0 or not os.path.exists(tmp_path):
+                # lang track missing — fall back to the first audio track
+                cmd2 = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
+                        "-map", "0:v:0", "-map", "0:a:0",
+                        "-c", "copy", "-movflags", "faststart", "-f", "mp4", tmp_path]
+                proc2 = _sp.Popen(cmd2, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                proc2.wait(timeout=600)
+                if proc2.returncode != 0 or not os.path.exists(tmp_path):
+                    return self._json({"error": "remux failed"}, 500)
+            os.rename(tmp_path, cache_path)
         except Exception:
-            out_f = None
-        cmd = ["ffmpeg", "-v", "error", "-i", raw_url,
-               "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
-               "-c", "copy", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"]
-        proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL)
-        po = proc.stdout  # non-None (stdout=PIPE)  # type: ignore[union-attr]
-        self.send_response(200)
-        self.send_header("Content-Type", "video/mp4")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        try:
-            while True:
-                chunk = po.read(65536)  # type: ignore[union-attr]
-                if not chunk:
-                    break
-                try:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                except Exception:
-                    # client gone — stop sending but keep filling the cache
-                    if out_f:
-                        while True:
-                            chunk = po.read(65536)  # type: ignore[union-attr]
-                            if not chunk:
-                                break
-                            out_f.write(chunk)
-                    break
-                if out_f:
-                    try:
-                        out_f.write(chunk)
-                    except Exception:
-                        pass
-        finally:
             try:
-                proc.kill()
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
             except Exception:
                 pass
-            if out_f:
-                try:
-                    out_f.close()
-                    # Rename to cache only if the remux completed (ffmpeg exit 0)
-                    if proc.poll() == 0:
-                        os.rename(tmp_path, cache_path)
-                    else:
-                        os.unlink(tmp_path)
-                except Exception:
-                    pass
+            return self._json({"error": "remux failed"}, 500)
+        # Serve the freshly remuxed file (full body — client waited for remux)
+        size = os.path.getsize(cache_path)
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        with open(cache_path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
         return
 
     def log_message(self, format, *args):

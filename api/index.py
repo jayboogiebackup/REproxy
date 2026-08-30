@@ -884,7 +884,11 @@ def api_rd_track():
         return _json({"error": "url required"}), 400
     try:
         qs = urllib.parse.urlencode({"url": raw_url, "lang": lang})
-        req = urllib.request.Request(f"{bridge}/api/rd/track?{qs}", headers={"User-Agent": "Mozilla/5.0"})
+        rng = request.headers.get("Range", "")
+        headers = {"User-Agent": "Mozilla/5.0"}
+        if rng:
+            headers["Range"] = rng
+        req = urllib.request.Request(f"{bridge}/api/rd/track?{qs}", headers=headers)
         resp = urllib.request.urlopen(req, timeout=600)
         def gen():
             try:
@@ -895,7 +899,19 @@ def api_rd_track():
                     yield chunk
             finally:
                 resp.close()
-        return Response(gen(), mimetype="video/mp4", headers={"Cache-Control": "no-store", "Access-Control-Allow-Origin": "*", "Accept-Ranges": "bytes"})
+        status = 206 if rng else 200
+        hdrs = {
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+            "Accept-Ranges": "bytes",
+        }
+        cr = resp.headers.get("Content-Range")
+        if cr:
+            hdrs["Content-Range"] = cr
+        cl = resp.headers.get("Content-Length")
+        if cl:
+            hdrs["Content-Length"] = cl
+        return Response(gen(), status=status, mimetype="video/mp4", headers=hdrs)
     except Exception as exc:
         return _json({"error": f"rd track error: {exc}"}), 502
 

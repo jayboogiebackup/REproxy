@@ -135,10 +135,10 @@ def audio_codec_is_browser_safe(url, ttl=3600, filename_hint=None):
                        capture_output=True, text=True, timeout=25)
         codec = (proc.stdout or "").strip().split(",")[0].strip().lower()
         safe = codec in ("aac", "mp3", "opus", "vorbis", "flac", "pcm_s16le",
-                         "pcm_s24le", "pcm_f32le", "pcm_u8", "truehd") if codec else None
-        # TrueHD actually decodes in Chrome sometimes (FLAC-compatible core);
-        # mark AC-3 family explicitly unsafe
-        if codec in ("ac3", "eac3", "dts", "dts-hd", "mlp"):
+                         "pcm_s24le", "pcm_f32le", "pcm_u8") if codec else None
+        # TrueHD is NOT browser-playable (silent in Chrome, experimental in
+        # MP4) — same family as DTS/AC-3. Mark it unsafe.
+        if codec in ("ac3", "eac3", "dts", "dts-hd", "mlp", "truehd"):
             safe = False
         _codec_cache[key] = (now, safe)
         _codec_cache_save()
@@ -1296,14 +1296,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             cmd = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
                    "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
-                   "-c", "copy", "-movflags", "faststart", "-f", "mp4", tmp_path]
+                   "-c", "copy", "-strict", "-2", "-movflags", "faststart", "-f", "mp4", tmp_path]
             proc = _sp.Popen(cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
             proc.wait(timeout=600)
             if proc.returncode != 0 or not os.path.exists(tmp_path):
                 # lang track missing — fall back to the first audio track
                 cmd2 = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
                         "-map", "0:v:0", "-map", "0:a:0",
-                        "-c", "copy", "-movflags", "faststart", "-f", "mp4", tmp_path]
+                        "-c", "copy", "-strict", "-2", "-movflags", "faststart", "-f", "mp4", tmp_path]
                 proc2 = _sp.Popen(cmd2, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
                 proc2.wait(timeout=600)
                 if proc2.returncode != 0 or not os.path.exists(tmp_path):
@@ -1316,8 +1316,37 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             return self._json({"error": "remux failed"}, 500)
-        # Serve the freshly remuxed file (full body — client waited for remux)
+        # Serve the freshly remuxed file with FULL Range support (the browser
+        # needs to seek even on the first play). Reuse the same serving logic
+        # as a cache hit by handling the Range header here too.
         size = os.path.getsize(cache_path)
+        rng = self.headers.get("Range", "")
+        if rng:
+            try:
+                rng = rng.replace("bytes=", "").split("-")
+                start = int(rng[0]) if rng[0] else 0
+                end = int(rng[1]) if len(rng) > 1 and rng[1] else size - 1
+                end = min(end, size - 1)
+                length = end - start + 1
+                self.send_response(206)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                with open(cache_path, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = f.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                return
+            except Exception:
+                pass
         self.send_response(200)
         self.send_header("Content-Type", "video/mp4")
         self.send_header("Content-Length", str(size))

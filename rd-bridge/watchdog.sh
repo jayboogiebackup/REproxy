@@ -23,7 +23,7 @@ if [ "$ok" != 1 ] && [ $((now-last)) -gt 120 ]; then
 fi
 
 # ---- 2. public tunnel health (newest URLs in the tunnel log) ----
-urls=$(grep -aoE 'https://[a-z0-9-]+\.trycloudflare\.com' /var/log/rd-tunnel.log 2>/dev/null | awk '!seen[$0]++' | tail -2)
+urls="https://rd.repeaks.xyz"
 tok=0
 for u in $urls; do
   h=${u#https://}

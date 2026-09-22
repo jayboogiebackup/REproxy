@@ -19,6 +19,19 @@ import json
 import os
 import re
 import urllib.request
+
+
+# CLOUDFLARE_UA_FIX: Cloudflare's bot protection on the named tunnel hostname
+# returns HTTP 403 for the default "Python-urllib/x.y" User-Agent, which broke
+# every bridge call. Present a normal browser UA for all outbound requests.
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+try:
+    _ua_opener = urllib.request.build_opener()
+    _ua_opener.addheaders = [("User-Agent", _UA)]
+    urllib.request.install_opener(_ua_opener)
+except Exception:
+    pass
 import urllib.parse
 from urllib.parse import quote
 

@@ -877,10 +877,17 @@ def api_rd_stream():
             except Exception:
                 data = {"error": f"bridge http {e.code}"}
         if data.get("url"):
+            # needs_remux: True only when the wanted audio track is NOT the
+            # file's first one (the bridge must remux it before playback).
+            # False/absent → the file's own first audio track is already the
+            # wanted language → play it directly (no multi-GB remux wait).
             return _json({"status": True, "source": "realdebrid", "tmdb": int(tmdb), "type": mtype,
                           "season": int(params.get("season")) if params.get("season") else None,
                           "episode": int(params.get("episode")) if params.get("episode") else None,
-                          "url": data["url"], "provider": "realdebrid", "servers": [{"id": "realdebrid", "name": "Real-Debrid", "url": data["url"]}]})
+                          "url": data["url"], "provider": "realdebrid",
+                          "audio": data.get("audio"),
+                          "needs_remux": bool(data.get("needs_remux")),
+                          "servers": [{"id": "realdebrid", "name": "Real-Debrid", "url": data["url"]}]})
         return _json({"status": False, "error": data.get("error", "rd failed")}), 404
     except Exception as exc:
         return _json({"status": False, "error": f"rd bridge error: {exc}"}), 502

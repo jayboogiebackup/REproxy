@@ -26,6 +26,7 @@ Config:
 import json
 import os
 import re
+import threading
 import time
 import urllib.request
 import urllib.parse
@@ -94,6 +95,232 @@ def _codec_cache_load():
 _codec_cache_load()
 
 
+# ── audio probe (codec + real language per stream) ────────────────────
+# ONE header-only ffprobe serves both the codec check and the audio-language
+# check. Cached in memory + on disk so the resolve subprocess, the main
+# server (track endpoint) and later resolves all share it.
+_audio_probe_cache = {}  # RD file id -> (timestamp, {"tracks": [...], "safe": bool|None})
+
+SAFE_AUDIO_CODECS = ("aac", "mp3", "opus", "vorbis", "flac", "pcm_s16le",
+                     "pcm_s24le", "pcm_f32le", "pcm_u8")
+UNSAFE_AUDIO_CODECS = ("ac3", "eac3", "dts", "dts-hd", "mlp", "truehd")
+
+
+def _audio_probe_cache_save():
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".audio_probe_cache.json")
+        with open(p, "w") as f:
+            json.dump({k: (v[0], v[1]) for k, v in _audio_probe_cache.items()}, f)
+    except Exception:
+        pass
+
+
+def _audio_probe_cache_load():
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".audio_probe_cache.json")
+        with open(p) as f:
+            data = json.load(f)
+        for k, (ts, v) in data.items():
+            _audio_probe_cache[k] = (ts, v)
+    except Exception:
+        pass
+
+
+_audio_probe_cache_load()
+
+
+def _probe_key(url):
+    """Stable cache key for an RD file: the file id in /d/{ID}/... (survives
+    CDN host rotation)."""
+    try:
+        for frag in ("/d/", "/stream/"):
+            if frag in url:
+                return url.split(frag)[1].split("/")[0]
+    except Exception:
+        pass
+    return url
+
+
+def audio_tracks(url):
+    """Audio streams of the RD file in FILE ORDER as [{"codec","lang"}].
+    None when it can't be probed (callers must never block playback then).
+    Order matters: the first entry is the track a browser plays by default."""
+    return _probe_audio(url).get("tracks")
+
+
+def _probe_audio(url, ttl=21600):
+    """Header-only ffprobe → {"tracks": [{"codec","lang"}...], "safe": bool|None}
+    in a SINGLE call (~3s, cached on disk for 6h). "safe" mirrors
+    audio_codec_is_browser_safe: True when the FIRST audio track decodes in
+    browsers, False for AC-3/DTS/TrueHD (silent), None when unknown."""
+    key = _probe_key(url)
+    now = time.time()
+    c = _audio_probe_cache.get(key)
+    if c and now - c[0] < ttl:
+        return c[1]
+    info = {"tracks": None, "safe": None}
+    import subprocess as _sp
+    try:
+        proc = _sp.run(["ffprobe", "-v", "error", "-select_streams", "a",
+                        "-show_entries", "stream=codec_name:stream_tags=language",
+                        "-of", "json", url],
+                       capture_output=True, text=True, timeout=25)
+        d = json.loads(proc.stdout or "{}")
+        tracks = []
+        for st in (d.get("streams") or []):
+            tracks.append({"codec": (st.get("codec_name") or "").lower(),
+                           "lang": ((st.get("tags") or {}).get("language") or "").lower()})
+        info["tracks"] = tracks
+        codec = tracks[0]["codec"] if tracks else ""
+        if codec:
+            info["safe"] = codec in SAFE_AUDIO_CODECS
+            if codec in UNSAFE_AUDIO_CODECS:
+                # TrueHD is NOT browser-playable (silent in Chrome/Edge) —
+                # same family as DTS/AC-3.
+                info["safe"] = False
+        # A filename fast-path verdict (if we already have one) wins: it is
+        # what the previous code returned without probing.
+        fc = _codec_cache.get(key)
+        if fc and isinstance(fc[1], bool) and codec:
+            info["safe"] = fc[1]
+        _audio_probe_cache[key] = (now, info)
+        _audio_probe_cache_save()
+        return info
+    except Exception:
+        return info  # can't probe — never block playback on it
+
+
+# ── audio language decision ───────────────────────────────────────────
+# Languages that must NEVER be served to an English request. "jpn" is
+# deliberately absent: Japanese is the ORIGINAL audio of anime (it is only
+# wrong when the user asked for the English dub, which the plan checks).
+FOREIGN_AUDIO_LANGS = {
+    "spa", "esp", "ita", "fre", "fra", "ger", "deu", "por", "rus", "pol",
+    "ukr", "nld", "dut", "swe", "nor", "hun", "ron", "ell", "bul", "hrv",
+    "srp", "slo", "ces", "cze", "heb", "tha", "vie", "tur", "hin", "ara",
+    "zho", "chi", "kor", "ben", "tam", "tel", "msa", "fil",
+}
+
+
+def _norm_lang(code):
+    """Normalise an ffprobe language tag (ISO 639-2, sometimes 639-1 or a
+    full name) to a 3-letter code; "" / unknown → "und"."""
+    c = (code or "").strip().lower().rstrip(".")
+    return {
+        "en": "eng", "english": "eng", "eng": "eng",
+        "ja": "jpn", "japanese": "jpn", "jpn": "jpn",
+        "es": "spa", "esp": "spa", "spanish": "spa", "spa": "spa",
+        "it": "ita", "italian": "ita", "ita": "ita",
+        "fr": "fre", "fra": "fre", "french": "fre", "fre": "fre",
+        "de": "ger", "deu": "ger", "german": "ger", "ger": "ger",
+        "pt": "por", "portuguese": "por", "por": "por",
+        "ru": "rus", "russian": "rus", "rus": "rus",
+        "und": "und", "unknown": "und", "": "und",
+    }.get(c, c) or "und"
+
+
+def _accept_langs(mtype, lang):
+    """Which audio languages satisfy a request:
+      lang=dub (anime)      → English only (that is the dub track)
+      anime (sub)           → Japanese, English acceptable
+      movie/tv (default)    → English
+    """
+    if (lang or "").lower() in ("dub", "eng", "en", "english"):
+        return ("eng",)
+    if mtype == "anime":
+        return ("jpn", "eng")
+    return ("eng",)
+
+
+def audio_plan(tracks, accept):
+    """How a file must be played for the requested audio, from its REAL
+    audio streams (ffprobe order):
+      "fits"    the first audio track already is an accepted language → play
+                the file DIRECTLY: no remux, instant start.
+      "remux"   an accepted language exists but is not first → the track
+                endpoint has to remux to it.
+      "reject"  no accepted language anywhere (e.g. a Spanish/Italian dub for
+                an English request) → never serve this file.
+      "unknown" can't tell (no probe / untagged streams) → play directly;
+                blocking playback on an unknown is worse than trying it.
+    """
+    if not tracks:
+        return "unknown"
+    langs = [_norm_lang(t.get("lang")) for t in tracks]
+    if langs[0] in accept:
+        return "fits"
+    for l in langs[1:]:
+        if l in accept:
+            return "remux"
+    if all(l == "und" for l in langs):
+        return "unknown"
+    return "reject"
+
+
+# Release-name markers that state a foreign audio track. Matched on whole
+# tokens so titles are never misread ("Captain America" has no ITA token),
+# and deliberately WITHOUT plain "SPANISH"/"ITALIAN"/"FRENCH" — those are
+# common words in English titles ("The Italian Job"). They are only a cheap
+# pre-filter; the probe of the real audio tracks is the actual decision.
+FOREIGN_NAME_TOKENS = {
+    "SPA", "ESP", "ITA", "FRE", "FRA", "GER", "DEU", "POR", "RUS", "POL",
+    "UKR", "NLD", "DUT", "SWE", "NOR", "HUN", "RON", "ELL", "BUL", "HRV",
+    "SRP", "SLO", "CES", "CZE", "HEB", "THA", "VIE", "TUR", "HIN", "ARA",
+    "ZHO", "KOR", "BEN", "TAM", "TEL", "MSA", "LATINO", "CASTELLANO",
+    "ESPANOL", "SUBTITULADO", "SUBTITULADA", "DUBBED", "VOSTFR",
+}
+ENGLISH_NAME_TOKENS = {"ENG", "ENGLISH", "EN", "MULTI", "DUAL", "MULTIAUDIO",
+                       "DUALAUDIO", "ENGDUB", "VOSTENG"}
+
+
+def _foreign_only_name(name):
+    """True when a release name declares foreign audio and gives no sign of
+    English/multi audio. Cheap pre-filter — the real decision is the probe."""
+    if not name:
+        return False
+    toks = set(re.split(r"[^A-Za-z0-9]+", name.upper()))
+    if not (toks & FOREIGN_NAME_TOKENS):
+        return False
+    return not (toks & ENGLISH_NAME_TOKENS)
+
+
+def _url_name(url):
+    """The release filename from an RD URL (percent-decoded)."""
+    try:
+        return urllib.parse.unquote((url or "").split("/")[-1] or "")
+    except Exception:
+        return ""
+
+
+# ── remux coordination ────────────────────────────────────────────────
+# The track endpoint is a ThreadingHTTPServer: the player (and its
+# stall-recovery watchdog) can ask for the same remux twice at once. One
+# lock per RD file id keeps a second request from starting a duplicate
+# multi-GB ffmpeg — it waits for the first to finish and then serves the
+# cached file.
+_remux_locks = {}
+_remux_locks_guard = threading.Lock()
+_remux_failed = {}  # file id -> timestamp of the last failed remux
+
+
+def _remux_lock(file_id):
+    with _remux_locks_guard:
+        lk = _remux_locks.get(file_id)
+        if lk is None:
+            lk = threading.Lock()
+            _remux_locks[file_id] = lk
+        return lk
+
+
+def _remux_mark_failed(file_id):
+    _remux_failed[file_id] = time.time()
+
+
+def _remux_recently_failed(file_id, ttl=60):
+    ts = _remux_failed.get(file_id)
+    return bool(ts and time.time() - ts < ttl)
+
+
 def audio_codec_is_browser_safe(url, ttl=3600, filename_hint=None):
     """Probe the file's audio codec via ffprobe (header-only, ~3s, cached).
     Returns True when the audio will play in browsers (AAC/MP3/Opus/Vorbis/
@@ -113,38 +340,14 @@ def audio_codec_is_browser_safe(url, ttl=3600, filename_hint=None):
     if filename_hint:
         n = (filename_hint or "").upper()
         if any(x in n for x in ("AC3", "AC-3", "EAC3", "E-AC-3", "DTS", "TRUEHD", "TRUE-HD", "ATMOS", "DOLBYD", "DOLBY DIGITAL", "DD 5.1", "DD5.1", "DDP", "DTS-HD")):
-            _codec_cache[url.split("/d/")[-1].split("/")[0] if "/d/" in url else url] = (time.time(), False)
+            _codec_cache[_probe_key(url)] = (time.time(), False)
             return False
         if any(x in n for x in ("AAC", "AAC2.0", "MP3", "OPUS", "VORBIS", "FLAC", "MP4A", "MPEG-4 AUDIO", "LC-AAC")):
-            _codec_cache[url.split("/d/")[-1].split("/")[0] if "/d/" in url else url] = (time.time(), True)
+            _codec_cache[_probe_key(url)] = (time.time(), True)
             return True
-    import subprocess as _sp
-    try:
-        # cache key = the RD file id (stable across CDN host rotations)
-        key = url
-        for frag in ("/d/", "/stream/"):
-            if frag in url:
-                key = url.split(frag)[1].split("/")[0]
-                break
-        now = time.time()
-        c = _codec_cache.get(key)
-        if c and now - c[0] < ttl:
-            return c[1]
-        proc = _sp.run(["ffprobe", "-v", "error", "-select_streams", "a:0",
-                        "-show_entries", "stream=codec_name", "-of", "csv=p=0", url],
-                       capture_output=True, text=True, timeout=25)
-        codec = (proc.stdout or "").strip().split(",")[0].strip().lower()
-        safe = codec in ("aac", "mp3", "opus", "vorbis", "flac", "pcm_s16le",
-                         "pcm_s24le", "pcm_f32le", "pcm_u8") if codec else None
-        # TrueHD is NOT browser-playable (silent in Chrome, experimental in
-        # MP4) — same family as DTS/AC-3. Mark it unsafe.
-        if codec in ("ac3", "eac3", "dts", "dts-hd", "mlp", "truehd"):
-            safe = False
-        _codec_cache[key] = (now, safe)
-        _codec_cache_save()
-        return safe
-    except Exception:
-        return None  # can't probe — don't block playback
+    # Ambiguous name → probe once (codec + languages in ONE ffprobe, cached
+    # for 6h in .audio_probe_cache.json).
+    return _probe_audio(url).get("safe")
 
 
 def rd_get(path):
@@ -898,6 +1101,7 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_ac
     lang='dub' (anime) → prefer English-dubbed releases.
     Successful resolves are cached (6h) so repeat plays skip the 20s walk."""
     ck = f"{tmdb}|{mtype}|{season}|{episode}|{quality}|{skip_account}|{lang}"
+    accept = _accept_langs(mtype, lang)
     # codec is deliberately EXCLUDED from the key: it's a browser preference,
     # not a different resolution — sharing the cache means Chrome's resolve
     # (0.1s) serves Firefox instantly instead of Firefox re-walking the
@@ -909,16 +1113,63 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_ac
         cfn = cached.get("url", "")
         if codec == "h264" and _is_hevc_name(cfn.split("/")[-1] if "/" in cfn else cfn):
             pass
-        else:
+        elif _cached_audio_ok(cached, cfn, accept):
             return cached
+        # else: the cached entry is a foreign-audio release (written before
+        # the audio-language check) → fall through and re-resolve.
     result = _resolve_stream_impl(tmdb, mtype, season, episode, quality, skip_account, codec, lang)
     url = result.get("url") if isinstance(result, dict) else None
     if url and not url_matches_type(url, mtype, season, episode):
         result = {"error": "resolved link is the wrong type (show/movie mismatch)",
                   "imdb": result.get("imdb")}
     if url and isinstance(result, dict):
+        _tag_audio(result, accept)
         _resolve_cache_set(ck, result)
     return result
+
+
+def _tag_audio(result, accept):
+    """Attach the audio decision to a resolve result so the player knows
+    whether the file plays as-is or needs the track endpoint:
+      audio       "fits" | "remux" | "unknown" | "reject"
+      needs_remux True when the wanted audio exists but is NOT the file's
+                  first track — the only case where the ffmpeg remux (the
+                  multi-second/tens-of-seconds first-play stall) is needed.
+    """
+    url = result.get("url")
+    if not url:
+        return result
+    plan = audio_plan(audio_tracks(url), accept)
+    result["audio"] = plan
+    result["needs_remux"] = plan == "remux"
+    return result
+
+
+def _cached_audio_ok(cached, url, accept):
+    """True when a cached resolve may be served for this audio request.
+    Entries written before the audio-language check can point at a foreign
+    dub (Spanish/Italian) — verify the file's REAL audio once, remember the
+    verdict (so this costs one ffprobe ever), and reject it otherwise."""
+    if not url:
+        return False
+    if cached.get("audio"):
+        return cached["audio"] != "reject"
+    plan = audio_plan(audio_tracks(url), accept)
+    if plan == "reject":
+        return False
+    cached["audio"] = plan
+    cached["needs_remux"] = plan == "remux"
+    return True
+
+
+def _audio_gate(url, accept):
+    """True when this file must NOT be served for the requested audio:
+    its release name declares a foreign-only dub, or its REAL audio tracks
+    contain no accepted language (Spanish/Italian dub for an English ask).
+    A file that can't be probed passes — an unknown is never a hard reject."""
+    if _foreign_only_name(_url_name(url)):
+        return True
+    return audio_plan(audio_tracks(url), accept) == "reject"
 
 
 def _is_hevc_name(name):
@@ -937,6 +1188,10 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
     imdb = tmdb_to_imdb(tmdb, "movie" if mtype == "movie" else "tv")
     if not imdb:
         return {"error": "no imdb id"}
+    # Which audio languages may be served for this request (English unless the
+    # caller asked for something else). Every accepted candidate must pass
+    # _audio_gate: a release that only carries a foreign dub is never used.
+    accept = _accept_langs(mtype, lang)
 
     # 0. Fetch Torrentio candidates FIRST (0.1s, parallel-safe) so the slow
     #    account codec probe below overlaps with candidate prep.
@@ -969,6 +1224,11 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                 safe = audio_codec_is_browser_safe(url, filename_hint=q)
                 if safe is False:
                     continue
+                # Audio-language gate: the account walk is title-matched only,
+                # so it happily returns a foreign dub ("Subtitulado.Esp") when
+                # the account holds one. Never serve that for an English ask.
+                if _audio_gate(url, accept):
+                    continue
                 return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
         except Exception:
             pass
@@ -989,13 +1249,19 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
             if h264_only:
                 candidates = h264_only
             # else: keep all — HEVC-only title, prefer a stream over nothing
-        # lang=dub (anime): boost English-dub/dual-audio releases in the order.
+        # lang=dub (anime): boost English-dub releases in the order. Within
+        # those, an English-ONLY dub release is ranked above Dual/Multi-audio:
+        # its first audio track is the English one, so it plays directly
+        # (audio_plan "fits") with no remux at all. Dual-audio releases store
+        # the Japanese track first → they still need the ffmpeg remux.
         def _lang_rank(c):
             n = (c.get("name", "") or "").upper()
             if lang == "dub":
-                if any(x in n for x in ("DUB", "DUAL", "ENGLISH", "EN.")):
-                    return 0  # dubbed — try first
-                return 1
+                if any(x in n for x in ("DUAL", "MULTI")):
+                    return 1  # English present, but not as the first track
+                if any(x in n for x in ("DUB", "ENGLISH", "EN.")):
+                    return 0  # dubbed — likely English-first: try first
+                return 2
             return 0
         order = sorted(candidates,
                        key=lambda c: (_lang_rank(c), codec_rank(c.get("name", ""), want_h), -int(c.get("seeders") or 0)))
@@ -1011,14 +1277,29 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
             try:
                 url = rd_add_and_stream(c["info_hash"], file_idx=c.get("file_idx"),
                                         filename=c.get("filename"), season=season, episode=episode)
-                if url and audio_codec_is_browser_safe(url) is False:
+                if not url:
+                    return None
+                if audio_codec_is_browser_safe(url) is False:
                     return None  # silent codec — skip
-                return url, c
+                # Audio language: reject a foreign dub outright; report how
+                # the file has to be played ("fits" = play it as-is).
+                if _foreign_only_name(c.get("name", "")):
+                    return None
+                plan = audio_plan(audio_tracks(url), accept)
+                if plan == "reject":
+                    return None
+                return url, c, plan
             except Exception:
                 return None
 
         BATCH = 3
-        for start in range(0, len(order), BATCH):
+        # A candidate whose English audio is not its first track needs the
+        # blocking remux. Before paying that, look one extra batch further for
+        # a release that plays as-is (bounded: 2 batches max, so the resolve
+        # never turns into a long walk).
+        MAX_BATCHES_FOR_FITS = 2
+        fallback = None  # (url, candidate) needing a remux
+        for bi, start in enumerate(range(0, len(order), BATCH)):
             if time.time() > deadline:
                 break
             batch = order[start:start + BATCH]
@@ -1027,9 +1308,20 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                     tried += 1
                     if not res:
                         continue
-                    url, c = res
-                    if url:
+                    url, c, plan = res
+                    if not url:
+                        continue
+                    if plan != "remux":
                         return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
+                    if fallback is None:
+                        fallback = (url, c)
+            if fallback is not None and bi + 1 >= MAX_BATCHES_FOR_FITS:
+                break
+        if fallback is not None:
+            # No as-is release found — play the right audio via the remux
+            # (cached after the first time) rather than a foreign dub.
+            url, c = fallback
+            return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
         # Second pass: try the best-seeded candidates (may include cached HEVC
         # that browsers with hardware decode CAN play)
         if time.time() < deadline:
@@ -1046,6 +1338,10 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                     if url:
                         safe = audio_codec_is_browser_safe(url)
                         if safe is False:
+                            continue
+                        if _foreign_only_name(c.get("name", "")):
+                            continue
+                        if audio_plan(audio_tracks(url), accept) == "reject":
                             continue
                         return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
                 except Exception:
@@ -1098,6 +1394,8 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                     continue
                 url = rd_find_by_title(q)
                 if url:
+                    if _audio_gate(url, accept):
+                        continue
                     return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
         except Exception:
             pass
@@ -1118,6 +1416,8 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
         try:
             url = rd_add_and_stream(c["info_hash"], file_idx=c.get("file_idx"), season=season, episode=episode)
             if url:
+                if _audio_gate(url, accept):
+                    continue
                 return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
         except Exception:
             continue  # 451 / invalid — next candidate
@@ -1232,6 +1532,8 @@ class Handler(BaseHTTPRequestHandler):
         import urllib.parse as _up
         raw_url = q.get("url", [None])[0]
         lang = (q.get("lang", ["eng"])[0] or "eng").lower()
+        if lang in ("dub", "en", "english"):
+            lang = "eng"  # normalise (also keeps the _eng.mp4 cache name)
         if not raw_url:
             return self._json({"error": "url required"}, 400)
         # Derive a stable cache key from the RD file ID in the URL
@@ -1244,6 +1546,31 @@ class Handler(BaseHTTPRequestHandler):
         cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "track_cache")
         os.makedirs(cache_dir, exist_ok=True)
         cache_path = os.path.join(cache_dir, f"{file_id}_{lang}.mp4")
+        # ── FAST PATH: does this file even NEED a remux? ──────────────────
+        # A remux only exists to pick the wanted audio track. If the file's
+        # FIRST audio track already IS that language (or the streams are
+        # untagged, in which case ffmpeg would just fall back to the same
+        # first track), the remux would produce byte-identical audio while
+        # making the viewer wait for a full multi-GB RD download + copy.
+        # Redirect to the original file instead: playback starts immediately
+        # and nothing is written to track_cache.
+        tracks = audio_tracks(raw_url)
+        plan = audio_plan(tracks, (lang,))
+        if plan in ("fits", "unknown"):
+            self.send_response(302)
+            self.send_header("Location", raw_url)
+            self.send_header("Content-Length", "0")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        if plan == "reject":
+            # The file carries no <lang> track at all (e.g. a Spanish/Italian
+            # dub for an English request). Refuse — never remux some other
+            # language and label it English.
+            langs = ",".join(_norm_lang(t.get("lang")) for t in (tracks or []))
+            return self._json({"error": f"no {lang} audio track in this file (has: {langs})"}, 409)
+        # plan == "remux": the wanted track exists but is not the first one.
         # Serve from cache when present (full Range support → fast Firefox)
         if os.path.exists(cache_path):
             size = os.path.getsize(cache_path)
@@ -1293,29 +1620,41 @@ class Handler(BaseHTTPRequestHandler):
         # NOT a live stream. First play waits for the remux; later plays hit
         # the cache instantly with full Range support.
         tmp_path = cache_path + ".tmp"
-        try:
-            cmd = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
-                   "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
-                   "-c", "copy", "-strict", "-2", "-movflags", "faststart", "-f", "mp4", tmp_path]
-            proc = _sp.Popen(cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-            proc.wait(timeout=600)
-            if proc.returncode != 0 or not os.path.exists(tmp_path):
-                # lang track missing — fall back to the first audio track
-                cmd2 = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
-                        "-map", "0:v:0", "-map", "0:a:0",
-                        "-c", "copy", "-strict", "-2", "-movflags", "faststart", "-f", "mp4", tmp_path]
-                proc2 = _sp.Popen(cmd2, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-                proc2.wait(timeout=600)
-                if proc2.returncode != 0 or not os.path.exists(tmp_path):
-                    return self._json({"error": "remux failed"}, 500)
-            os.rename(tmp_path, cache_path)
-        except Exception:
-            try:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-            except Exception:
+        with _remux_lock(file_id):
+            # Another request may have finished the remux while we waited.
+            if os.path.exists(cache_path):
                 pass
-            return self._json({"error": "remux failed"}, 500)
+            elif _remux_recently_failed(file_id):
+                return self._json({"error": f"no {lang} audio track — remux failed"}, 502)
+            else:
+                try:
+                    cmd = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
+                           "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
+                           "-c", "copy", "-strict", "-2", "-movflags", "faststart", "-f", "mp4", tmp_path]
+                    proc = _sp.Popen(cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                    proc.wait(timeout=600)
+                    if proc.returncode != 0 or not os.path.exists(tmp_path):
+                        # The wanted track could not be extracted. The old code
+                        # fell back to audio track 0 — which is how a Spanish/
+                        # Italian dub ended up playing as "English". Fail
+                        # instead: the player re-resolves (English or nothing).
+                        _remux_mark_failed(file_id)
+                        try:
+                            if os.path.exists(tmp_path):
+                                os.unlink(tmp_path)
+                        except Exception:
+                            pass
+                        return self._json(
+                            {"error": f"no {lang} audio track — refusing foreign audio fallback"}, 502)
+                    os.rename(tmp_path, cache_path)
+                except Exception:
+                    _remux_mark_failed(file_id)
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+                    except Exception:
+                        pass
+                    return self._json({"error": "remux failed"}, 500)
         # Serve the freshly remuxed file with FULL Range support (the browser
         # needs to seek even on the first play). Reuse the same serving logic
         # as a cache hit by handling the Range header here too.

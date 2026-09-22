@@ -775,7 +775,7 @@ def api_replayer_stream():
 
     resolver = os.environ.get(
         "RESOLVER_URL",
-        "https://england-successfully-jaguar-poems.trycloudflare.com",
+        "https://vault-informal-weekends-give.trycloudflare.com",
     ).rstrip("/")
     url = None
     if resolver:
@@ -843,7 +843,7 @@ def api_rd_stream():
         return _json({"status": False, "error": "tmdb + type required"}), 400
     bridge = os.environ.get(
         "RD_BRIDGE_URL",
-        "https://albums-bedrooms-mods-cow.trycloudflare.com",
+        "https://vault-informal-weekends-give.trycloudflare.com",
     ).rstrip("/")
     if not bridge:
         return _json({"status": False, "error": "RD_BRIDGE_URL not set"}), 503
@@ -877,7 +877,7 @@ def api_rd_stream():
 def api_rd_track():
     """RD file remuxed to a single audio track (dual-audio anime → eng).
     Streams the bridge's ffmpeg -c copy output directly to the player."""
-    bridge = os.environ.get("RD_BRIDGE_URL", "https://albums-bedrooms-mods-cow.trycloudflare.com").rstrip("/")
+    bridge = os.environ.get("RD_BRIDGE_URL", "https://vault-informal-weekends-give.trycloudflare.com").rstrip("/")
     raw_url = (request.args.get("url") or "").strip()
     lang = (request.args.get("lang") or "eng").strip()
     if not raw_url:
@@ -919,7 +919,7 @@ def api_rd_track():
 @app.route("/api/rd/subs")
 def api_rd_subs():
     """OpenSubtitles subtitle list — forwards to the Pi RD bridge."""
-    bridge = os.environ.get("RD_BRIDGE_URL", "https://albums-bedrooms-mods-cow.trycloudflare.com").rstrip("/")
+    bridge = os.environ.get("RD_BRIDGE_URL", "https://vault-informal-weekends-give.trycloudflare.com").rstrip("/")
     try:
         params = {k: request.args.get(k) for k in ("tmdb", "type", "season", "episode") if request.args.get(k)}
         qs = urllib.parse.urlencode(params)

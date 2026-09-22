@@ -732,7 +732,7 @@ def api_replayer_relay():
         "https://vidnest.fun/" if url.startswith(("https://tiktoks.animanga.fun/", "https://streamvaultsrc.click/")) else (
         "https://www.vidking.net/" if url.startswith(("https://moon.peakstorm.top/", "https://rapidnight.top/", "https://stormgate.top/", "https://papercobra.top/")) else "https://cinesrc.st/"
     ))
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": referer})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36", "Referer": referer})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = resp.read()
@@ -798,7 +798,7 @@ def api_replayer_stream():
                 params["season"] = season or "1"
                 params["episode"] = episode or "1"
             qs = urllib.parse.urlencode(params)
-            req = urllib.request.Request(f"{resolver}/resolve?{qs}", headers={"User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(f"{resolver}/resolve?{qs}", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"})
             with urllib.request.urlopen(req, timeout=60) as resp:
                 data = json.loads(resp.read().decode())
             if data.get("url"):
@@ -866,7 +866,7 @@ def api_rd_stream():
             if request.args.get(k):
                 params[k] = request.args[k]
         qs = urllib.parse.urlencode(params)
-        req = urllib.request.Request(f"{bridge}/api/rd/stream?{qs}", headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(f"{bridge}/api/rd/stream?{qs}", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"})
         try:
             with urllib.request.urlopen(req, timeout=155) as resp:
                 data = json.loads(resp.read().decode())
@@ -898,7 +898,7 @@ def api_rd_track():
     try:
         qs = urllib.parse.urlencode({"url": raw_url, "lang": lang})
         rng = request.headers.get("Range", "")
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
         if rng:
             headers["Range"] = rng
         req = urllib.request.Request(f"{bridge}/api/rd/track?{qs}", headers=headers)
@@ -936,7 +936,7 @@ def api_rd_subs():
     try:
         params = {k: request.args.get(k) for k in ("tmdb", "type", "season", "episode") if request.args.get(k)}
         qs = urllib.parse.urlencode(params)
-        req = urllib.request.Request(f"{bridge}/api/rd/subs?{qs}", headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(f"{bridge}/api/rd/subs?{qs}", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"})
         with urllib.request.urlopen(req, timeout=60) as resp:
             return _json(json.loads(resp.read().decode()))
     except Exception as exc:
@@ -964,7 +964,7 @@ def api_rd_sub():
         srt_url = dl.get("link")
         if not srt_url:
             return _json({"error": "no link"}), 404
-        req2 = urllib.request.Request(srt_url, headers={"User-Agent": "Mozilla/5.0"})
+        req2 = urllib.request.Request(srt_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"})
         with urllib.request.urlopen(req2, timeout=40) as resp2:
             srt = resp2.read().decode("utf-8", "replace")
         # SRT → VTT

@@ -1451,14 +1451,18 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
     return None
 
 
-# ── candidate ordering: POPULARITY-FIRST, sanity-filtered ─────────────
-# The user's ask: "check the debrid server for torrents, pick the MOST POPULAR
-# one, and stream it". Popularity must never outrank sanity, so the order is
-# (1) language preference, (2) a sanity tier read from the release NAME,
-# (3) a sane size band, (4) seeder count, (5) codec_rank as tie-breaker.
+# ── candidate ordering: QUALITY-FIRST, sanity-filtered ────────────────
+# HARD RULES for the RD resolver:
+#   (1) a CAM/TS/telesync release is never used while an HD (720p+) release
+#       exists — _filter_cam_when_hd drops it outright and the order key's
+#       leading cam flag demotes any straggler below every non-cam release;
+#   (2) candidates are ordered by quality, highest fidelity first: resolution
+#       (2160→480) descending, with unmarked names below any explicit height.
+# The old POPULARITY-FIRST intent survives INSIDE a fidelity tier (language
+# preference, a sanity tier, a sane size band, seeder count, then codec_rank).
 # The PROBED gates (audio language, browser-safe audio, Firefox video codec)
 # still decide what is actually returned — this only decides what is tried
-# first, so the most-seeded SENSIBLE candidate wins instead of first-match.
+# first, so the highest-quality SENSIBLE candidate wins instead of first-match.
 _SANE_SIZE_MIN_GB = 0.12   # below this it is a sample or a broken release
 _SANE_SIZE_MAX_GB = 25.0   # above this it is a remux pack, not an episode
 
@@ -1541,8 +1545,93 @@ def _candidate_tier(c, codec, want_h):
     return tier
 
 
+# ── fidelity tiering (HARD RULES) ─────────────────────────────────────
+# Two rules, applied to every candidate list before it is ordered or tried:
+#   (1) a cam / telesync / telecine release is only ever considered when the
+#       candidate set holds NO genuine HD (720p+) alternative — otherwise it
+#       is dropped outright (see _filter_cam_when_hd);
+#   (2) the surviving candidates are ordered highest-fidelity first, so a
+#       2160p beats a 1080p beats a 720p beats an unmarked name beats a cam
+#       (see _quality_rank / _candidate_order_key).
+_CAM_TOKENS = {
+    "CAM", "CAMRIP", "HDCAM", "TS", "HDTS", "TELESYNC", "TELECINE", "TC",
+    "HDTC", "NEWSOURCE", "PREDVD", "DVDSCR", "SCREENER", "VHSRIP",
+}
+# Substrings the previous code already used — kept as a fast path (and to
+# catch glued forms like "HDCAMRIP" that do not tokenise to a marker).
+_CAM_SUBSTRINGS = ("CAMRIP", "HDCAM", "TELESYNC", "TELECINE", "HDTS", "NEWSOURCE")
+
+
+def _is_cam_release(name):
+    """True when a release name declares a cam / telesync / telecine source —
+    the lowest-fidelity tier (a recording made inside a cinema). Tokenised, so
+    a "TS"/"TC" inside an unrelated word cannot false-positive; "DTS" (a legit
+    audio codec) is explicitly NOT a cam marker."""
+    n = (name or "").upper()
+    if not n:
+        return False
+    if any(x in n for x in _CAM_SUBSTRINGS):
+        return True
+    toks = set(re.split(r"[^A-Z0-9]+", n))
+    return bool(toks & _CAM_TOKENS)
+
+
+def _release_height(name):
+    """Explicit resolution height parsed from a release name, else None
+    (an unmarked name proves nothing). Handles the usual 480/720/1080/2160
+    markers plus 1440p and the 4K/UHD aliases."""
+    n = (name or "").upper()
+    if "2160P" in n or "4K" in n or "UHD" in n:
+        return 2160
+    if "1440P" in n or "QHD" in n:
+        return 1440
+    if "1080P" in n or "FHD" in n:
+        return 1080
+    if "720P" in n:
+        return 720
+    if "576P" in n:
+        return 576
+    if "480P" in n:
+        return 480
+    return None
+
+
+def _quality_rank(c):
+    """Higher = higher fidelity. Used as the PRIMARY ordering key (rule 2):
+    cam/TS/telecine → 0 (always last), an unmarked name → 1 (it cannot prove
+    it is HD, so any explicitly-HD release outranks it), otherwise the explicit
+    pixel height (480…2160)."""
+    name = c.get("name", "")
+    if _is_cam_release(name):
+        return 0
+    h = _release_height(name)
+    return 1 if h is None else h
+
+
+def _filter_cam_when_hd(candidates):
+    """HARD RULE 1: drop every cam / telesync / telecine release as soon as the
+    set holds at least one genuine HD (720p+) alternative. Returns the possibly
+    filtered list, or the input untouched when there is no HD alternative (a cam
+    stream still beats no stream) or when filtering would leave it empty."""
+    if not candidates:
+        return candidates
+    hd_alt = [c for c in candidates
+              if (_release_height(c.get("name", "")) or 0) >= 720]
+    if not hd_alt:
+        return candidates  # nothing HD on offer — cams may be used
+    kept = [c for c in candidates if not _is_cam_release(c.get("name", ""))]
+    return kept or candidates
+
+
 def _candidate_order_key(c, want_h, lang, codec):
-    return (_lang_rank(c, lang),
+    # Rule 1 (cam never above HD) is also enforced structurally: the cam flag
+    # is the FIRST key (1 = cam, so it sorts last ascending), so even a cam
+    # that claims "2160p" sorts below a 480p WEB. Rule 2 (highest fidelity
+    # first) is the second key; language, browser-safety tier, size sanity,
+    # popularity and codec_rank break ties.
+    return (1 if _is_cam_release(c.get("name", "")) else 0,
+            -_quality_rank(c),
+            _lang_rank(c, lang),
             _candidate_tier(c, codec, want_h),
             _size_rank(_candidate_size_gb(c)),
             -int(c.get("seeders") or 0),
@@ -1924,6 +2013,10 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
     # Requested resolution bias (shared by the candidate ordering below and the
     # APIBay/EZTV tail sort further down).
     want_h = 1080 if quality == "1080" else 720 if quality == "720" else 480 if quality == "480" else None
+    # HARD RULE 1: never walk a CAM/TS/telecine release while an HD (720p+)
+    # alternative is on the table. Drop cams here so the h264 pre-filter, the
+    # ordering and the try-loop all see the same HD-only set.
+    candidates = _filter_cam_when_hd(candidates)
     if candidates:
         # Browser-playable first (H264 > HEVC/AV1), biased to requested quality.
         # codec=h264: filter HEVC/AV1 out — but SOFT: if every candidate is
@@ -2073,6 +2166,10 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
         tdata = json.loads(body)
         q = f"{tdata.get('name','')} S{int(season or 1):02d}E{int(episode or 1):02d}"
         candidates.extend(search_apibay(q, category="205"))
+
+    # HARD RULE 1 again: the APIBay/EZTV tail can add cams the Torrentio set
+    # did not have — re-apply before the final ordering below.
+    candidates = _filter_cam_when_hd(candidates)
 
     if not candidates:
         # Niche content may already be in the user's RD account — match by

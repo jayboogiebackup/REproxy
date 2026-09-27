@@ -35,5 +35,5 @@ last=0; [ -f "$S/tunnel" ] && last=$(cat "$S/tunnel")
 if [ "$tok" != 1 ] && [ $((now-last)) -gt 420 ]; then
   log "public tunnel unhealthy -> restart"
   echo "$now" > "$S/tunnel"
-  systemctl restart rd-tunnel.service
+  systemctl restart rd-tunnel-named.service
 fi

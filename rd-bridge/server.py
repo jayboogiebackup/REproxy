@@ -23,11 +23,13 @@ Config:
   TMDB_API_KEY        (defaults to the repeaks key)
   HTTP_PROXY/HTTPS_PROXY  (optional, for indexer scrapes)
 """
+import hashlib
 import json
 import os
 import re
 import threading
 import time
+import urllib.error
 import urllib.request
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,21 +43,30 @@ _resolve_cache = {}  # key -> (timestamp, result dict) — successful resolves,
 #                     # walk. Persisted to disk across restarts.
 
 
-def _resolve_cache_get(key):
+def _resolve_cache_get_entry(key):
+    """(timestamp, result) for a live cache entry, else (None, None)."""
     entry = _resolve_cache.get(key)
     if entry and time.time() - entry[0] < 21600:
-        return entry[1]
-    return None
+        return entry[0], entry[1]
+    return None, None
 
 
-def _resolve_cache_set(key, result):
-    _resolve_cache[key] = (time.time(), result)
+def _resolve_cache_get(key):
+    return _resolve_cache_get_entry(key)[1]
+
+
+def _write_resolve_cache():
     try:
         p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".resolve_cache.json")
         with open(p, "w") as f:
             json.dump({k: (v[0], v[1]) for k, v in _resolve_cache.items()}, f)
     except Exception:
         pass
+
+
+def _resolve_cache_set(key, result):
+    _resolve_cache[key] = (time.time(), result)
+    _write_resolve_cache()
 
 
 def _resolve_cache_load():
@@ -480,6 +491,255 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 
 
 
 # =========================================================================
+# CACHE PROVENANCE + DEAD-LINK FAILOVER
+#
+# A Real-Debrid direct link is minted against the account/session that created
+# it and is time-limited. MEASURED: after a subscription renewal (same token
+# text is irrelevant — RD rotates the session), every previously cached
+# `.../d/<FILEID>/...` URL answers HTTP 404 while a fresh resolve of the SAME
+# title/file returns a NEW file id that answers 206. So a cache holding a link
+# across a renewal is a cache holding a DEAD link, for up to its 6h TTL.
+#
+# Two defences, both cheap:
+#   1. Every cache key is prefixed with a short fingerprint of the current RD
+#      token; on startup the cache is purged when that fingerprint changed, so
+#      a renewal invalidates stale links AUTOMATICALLY instead of serving them.
+#   2. A failed candidate is blacklisted (`dead=` from the player) and never
+#      re-served; the resolve then falls through to the next candidate. Cached
+#      links older than _LINK_VERIFY_AFTER are also probed with a 2-byte Range
+#      request before being handed out.
+# =========================================================================
+_CACHE_FP = None
+
+# A cached direct link that is older than this is probed (2-byte Range) before
+# it is served. Warm repeat plays inside this window stay instant (0.07s).
+_LINK_VERIFY_AFTER = 900  # seconds
+
+_dead_links = {}  # RD file id -> timestamp first reported/probed dead
+_DEAD_LINK_TTL = 1800
+
+# ── provenance of the account, not just of the token ──────────────────────
+# The user's renewal did NOT change the token text, yet every cached link died:
+# RD rotates the direct links with the subscription period. So the fingerprint
+# must include ACCOUNT state — `expiration` moves forward on a renewal. The
+# /user call is cheap and re-read at most once per _FP_TTL.
+_FP_TTL = 600
+_FP_RECHECK_SECS = 600
+_FP_LOCK = threading.Lock()
+_FP_STATE = {"ts": 0.0, "fp": None, "token": None, "exp": None, "id": None,
+             "inconclusive": True}
+
+
+def _token_fingerprint():
+    """Short, non-reversible fingerprint of the current RD API key. Only the
+    first 10 hex chars of a SHA-256 are exposed (behind the auth gate) — never
+    enough to recover the token."""
+    raw = (RD_KEY or "").strip()
+    if not raw:
+        return "nokey"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+
+
+def _cache_fingerprint(force=False):
+    """Fingerprint of the RD ACCOUNT/session the cached links were minted
+    against. A renewal keeps the token but moves `expiration` forward and
+    rotates every direct link, so the account state MUST be part of it —
+    otherwise a renewal would silently keep serving 404s for 6h.
+
+    Cached twice for speed: in memory (per process) AND on disk, because every
+    resolve runs in a fresh SUBPROCESS — an in-memory-only TTL would mean one
+    /user call per resolve. Only the long-lived server (force=True, every
+    _FP_RECHECK_SECS) actually calls the API. On any failure it falls back to
+    the token-only hash and says so (`inconclusive`), which is what stops a
+    transient network blip from wiping a perfectly good cache."""
+    global _CACHE_FP
+    now = time.time()
+    tok = _token_fingerprint()
+    if not force:
+        with _FP_LOCK:
+            if _FP_STATE["fp"] and (now - _FP_STATE["ts"]) < _FP_TTL:
+                return _FP_STATE["fp"]
+        prev = _read_fp_file()
+        try:
+            prev_ok = (prev and prev.get("token") == tok
+                       and (now - float(prev.get("ts") or 0)) < _FP_TTL)
+        except Exception:
+            prev_ok = False
+        if prev_ok:
+            with _FP_LOCK:
+                _FP_STATE.update({"ts": float(prev.get("ts") or now),
+                                  "fp": prev.get("fp"), "token": prev.get("token"),
+                                  "exp": prev.get("exp"), "id": prev.get("id"),
+                                  "inconclusive": False})
+                _CACHE_FP = prev.get("fp")
+            return prev.get("fp")
+    fp = tok
+    exp = None
+    uid = None
+    inconclusive = True
+    try:
+        req = urllib.request.Request(
+            f"{RD_API}/user",
+            headers={"Authorization": f"Bearer {RD_KEY}", "User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.loads(r.read())
+        exp = str(d.get("expiration") or "") or None
+        uid = str(d.get("id") or "") or None
+        if exp:
+            fp = hashlib.sha256(f"{tok}|{exp}|{uid}".encode("utf-8")).hexdigest()[:10]
+            inconclusive = False
+    except Exception:
+        pass
+    with _FP_LOCK:
+        _FP_STATE.update({"ts": now, "fp": fp, "token": tok, "exp": exp,
+                          "id": uid, "inconclusive": inconclusive})
+        _CACHE_FP = fp
+    return fp
+
+
+def _cache_key(tmdb, mtype, season, episode, quality, skip_account, lang):
+    """Resolve cache key. The account fingerprint is part of the key, so a
+    renewal can never key-match an entry written under the previous session —
+    belt and braces on top of the startup purge."""
+    return (f"{_cache_fingerprint()}|{tmdb}|{mtype}|{season}|{episode}|"
+            f"{quality}|{skip_account}|{lang}")
+
+
+_FP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".resolve_cache_fp")
+
+
+def _read_fp_file():
+    """Last recorded provenance, or None when unreadable/legacy (a legacy
+    plain-text file is treated as 'no provenance' → one purge, then clean)."""
+    try:
+        with open(_FP_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) and d.get("fp") else None
+    except Exception:
+        return None
+
+
+def _write_fp_file():
+    try:
+        with open(_FP_FILE, "w") as f:
+            json.dump({"fp": _FP_STATE["fp"], "token": _FP_STATE["token"],
+                       "exp": _FP_STATE["exp"], "id": _FP_STATE["id"],
+                       "ts": _FP_STATE["ts"] or time.time()}, f)
+    except Exception:
+        pass
+
+
+def _cache_purge_entries(fp):
+    """Drop every cached resolve that is not bound to the current account
+    fingerprint (legacy entries and entries from a previous session)."""
+    dropped = 0
+    for k in list(_resolve_cache.keys()):
+        if not str(k).startswith(str(fp) + "|"):
+            _resolve_cache.pop(k, None)
+            dropped += 1
+    if dropped:
+        _write_resolve_cache()
+    return dropped
+
+
+def _cache_purge_stale_provenance(force=False):
+    """Purge cached resolves whose links belong to a PREVIOUS RD session and
+    record the current provenance. Called at startup and every _FP_RECHECK_SECS
+    by the watcher thread, so a renewal invalidates stale links automatically
+    instead of serving dead ones for up to 6h. Returns (reason, dropped)."""
+    fp = _cache_fingerprint(force=force)
+    with _FP_LOCK:
+        st = dict(_FP_STATE)
+    prev = _read_fp_file()
+    reason = None
+    if prev is None:
+        reason = "no provenance on record (first run / legacy cache)"
+    elif prev.get("token") != st.get("token"):
+        reason = "RD token changed"
+    elif st.get("exp") and prev.get("exp") and st.get("exp") != prev.get("exp"):
+        reason = "RD account session rotated (subscription renewed)"
+    elif prev.get("fp") != fp and not st.get("inconclusive"):
+        reason = "cache fingerprint changed"
+    dropped = 0
+    if reason:
+        dropped = _cache_purge_entries(fp)
+        _dead_links.clear()
+        print(f"[rd-bridge] cache provenance: {reason} -> purged {dropped} "
+              f"entr{'y' if dropped == 1 else 'ies'} (fp={fp})", flush=True)
+    _write_fp_file()
+    return reason, dropped
+
+
+def _provenance_watch():
+    """Daemon: re-fingerprint the account every _FP_RECHECK_SECS and purge the
+    resolve cache when it changed — a renewal is picked up without a restart."""
+    while True:
+        time.sleep(_FP_RECHECK_SECS)
+        try:
+            _cache_purge_stale_provenance(force=True)
+        except Exception:
+            pass
+
+
+def _link_id(url):
+    """Identity of an RD direct link: its /d/<FILEID>/ segment (URL-decoded —
+    the player double-encodes). Falls back to the path without the query."""
+    u = urllib.parse.unquote(url or "")
+    m = re.search(r"/d/([A-Za-z0-9]+)", u)
+    if m:
+        return m.group(1).upper()
+    return u.split("?")[0]
+
+
+def _mark_dead(url):
+    """Remember that this direct link failed. Never fatal: an empty/unknown
+    link is simply not remembered."""
+    if not url or not _is_rd_url(url):
+        return
+    lid = _link_id(url)
+    if lid:
+        _dead_links[lid] = time.time()
+        # drop any cache entry currently holding it
+        for k in list(_resolve_cache.keys()):
+            try:
+                cur = (_resolve_cache[k][1] or {}).get("url", "")
+            except Exception:
+                continue
+            if cur and _link_id(cur) == lid:
+                _resolve_cache.pop(k, None)
+
+
+def _is_dead(url):
+    if not url:
+        return False
+    ts = _dead_links.get(_link_id(url))
+    if ts and time.time() - ts < _DEAD_LINK_TTL:
+        return True
+    return False
+
+
+def _link_live(url, timeout=6):
+    """2-byte Range probe against an RD direct link. True = live OR
+    inconclusive (a network blip must never nuke a good link)."""
+    if not url:
+        return False
+    try:
+        req = urllib.request.Request(url, headers={"Range": "bytes=0-1",
+                                                  "User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return getattr(r, "status", 200) in (200, 206)
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 404, 410):
+            return False
+        return True
+    except Exception:
+        return True
+
+
+_cache_purge_stale_provenance()
+
+
+# =========================================================================
 # SECURITY LAYER — access control, per-IP rate limiting, outbound allowlist
 #
 # Threat model: rd.repeaks.xyz is a PUBLIC hostname and every call to
@@ -710,6 +970,7 @@ def search_torrentio(imdb, mtype, season=None, episode=None):
             bh = s.get("behaviorHints") or {}
             hits.append({"name": title[:90], "info_hash": ih, "file_idx": s.get("fileIdx"),
                          "filename": bh.get("filename", ""), "seeders": seeders,
+                         "size_gb": _size_gb(title),
                          "source": "torrentio", "quality": s.get("name", "")[:30]})
         return hits
     except Exception:
@@ -1190,6 +1451,104 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
     return None
 
 
+# ── candidate ordering: POPULARITY-FIRST, sanity-filtered ─────────────
+# The user's ask: "check the debrid server for torrents, pick the MOST POPULAR
+# one, and stream it". Popularity must never outrank sanity, so the order is
+# (1) language preference, (2) a sanity tier read from the release NAME,
+# (3) a sane size band, (4) seeder count, (5) codec_rank as tie-breaker.
+# The PROBED gates (audio language, browser-safe audio, Firefox video codec)
+# still decide what is actually returned — this only decides what is tried
+# first, so the most-seeded SENSIBLE candidate wins instead of first-match.
+_SANE_SIZE_MIN_GB = 0.12   # below this it is a sample or a broken release
+_SANE_SIZE_MAX_GB = 25.0   # above this it is a remux pack, not an episode
+
+
+def _size_gb(name):
+    """Release size in GB parsed from a release name. Torrentio embeds
+    '💾 1.72 GB' in its title; APIBay/EZTV rows carry a plain size field
+    (handled by _candidate_size_gb). None when the name says nothing."""
+    n = (name or "").upper()
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:GB|GIB)\b", n)
+    if m:
+        return float(m.group(1))
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:MB|MIB)\b", n)
+    if m:
+        return float(m.group(1)) / 1024.0
+    return None
+
+
+def _candidate_size_gb(c):
+    """Best-effort size for a candidate: an explicit field (bytes or GB) first,
+    then the release name."""
+    for k in ("size_gb", "size_bytes", "size"):
+        v = c.get(k)
+        if v is None:
+            continue
+        try:
+            n = float(v)
+        except Exception:
+            continue
+        if n <= 0:
+            continue
+        if k == "size_gb":
+            return n
+        # bytes → GB (a value below 1MiB cannot be bytes for video)
+        return n / (1024.0 ** 3) if n > 1024 * 1024 else n
+    return _size_gb(c.get("name", ""))
+
+
+def _size_rank(gb):
+    """0 = sane for one episode/feature, 1 = unknown, 2 = sample or absurd."""
+    if gb is None:
+        return 1
+    if gb < _SANE_SIZE_MIN_GB or gb > _SANE_SIZE_MAX_GB:
+        return 2
+    return 0
+
+
+def _lang_rank(c, lang):
+    """lang=dub (anime): an English-ONLY dub release ranks above Dual/Multi —
+    dual-audio releases store the Japanese track first, so they always pay the
+    slow ffmpeg remux. Unchanged behaviour, moved to module level so the
+    ordering helper can share it."""
+    n = (c.get("name", "") or "").upper()
+    if lang == "dub":
+        if any(x in n for x in ("DUAL", "MULTI")):
+            return 1  # English present, but not as the first track
+        if any(x in n for x in ("DUB", "ENGLISH", "EN.")):
+            return 0  # dubbed — likely English-first: try first
+        return 2
+    return 0
+
+
+def _candidate_tier(c, codec, want_h):
+    """0 = release name looks browser-sensible, higher = more suspicious.
+    Name-based only (the real decision is the ffprobe gate at try time)."""
+    n = (c.get("name", "") or "").upper()
+    tier = 0
+    if codec == "h264" and _is_hevc_name(n):
+        tier += 2  # Firefox has no HEVC decoder at all
+    if any(x in n for x in ("DTS", "TRUEHD", "TRUE-HD", "ATMOS", "AC3", "AC-3",
+                            "EAC3", "E-AC-3", "DOLBY", "DD 5.1", "DD5.1", "DDP")):
+        tier += 1  # silent in Chrome
+    if "HDCAM" in n or "CAMRIP" in n or "TELESYNC" in n or "TS-" in n:
+        tier += 3
+    if want_h:
+        h = (1080 if "1080P" in n else 720 if "720P" in n else 480 if "480P" in n
+             else 2160 if ("2160P" in n or "4K" in n) else None)
+        if h is not None and h != want_h:
+            tier += 1
+    return tier
+
+
+def _candidate_order_key(c, want_h, lang, codec):
+    return (_lang_rank(c, lang),
+            _candidate_tier(c, codec, want_h),
+            _size_rank(_candidate_size_gb(c)),
+            -int(c.get("seeders") or 0),
+            codec_rank(c.get("name", ""), want_h))
+
+
 def codec_rank(name, want_height=None):
     """Browser-friendly + English-first ranking. Lower = better.
     Penalizes: HEVC/AV1/2160p (unplayable), non-English dubs (RUS/CZ/SK/ES/IT/
@@ -1349,21 +1708,46 @@ def url_matches_type(url, mtype, season=None, episode=None):
     return bool(re.search(r"(?:e|ep|episode)[\s._-]?\d{1,2}(?!\d)|[\s._-]\d{1,2}[\s._-]", fn))
 
 
-def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None):
+def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None,
+                   nocache=False, dead=None):
     """Full flow → direct stream URL, with STRICT show/movie separation:
     a show never plays a movie and vice versa. Any resolved URL that fails
     the type check is rejected. codec='h264' → H.264/AVC only (Firefox
     has NO HEVC/AV1 support, so those would fail to load there).
     lang='dub' (anime) → prefer English-dubbed releases.
-    Successful resolves are cached (6h) so repeat plays skip the 20s walk."""
-    ck = f"{tmdb}|{mtype}|{season}|{episode}|{quality}|{skip_account}|{lang}"
+    Successful resolves are cached (6h) so repeat plays skip the 20s walk.
+
+    RELIABILITY FAILOVER:
+      nocache=True  → never read the cache. A playback failure must not be
+                      answered with the same dead link again.
+      dead=<url>    → the caller just failed on this direct link: blacklist it
+                      (and every cache entry holding it) so the walk falls
+                      through to the NEXT candidate automatically.
+    Cached links are bound to the current RD token fingerprint, so a debrid
+    renewal invalidates them instead of serving 404s for up to 6h."""
+    if dead:
+        _mark_dead(dead)
     accept = _accept_langs(mtype, lang)
+    ck = _cache_key(tmdb, mtype, season, episode, quality, skip_account, lang)
     # codec is deliberately EXCLUDED from the key: it's a browser preference,
     # not a different resolution — sharing the cache means Chrome's resolve
     # (0.1s) serves Firefox instantly instead of Firefox re-walking the
     # account (~19s) for the same file.
-    cached = _resolve_cache_get(ck)
+    cts, cached = (None, None) if nocache else _resolve_cache_get_entry(ck)
     soft_cached = None
+    if cached is not None:
+        cfn = cached.get("url", "") or ""
+        stale = False
+        if _is_dead(cfn):
+            stale = True  # the player already failed on this exact link
+        elif cfn and cts and (time.time() - cts) > _LINK_VERIFY_AFTER and not _link_live(cfn):
+            # RD rotated/expired the direct link (independent of the token) —
+            # never hand a dead URL to the player.
+            _mark_dead(cfn)
+            stale = True
+        if stale:
+            cached = None
+            cts = None
     if cached is not None:
         cfn = cached.get("url", "")
         cname = cfn.split("/")[-1] if "/" in cfn else cfn
@@ -1507,6 +1891,11 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                 url = rd_find_by_title(q, season, episode, codec)
                 if not url:
                     continue
+                # A link the player already failed on (or that a liveness probe
+                # found dead) must never be served again — fall through to the
+                # next candidate instead.
+                if _is_dead(url):
+                    continue
                 # codec=h264 (Firefox): reject HEVC by the REAL probed codec —
                 # the torrent name often does not say it. HEVC is remembered as
                 # a last-resort fallback, never a hard "no stream". No name is
@@ -1532,6 +1921,9 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
     order = []
     tried = 0
     deadline = time.time() + 115
+    # Requested resolution bias (shared by the candidate ordering below and the
+    # APIBay/EZTV tail sort further down).
+    want_h = 1080 if quality == "1080" else 720 if quality == "720" else 480 if quality == "480" else None
     if candidates:
         # Browser-playable first (H264 > HEVC/AV1), biased to requested quality.
         # codec=h264: filter HEVC/AV1 out — but SOFT: if every candidate is
@@ -1539,7 +1931,6 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
         # stream (browsers with hardware decode can play it; the player's
         # decode-error retry handles the rest). Never return "no stream" just
         # because the only releases are HEVC.
-        want_h = 1080 if quality == "1080" else 720 if quality == "720" else 480 if quality == "480" else None
         if codec == "h264":
             h264_only = [c for c in candidates if not _is_hevc_name(c.get("name", ""))]
             if h264_only:
@@ -1550,17 +1941,11 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
         # its first audio track is the English one, so it plays directly
         # (audio_plan "fits") with no remux at all. Dual-audio releases store
         # the Japanese track first → they still need the ffmpeg remux.
-        def _lang_rank(c):
-            n = (c.get("name", "") or "").upper()
-            if lang == "dub":
-                if any(x in n for x in ("DUAL", "MULTI")):
-                    return 1  # English present, but not as the first track
-                if any(x in n for x in ("DUB", "ENGLISH", "EN.")):
-                    return 0  # dubbed — likely English-first: try first
-                return 2
-            return 0
+        # POPULARITY-FIRST: among equally sensible candidates the most-seeded
+        # one is tried first (then codec_rank breaks ties). See
+        # _candidate_order_key.
         order = sorted(candidates,
-                       key=lambda c: (_lang_rank(c), codec_rank(c.get("name", ""), want_h), -int(c.get("seeders") or 0)))
+                       key=lambda c: _candidate_order_key(c, want_h, lang, codec))
         # Stremio-style: try candidates until one streams. Cached = instant;
         # non-cached = RD downloads on their servers (30s-3min).
         # PARALLEL batches (3 at a time): each add is independent, so this
@@ -1574,6 +1959,11 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                 url = rd_add_and_stream(c["info_hash"], file_idx=c.get("file_idx"),
                                         filename=c.get("filename"), season=season, episode=episode)
                 if not url:
+                    return None
+                # Never re-mint a link the player already failed on: RD can
+                # hand back a URL for a torrent whose stored link expired, and
+                # re-serving it ends playback for no reason.
+                if _is_dead(url):
                     return None
                 # codec=h264 (Firefox): the RELEASE NAME is only a hint — most
                 # unmarked 2160p x265 releases carry no "x265"/"HEVC" token, so
@@ -1641,6 +2031,8 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                     url = rd_add_and_stream(c["info_hash"], file_idx=c.get("file_idx"),
                                             filename=c.get("filename"), season=season, episode=episode)
                     if url:
+                        if _is_dead(url):
+                            continue
                         # Same probed-codec gate as the first pass (see _try_one).
                         if codec == "h264" and not firefox_video_ok(url, c.get("name")):
                             _keep_hevc(url, c.get("name", ""))
@@ -1706,6 +2098,8 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                     continue
                 url = rd_find_by_title(q, season, episode, codec)
                 if url:
+                    if _is_dead(url):
+                        continue
                     # codec=h264 (Firefox): probed-codec gate — the name
                     # pre-filter inside rd_find_by_title cannot see an unmarked
                     # 2160p x265. HEVC is kept soft, never a hard reject.
@@ -1725,7 +2119,8 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
     # Torrentio-style: try EVERY candidate — RD 451-skips silently and
     # cached/unflagged hashes resolve instantly. Also wait longer for RD to
     # fetch non-cached torrents (RD does the downloading, not us).
-    order = sorted(candidates, key=lambda c: -int(c.get("seeders") or 0))
+    # Same popularity-first, sanity-filtered ordering as the main walk.
+    order = sorted(candidates, key=lambda c: _candidate_order_key(c, want_h, lang, codec))
     tried = 0
     for c in order:
         if tried >= 40:
@@ -1734,6 +2129,8 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
         try:
             url = rd_add_and_stream(c["info_hash"], file_idx=c.get("file_idx"), season=season, episode=episode)
             if url:
+                if _is_dead(url):
+                    continue
                 # codec=h264 (Firefox): probed-codec gate on the last candidate
                 # source too — prefer an H.264 release, keep probed HEVC soft.
                 if codec == "h264" and not firefox_video_ok(url, c.get("name")):
@@ -1874,6 +2271,14 @@ class Handler(BaseHTTPRequestHandler):
         skip_account = q.get("skip_account", ["0"])[0] == "1"
         codec = q.get("codec", [None])[0]
         lang = q.get("lang", [None])[0]
+        # Playback-failure failover: the player reports the direct link that
+        # just died and asks for a fresh walk that must not serve it again.
+        nocache = q.get("nocache", ["0"])[0] == "1"
+        dead = q.get("dead", [None])[0]
+        # Only a plausible RD direct link is accepted (it travels into the
+        # subprocess argv and into the dead-link blacklist).
+        if dead and (len(dead) > 512 or not _is_rd_url(dead)):
+            dead = None
         # Run the resolve in a SUBPROCESS with a hard timeout — a hung
         # RD call can never deadlock the server thread pool this way.
         import subprocess as _sp
@@ -1892,11 +2297,20 @@ class Handler(BaseHTTPRequestHandler):
             args.append(f"--lang={str(lang)[:16]}")
         if skip_account:
             args.append("--skip-account")
+        if nocache:
+            args.append("--nocache")
+        if dead:
+            args.append(f"--dead={dead}")
         try:
             proc = _sp.run(args, capture_output=True, text=True, timeout=150)
             out = proc.stdout.strip()
             if out:
                 result = json.loads(out.splitlines()[-1])
+                if isinstance(result, dict):
+                    # Token fingerprint: lets the client invalidate its own
+                    # cached URL after a renewal (a changed `v` = new session =
+                    # every previously cached link is dead).
+                    result["v"] = _cache_fingerprint()
                 return self._json(result, 200 if result.get("url") else 404)
             return self._json({"error": "resolve failed"}, 404)
         except _sp.TimeoutExpired:
@@ -2112,4 +2526,10 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"RD-bridge on :{PORT} (key={'set' if RD_KEY else 'MISSING'})")
+    # Purge cached links from a previous RD session (a renewal rotates them all)
+    # and keep watching: a later renewal must not be able to serve 404s for 6h.
+    # force=True = one /user call at boot so a renewal that happened while the
+    # bridge was down is caught immediately (subprocesses reuse the disk copy).
+    _cache_purge_stale_provenance(force=True)
+    threading.Thread(target=_provenance_watch, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """CLI entry for the RD bridge resolve — run as a subprocess with a hard timeout.
-Usage: resolve_cli.py <tmdb> <movie|tv> [season] [episode]"""
+Usage: resolve_cli.py <tmdb> <movie|tv> [season] [episode] [quality]
+                      [--codec=h264] [--lang=dub] [--skip-account]
+                      [--nocache] [--dead=<rd-url>]"""
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -13,6 +15,8 @@ if __name__ == "__main__":
     episode = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4].isdigit() else None
     quality = sys.argv[5] if len(sys.argv) > 5 and not sys.argv[5].startswith("--") else None
     skip_account = "--skip-account" in sys.argv
+    nocache = "--nocache" in sys.argv
+    dead = None
     codec = None
     lang = None
     for a in sys.argv:
@@ -20,5 +24,8 @@ if __name__ == "__main__":
             codec = a.split("=", 1)[1]
         if a.startswith("--lang="):
             lang = a.split("=", 1)[1]
-    result = server.resolve_stream(tmdb, mtype, season, episode, quality, skip_account, codec, lang)
+        if a.startswith("--dead="):
+            dead = a.split("=", 1)[1]
+    result = server.resolve_stream(tmdb, mtype, season, episode, quality, skip_account, codec, lang,
+                                   nocache=nocache, dead=dead)
     print(__import__("json").dumps(result))

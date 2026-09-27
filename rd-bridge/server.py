@@ -1552,7 +1552,10 @@ def _candidate_tier(c, codec, want_h):
 #       is dropped outright (see _filter_cam_when_hd);
 #   (2) the surviving candidates are ordered highest-fidelity first, so a
 #       2160p beats a 1080p beats a 720p beats an unmarked name beats a cam
-#       (see _quality_rank / _candidate_order_key).
+#       (see _quality_rank / _candidate_order_key). A FIREFOX ask
+#       (codec="h264") is the one exception: it has no HEVC decoder and 4K
+#       stutters, so 1080p is its top pick for smooth playback (see
+#       _quality_rank_browser).
 _CAM_TOKENS = {
     "CAM", "CAMRIP", "HDCAM", "TS", "HDTS", "TELESYNC", "TELECINE", "TC",
     "HDTC", "NEWSOURCE", "PREDVD", "DVDSCR", "SCREENER", "VHSRIP",
@@ -1597,10 +1600,11 @@ def _release_height(name):
 
 
 def _quality_rank(c):
-    """Higher = higher fidelity. Used as the PRIMARY ordering key (rule 2):
+    """Higher = higher fidelity. Chrome's PRIMARY ordering key (rule 2):
     cam/TS/telecine → 0 (always last), an unmarked name → 1 (it cannot prove
     it is HD, so any explicitly-HD release outranks it), otherwise the explicit
-    pixel height (480…2160)."""
+    pixel height (480…2160). Firefox (codec="h264") does NOT use this — see
+    _quality_rank_browser, which is speed-first."""
     name = c.get("name", "")
     if _is_cam_release(name):
         return 0
@@ -1623,14 +1627,60 @@ def _filter_cam_when_hd(candidates):
     return kept or candidates
 
 
+# ── browser-aware fidelity preference ────────────────────────────────
+# Chrome (codec != "h264") keeps STRICT highest-quality-first: 2160 > 1440 >
+# 1080 > 720 > 480 > unmarked. Firefox (codec == "h264") is SPEED-first: it
+# has no HEVC decoder and 4K playback stutters on the streaming hardware, so
+# 1080p is the top pick. Everything else sorts by distance from that sweet
+# spot, which puts the heavy 2160p last among explicit heights (a light 480p
+# plays smoother than a 4K stream) — cam stays the floor for both browsers.
+_FIREFOX_SWEET_SPOT = 1080
+# Larger than any possible |height - 1080| (max 1080 for 2160p), so an
+# explicit height always outranks the unmarked-name tier (1) and a cam (0).
+_FIREFOX_RANK_BASE = 2000
+
+
+def _quality_rank_browser(c, codec=None, want_h=None):
+    """Fidelity rank used as the PRIMARY ordering key (rule 2), chosen by the
+    requesting browser:
+
+      * Chrome / unknown (codec is not "h264") → strict highest-quality-first,
+        identical to _quality_rank: explicit pixel height (480…2160) wins,
+        an unmarked name sits at 1 (above cam), a cam release at 0.
+      * Firefox (codec == "h264") → speed-first, 1080p on top: rank decreases
+        with distance from _FIREFOX_SWEET_SPOT, and a height ABOVE the sweet
+        spot is penalised one extra point so the lighter release wins the tie
+        (720p beats the equally-distant but heavier 1440p). Ladder:
+        1080 > 720 > 1440 > 576 > 480 > 2160, with the unmarked/cam floor
+        unchanged. An EXPLICIT quality request (want_h, from ?quality=1080/720/
+        480) becomes the sweet spot instead of 1080, so the user's own pick is
+        never outranked by the browser default.
+
+    The cam floor is preserved in both branches so a cam can never outrank a
+    genuine release no matter which browser asks (see rule 1)."""
+    name = c.get("name", "")
+    if _is_cam_release(name):
+        return 0
+    h = _release_height(name)
+    if codec != "h264":
+        return _quality_rank(c)  # Chrome/unknown: strict highest-quality-first
+    if h is None:
+        return 1  # unmarked: cannot prove a height — still above cam only
+    target = want_h or _FIREFOX_SWEET_SPOT
+    overshoot = 1 if h > target else 0
+    return _FIREFOX_RANK_BASE - abs(h - target) - overshoot
+
+
 def _candidate_order_key(c, want_h, lang, codec):
     # Rule 1 (cam never above HD) is also enforced structurally: the cam flag
     # is the FIRST key (1 = cam, so it sorts last ascending), so even a cam
-    # that claims "2160p" sorts below a 480p WEB. Rule 2 (highest fidelity
-    # first) is the second key; language, browser-safety tier, size sanity,
+    # that claims "2160p" sorts below a 480p WEB. Rule 2 (fidelity first) is
+    # the second key and is BROWSER-AWARE: Chrome orders strictly highest
+    # quality first, Firefox puts 1080p top for smooth playback (see
+    # _quality_rank_browser). Language, browser-safety tier, size sanity,
     # popularity and codec_rank break ties.
     return (1 if _is_cam_release(c.get("name", "")) else 0,
-            -_quality_rank(c),
+            -_quality_rank_browser(c, codec, want_h),
             _lang_rank(c, lang),
             _candidate_tier(c, codec, want_h),
             _size_rank(_candidate_size_gb(c)),

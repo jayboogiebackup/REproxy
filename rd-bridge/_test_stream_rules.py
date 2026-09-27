@@ -106,6 +106,60 @@ try:
 except Exception as e:  # noqa: BLE001
     check(f"order key tolerates empty candidate ({e})", False)
 
+# ── browser-aware rule 2: Chrome strict, Firefox 1080p-first ────────
+ladder = [
+    C("Movie.2024.480p.WEB-DL.H264"),
+    C("Movie.2024.720p.WEB-DL.H264"),
+    C("Movie.2024.1080p.WEB-DL.H264"),
+    C("Movie.2024.1440p.WEB-DL.H264"),
+    C("Movie.2024.2160p.WEB-DL.H264"),
+    C("Movie.2024.WEB-DL.x264"),  # unmarked
+]
+
+# Chrome (no codec param): unchanged strict highest-quality-first
+oc = [c["name"] for c in sorted(ladder, key=lambda c: s._candidate_order_key(c, None, None, None))]
+check("chrome: 2160 first", "2160p" in oc[0])
+check("chrome: 1440 second (strict order intact)", "1440p" in oc[1])
+check("chrome: 1080 third", "1080p" in oc[2])
+check("chrome: unmarked last", oc[-1].endswith("x264") and "p." not in oc[-1].split("WEB-DL")[0])
+
+# Firefox (codec="h264"): 1080p is the top pick for playback speed, then the
+# lighter 720p ahead of the equally-distant but heavier 1440p.
+of = [c["name"] for c in sorted(ladder, key=lambda c: s._candidate_order_key(c, None, None, "h264"))]
+check("firefox: 1080p is the top pick", "1080p" in of[0])
+check("firefox: 2160p NOT first", "2160p" not in of[0])
+check("firefox: 720p next after 1080p", "720p" in of[1])
+check("firefox: 1440p after 720p (lighter wins tie)", "1440p" in of[2])
+check("firefox: 2160p last among explicit heights",
+      next(i for i, n in enumerate(of) if "2160p" in n) >
+      next(i for i, n in enumerate(of) if "480p" in n))
+check("firefox: unmarked below every explicit height",
+      of.index([n for n in of if n.endswith("x264") and "p." not in n.split("WEB-DL")[0]][0]) == len(of) - 1)
+
+# Firefox keeps the cam floor: a cam never outranks a real release
+fcam = [C("Movie.2024.2160p.HDCAM.x264", seeders=99999), C("Movie.2024.1080p.WEB-DL.H264")]
+ofc = sorted(fcam, key=lambda c: s._candidate_order_key(c, None, None, "h264"))
+check("firefox: cam stays last despite 2160p+99999 seeders", s._is_cam_release(ofc[-1]["name"]))
+
+# Firefox prefers 1080p over a 2160p release even when 2160p is far better seeded
+fseed = [C("Movie.2024.2160p.WEB-DL.H264", seeders=5000), C("Movie.2024.1080p.WEB-DL.H264", seeders=2)]
+ofs = sorted(fseed, key=lambda c: s._candidate_order_key(c, None, None, "h264"))
+check("firefox: 1080p beats a 5000-seeder 2160p", "1080p" in ofs[0]["name"])
+
+# and Chrome still takes that 2160p (strict order preserved)
+ocs = sorted(fseed, key=lambda c: s._candidate_order_key(c, None, None, None))
+check("chrome: 2160p still wins with strict order", "2160p" in ocs[0]["name"])
+
+# Firefox honours an EXPLICIT quality pick as the sweet spot (the player's
+# 1080/720/480 switch must never be outranked by the 1080p default)…
+of720 = [c["name"] for c in sorted(ladder, key=lambda c: s._candidate_order_key(c, 720, None, "h264"))]
+check("firefox: explicit quality=720 puts 720p top", "720p" in of720[0])
+of480 = [c["name"] for c in sorted(ladder, key=lambda c: s._candidate_order_key(c, 480, None, "h264"))]
+check("firefox: explicit quality=480 puts 480p top", "480p" in of480[0])
+# …while Chrome stays strictly highest-quality-first even with an explicit pick
+oc480 = [c["name"] for c in sorted(ladder, key=lambda c: s._candidate_order_key(c, 480, None, None))]
+check("chrome: explicit quality=480 does NOT override strict order", "2160p" in oc480[0])
+
 print()
 if FAILED:
     print(f"{len(FAILED)} CHECK(S) FAILED")

@@ -68,6 +68,71 @@ def _json(data, status=200):
     return _cors(resp)
 
 
+# =========================================================================
+# RD access control. REproxy spends the owner's Real-Debrid quota on every
+# /api/rd/* call, so the same dual gate the Pi bridge uses applies here:
+#   1. `t=` shared secret (set BRIDGE_TOKEN in the Vercel env to match the
+#      bridge's .env) — stops URL harvesters/bots; public in the client, so it
+#      only raises the bar.
+#   2. Origin/Referer allowlist — keeps the deployed token-less client working.
+# Set RD_STRICT=1 in the Vercel env once the client ships the token to make the
+# token mandatory. Edge/WAF rules are the real enforcement point (see
+# HARDENING.md in the rd-bridge repo).
+# =========================================================================
+RD_TOKEN = os.environ.get("BRIDGE_TOKEN", "").strip()
+RD_STRICT = os.environ.get("RD_STRICT", "0").strip() == "1"
+RD_ALLOWED_ORIGINS = {
+    "https://embed.repeaks.xyz", "https://www.embed.repeaks.xyz",
+    "https://repeaks.xyz", "https://www.repeaks.xyz",
+    "https://api.repeaks.xyz", "https://www.api.repeaks.xyz",
+}
+
+
+def _rd_origin():
+    o = (request.headers.get("Origin") or "").strip().lower()
+    if o and o != "null":
+        return o
+    ref = (request.headers.get("Referer") or "").strip()
+    if ref:
+        try:
+            p = urllib.parse.urlparse(ref)
+            if p.scheme and p.netloc:
+                return f"{p.scheme}://{p.netloc}".lower()
+        except Exception:
+            pass
+    return ""
+
+
+def _rd_authed():
+    if RD_TOKEN and request.args.get("t", "") == RD_TOKEN:
+        return True
+    if not RD_STRICT and _rd_origin() in RD_ALLOWED_ORIGINS:
+        return True
+    return False
+
+
+def _rd_gate():
+    """Returns a Flask response when the caller may not spend RD quota."""
+    if not _rd_authed():
+        try:
+            print(f"[sec] DENY rd ip={request.headers.get('x-forwarded-for','?')} "
+                  f"path={request.path}", flush=True)
+        except Exception:
+            pass
+        return _json({"status": False, "error": "unauthorized"}, 403)
+    return None
+
+
+def _rd_bridge_params(extra):
+    """Params for an outbound bridge call. Always attaches the shared secret so
+    REproxy keeps working when the bridge's ORIGIN-COMPAT gate is switched off
+    (server-side calls carry no Origin)."""
+    p = dict(extra or {})
+    if RD_TOKEN:
+        p["t"] = RD_TOKEN
+    return p
+
+
 @app.after_request
 def add_cors(resp):
     return _cors(resp)
@@ -850,10 +915,15 @@ def api_replayer_stream():
 def api_rd_stream():
     """Real-Debrid stream — forwards to the Pi's RD bridge (addMagnet→select→unrestrict).
        Returns a direct MP4/MKV URL playable in our native player."""
+    gate = _rd_gate()
+    if gate:
+        return gate
     tmdb = (request.args.get("tmdb") or "").strip()
     mtype = (request.args.get("type") or "").strip()
     if not tmdb or mtype not in ("movie", "tv", "anime"):
         return _json({"status": False, "error": "tmdb + type required"}), 400
+    if not tmdb.isdigit() or len(tmdb) > 9:
+        return _json({"status": False, "error": "bad tmdb"}), 400
     bridge = os.environ.get(
         "RD_BRIDGE_URL",
         "https://rd.repeaks.xyz",
@@ -865,7 +935,12 @@ def api_rd_stream():
         for k in ("season", "episode", "quality", "skip_account", "codec", "lang"):
             if request.args.get(k):
                 params[k] = request.args[k]
-        qs = urllib.parse.urlencode(params)
+        # Only the numeric/enum-y fields are forwarded upstream.
+        if params.get("season") and not str(params["season"]).isdigit():
+            return _json({"status": False, "error": "bad season"}), 400
+        if params.get("episode") and not str(params["episode"]).isdigit():
+            return _json({"status": False, "error": "bad episode"}), 400
+        qs = urllib.parse.urlencode(_rd_bridge_params(params))
         req = urllib.request.Request(f"{bridge}/api/rd/stream?{qs}", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"})
         try:
             with urllib.request.urlopen(req, timeout=155) as resp:
@@ -897,13 +972,22 @@ def api_rd_stream():
 def api_rd_track():
     """RD file remuxed to a single audio track (dual-audio anime → eng).
     Streams the bridge's ffmpeg -c copy output directly to the player."""
+    gate = _rd_gate()
+    if gate:
+        return gate
     bridge = os.environ.get("RD_BRIDGE_URL", "https://rd.repeaks.xyz").rstrip("/")
     raw_url = (request.args.get("url") or "").strip()
     lang = (request.args.get("lang") or "eng").strip()
     if not raw_url:
         return _json({"error": "url required"}), 400
+    # Only RD's own CDN — this value is forwarded verbatim to the bridge, which
+    # hands it to ffmpeg and to a 302 Location.
+    if not re.match(r"^https://([a-z0-9-]+\.)*download\.real-debrid\.com/", raw_url, re.I):
+        return _json({"error": "url must be a real-debrid download URL"}, 400)
+    if not re.fullmatch(r"[a-z]{2,3}", lang.lower()):
+        return _json({"error": "bad lang"}, 400)
     try:
-        qs = urllib.parse.urlencode({"url": raw_url, "lang": lang})
+        qs = urllib.parse.urlencode(_rd_bridge_params({"url": raw_url, "lang": lang}))
         rng = request.headers.get("Range", "")
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
         if rng:
@@ -939,10 +1023,15 @@ def api_rd_track():
 @app.route("/api/rd/subs")
 def api_rd_subs():
     """OpenSubtitles subtitle list — forwards to the Pi RD bridge."""
+    gate = _rd_gate()
+    if gate:
+        return gate
     bridge = os.environ.get("RD_BRIDGE_URL", "https://rd.repeaks.xyz").rstrip("/")
     try:
         params = {k: request.args.get(k) for k in ("tmdb", "type", "season", "episode") if request.args.get(k)}
-        qs = urllib.parse.urlencode(params)
+        if not str(params.get("tmdb", "")).isdigit() or len(str(params.get("tmdb", ""))) > 9:
+            return _json({"error": "bad tmdb"}), 400
+        qs = urllib.parse.urlencode(_rd_bridge_params(params))
         req = urllib.request.Request(f"{bridge}/api/rd/subs?{qs}", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"})
         with urllib.request.urlopen(req, timeout=60) as resp:
             return _json(json.loads(resp.read().decode()))
@@ -954,9 +1043,14 @@ def api_rd_subs():
 def api_rd_sub():
     """OpenSubtitles VTT — fetch via OpenSubtitles API from Vercel's IP
     (the Pi/datacenter IPs get 503, Vercel's usually works)."""
+    gate = _rd_gate()
+    if gate:
+        return gate
     fid = request.args.get("file_id")
-    if not fid:
-        return _json({"error": "file_id required"}), 400
+    # digits only — fid is interpolated into the OpenSubtitles request and
+    # (on the bridge side) into a cache filename.
+    if not fid or not re.fullmatch(r"\d{1,12}", fid):
+        return _json({"error": "bad file_id"}), 400
     key = os.environ.get("OPENSUBTITLES_API_KEY", "")
     if not key:
         return _json({"error": "OPENSUBTITLES_API_KEY not set"}), 503

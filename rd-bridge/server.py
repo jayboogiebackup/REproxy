@@ -148,27 +148,119 @@ def audio_tracks(url):
     return _probe_audio(url).get("tracks")
 
 
+# ── real video codec (Firefox has NO HEVC decoder) ────────────────────
+# A filename hint ("x265" in the release name) MISSES unmarked 2160p releases,
+# and the account walk's torrent name often says nothing about the codec. The
+# video codec is read from the SAME header probe as the audio, so knowing it
+# costs one extra field, not one extra ffprobe.
+_HEVC_VIDEO_CODECS = ("hevc", "h265", "x265")
+# Cover art ("attached_pic") is exposed by ffprobe as a real video stream with
+# one of these codecs. It must never be mistaken for the feature's codec — a
+# JPEG poster in front of a HEVC feature would otherwise read as "playable".
+_IMAGE_CODECS = ("mjpeg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "jpeg2000")
+
+
+def _is_hevc_codec(vc):
+    return (vc or "").lower() in _HEVC_VIDEO_CODECS
+
+
+def _real_video_codec(codec_name):
+    """The ffprobe codec_name if it is an actual video codec, else None
+    (empty, or an image codec used for embedded cover art)."""
+    c = (codec_name or "").lower()
+    if not c or c in _IMAGE_CODECS:
+        return None
+    return c
+
+
+def video_codec(url):
+    """The file's REAL video codec ("h264" / "hevc" / "av1" / ...), probed once
+    and cached. None when it cannot be determined — callers must then fall back
+    to the filename hint and never hard-block on it."""
+    info = _probe_audio(url)
+    if not isinstance(info, dict):
+        return None
+    if "vcodec" in info:
+        return info.get("vcodec")
+    # Cache entry written before the video codec was probed — one extra
+    # (video-only) header read, remembered so it happens at most once per file.
+    # A read that TIMED OUT is not cached (same as _probe_audio): a transient
+    # failure must never be remembered as "unprobeable" and mask a real HEVC.
+    import subprocess as _sp
+    vc = None
+    probed = False
+    try:
+        proc = _sp.run(["ffprobe", "-v", "error",
+                        "-show_entries", "stream=codec_type,codec_name",
+                        "-of", "json", url],
+                       capture_output=True, text=True, timeout=25)
+        data = json.loads(proc.stdout or "{}")
+        probed = True
+        for st in (data.get("streams") or []):
+            if (st.get("codec_type") or "").lower() != "video":
+                continue
+            vc = _real_video_codec(st.get("codec_name"))
+            if vc:
+                break
+    except Exception:
+        probed = False
+    if not probed:
+        return None
+    try:
+        info["vcodec"] = vc
+        _audio_probe_cache[_probe_key(url)] = (time.time(), info)
+        _audio_probe_cache_save()
+    except Exception:
+        pass
+    return vc
+
+
+def firefox_video_ok(url, name=None):
+    """False when a Firefox (codec=h264) request must NOT be given this file:
+    Firefox cannot decode HEVC at all. Decided on the REAL probed codec, falling
+    back to the filename hint when the probe cannot tell. AV1 is deliberately
+    allowed — Firefox/Chrome/Edge all decode AV1 natively."""
+    vc = video_codec(url)
+    if vc is not None:
+        return not _is_hevc_codec(vc)
+    return not _is_hevc_name(name if name is not None else _url_name(url))
+
+
 def _probe_audio(url, ttl=21600):
-    """Header-only ffprobe → {"tracks": [{"codec","lang"}...], "safe": bool|None}
-    in a SINGLE call (~3s, cached on disk for 6h). "safe" mirrors
-    audio_codec_is_browser_safe: True when the FIRST audio track decodes in
-    browsers, False for AC-3/DTS/TrueHD (silent), None when unknown."""
+    """Header-only ffprobe → {"tracks": [{"codec","lang"}...], "safe": bool|None,
+    "vcodec": str|None} in a SINGLE call (~3s, cached on disk for 6h).
+    "safe" mirrors audio_codec_is_browser_safe: True when the FIRST audio track
+    decodes in browsers, False for AC-3/DTS/TrueHD (silent), None when unknown.
+    "vcodec" is the first VIDEO stream's codec (e.g. "h264", "hevc", "av1") —
+    Firefox has no HEVC decoder at all, so a Firefox (codec=h264) resolve needs
+    the REAL video codec, not just a filename hint. Costing nothing extra: the
+    audio and video streams come from the same header read."""
     key = _probe_key(url)
     now = time.time()
     c = _audio_probe_cache.get(key)
     if c and now - c[0] < ttl:
         return c[1]
-    info = {"tracks": None, "safe": None}
+    info = {"tracks": None, "safe": None, "vcodec": None}  # type: dict
     import subprocess as _sp
     try:
-        proc = _sp.run(["ffprobe", "-v", "error", "-select_streams", "a",
-                        "-show_entries", "stream=codec_name:stream_tags=language",
+        # NO -select_streams: one read returns every stream (video + audio), so
+        # the video codec is known without a second ffprobe.
+        proc = _sp.run(["ffprobe", "-v", "error",
+                        "-show_entries", "stream=codec_type,codec_name:stream_tags=language",
                         "-of", "json", url],
                        capture_output=True, text=True, timeout=25)
         d = json.loads(proc.stdout or "{}")
         tracks = []
         for st in (d.get("streams") or []):
-            tracks.append({"codec": (st.get("codec_name") or "").lower(),
+            ctype = (st.get("codec_type") or "").lower()
+            cname = (st.get("codec_name") or "").lower()
+            if ctype == "video" and info["vcodec"] is None:
+                # Cover-art streams (mjpeg/png) are codec_type=video too — the
+                # first REAL video codec wins, never a poster.
+                info["vcodec"] = _real_video_codec(cname)
+            if ctype != "audio":
+                continue
+            tracks.append({"codec": cname,
                            "lang": ((st.get("tags") or {}).get("language") or "").lower()})
         info["tracks"] = tracks
         codec = tracks[0]["codec"] if tracks else ""
@@ -267,7 +359,11 @@ FOREIGN_NAME_TOKENS = {
     "UKR", "NLD", "DUT", "SWE", "NOR", "HUN", "RON", "ELL", "BUL", "HRV",
     "SRP", "SLO", "CES", "CZE", "HEB", "THA", "VIE", "TUR", "HIN", "ARA",
     "ZHO", "KOR", "BEN", "TAM", "TEL", "MSA", "LATINO", "CASTELLANO",
-    "ESPANOL", "SUBTITULADO", "SUBTITULADA", "DUBBED", "VOSTFR",
+    "ESPANOL", "SUBTITULADO", "SUBTITULADA", "DUBBED",
+    # NOTE: "VOSTFR" is deliberately NOT here. VOSTFR (version originale
+    # sous-titrée en français) describes FRENCH SUBTITLES over the ORIGINAL
+    # audio — usually English. Treating it as a foreign-audio marker rejected
+    # valid English-audio releases outright. Subtitling never changes audio.
 }
 ENGLISH_NAME_TOKENS = {"ENG", "ENGLISH", "EN", "MULTI", "DUAL", "MULTIAUDIO",
                        "DUALAUDIO", "ENGDUB", "VOSTENG"}
@@ -381,6 +477,166 @@ RD_API = "https://api.real-debrid.com/rest/1.0"
 PORT = int(os.environ.get("RD_PORT", "8801"))
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
+
+
+# =========================================================================
+# SECURITY LAYER — access control, per-IP rate limiting, outbound allowlist
+#
+# Threat model: rd.repeaks.xyz is a PUBLIC hostname and every call to
+# /api/rd/stream spends the owner's PAID Real-Debrid quota. The embed player
+# cannot send a custom header (its cross-origin resolve MUST stay a simple GET
+# with no preflight — see EmbedPlayer.tsx), so the shared secret travels as a
+# query parameter `t=`.
+#
+# Two gates, either one admits the request:
+#   1. t=<BRIDGE_TOKEN>          — shared secret. It is baked into the public
+#                                  client, so it only RAISES THE BAR (stops
+#                                  URL harvesters, bots, casual abuse); it is
+#                                  NOT a real credential.
+#   2. Origin/Referer allowlist  — keeps the already-deployed token-less client
+#                                  working. Spoofable with curl, which is
+#                                  exactly why the edge (Cloudflare WAF) is the
+#                                  real enforcement point — see HARDENING.md.
+# Once the client ships the token, set BRIDGE_ALLOW_ORIGIN_COMPAT=0 in .env to
+# make the token MANDATORY.
+# =========================================================================
+
+BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "").strip()
+ALLOW_ORIGIN_COMPAT = os.environ.get("BRIDGE_ALLOW_ORIGIN_COMPAT", "1").strip() != "0"
+
+ALLOWED_ORIGINS = {
+    "https://embed.repeaks.xyz",
+    "https://www.embed.repeaks.xyz",
+    "https://repeaks.xyz",
+    "https://www.repeaks.xyz",
+    "https://api.repeaks.xyz",
+    "https://www.api.repeaks.xyz",
+}
+# Canonical CORS origin used when the caller is not an allowlisted browser origin.
+CORS_ORIGIN = "https://embed.repeaks.xyz"
+
+# Only Real-Debrid's own CDN may ever be fetched or 302-redirected to. This
+# closes the open-redirect + SSRF that /api/rd/track?url= used to allow: ANY
+# url was forwarded verbatim into a `Location:` header and handed to ffmpeg
+# (which happily speaks file:// and plain http:// on the LAN).
+_RD_URL_RE = re.compile(r"^https://([a-z0-9-]+\.)*download\.real-debrid\.com/", re.I)
+
+
+def _is_rd_url(u):
+    return bool(u) and bool(_RD_URL_RE.match(u))
+
+
+def _client_ip(handler):
+    """Real client IP behind the Cloudflare tunnel.
+
+    CF-Connecting-IP is stamped by Cloudflare's edge and cannot be forged by
+    the caller. X-Forwarded-For is only a fallback for direct/local access,
+    where forging it merely lands the caller in a bucket of their choosing.
+    """
+    for h in ("CF-Connecting-IP", "X-Real-IP"):
+        v = handler.headers.get(h)
+        if v:
+            return v.strip()
+    xff = handler.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return handler.client_address[0] if handler.client_address else "unknown"
+
+
+def _request_origin(handler):
+    o = (handler.headers.get("Origin") or "").strip().lower()
+    if o and o != "null":
+        return o
+    ref = (handler.headers.get("Referer") or "").strip()
+    if ref:
+        try:
+            p = urllib.parse.urlparse(ref)
+            if p.scheme and p.netloc:
+                return f"{p.scheme}://{p.netloc}".lower()
+        except Exception:
+            pass
+    return ""
+
+
+def _constant_eq(a, b):
+    if not a or not b or len(a) != len(b):
+        return False
+    r = 0
+    for x, y in zip(a.encode(), b.encode()):
+        r |= x ^ y
+    return r == 0
+
+
+def _authorized(handler, token):
+    if BRIDGE_TOKEN and _constant_eq(token or "", BRIDGE_TOKEN):
+        return True
+    if ALLOW_ORIGIN_COMPAT and _request_origin(handler) in ALLOWED_ORIGINS:
+        return True
+    return False
+
+
+def _audit(msg):
+    """Abuse log. NEVER logs the query string (it can carry the token)."""
+    try:
+        print(f"[sec] {time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}", flush=True)
+    except Exception:
+        pass
+
+
+# ── per-IP token bucket ──────────────────────────────────────────────────
+_RL_LOCK = threading.Lock()
+_RL = {}                      # ip -> [tokens, last_ts]
+_RL_SWEEP = [0.0]
+
+RL_PER_MIN = float(os.environ.get("BRIDGE_RL_PER_MIN", "120"))
+RL_BURST = float(os.environ.get("BRIDGE_RL_BURST", "40"))
+RL_ACTIVE_CAP = int(os.environ.get("BRIDGE_MAX_CONCURRENT", "8"))
+
+
+def _rate_ok(ip, cost=1.0):
+    now = time.time()
+    with _RL_LOCK:
+        if now - _RL_SWEEP[0] > 300:      # bounded memory (else it's a DoS itself)
+            _RL_SWEEP[0] = now
+            for k in [k for k, v in _RL.items() if now - v[1] > 900]:
+                _RL.pop(k, None)
+        st = _RL.get(ip)
+        if st is None:
+            st = [RL_BURST, now]
+            _RL[ip] = st
+        st[0] = min(RL_BURST, st[0] + (now - st[1]) * (RL_PER_MIN / 60.0))
+        st[1] = now
+        if st[0] < cost:
+            return False
+        st[0] -= cost
+        return True
+
+
+# ── global concurrency cap for expensive work (subprocess / ffmpeg) ──────
+_active_lock = threading.Lock()
+_active = [0]
+
+
+def _acquire_slot():
+    with _active_lock:
+        if _active[0] >= RL_ACTIVE_CAP:
+            return False
+        _active[0] += 1
+        return True
+
+
+def _release_slot():
+    with _active_lock:
+        if _active[0] > 0:
+            _active[0] -= 1
+
+
+def _env_int(v, lo, hi, default):
+    try:
+        n = int(str(v).strip())
+    except Exception:
+        return default
+    return n if lo <= n <= hi else default
 
 
 def http_get(url, headers=None, timeout=20):
@@ -1107,17 +1363,26 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_ac
     # (0.1s) serves Firefox instantly instead of Firefox re-walking the
     # account (~19s) for the same file.
     cached = _resolve_cache_get(ck)
+    soft_cached = None
     if cached is not None:
-        # h264 requested but cached result is a HEVC/AV1 file Firefox can't
-        # play → re-resolve (don't serve an unplayable file)
         cfn = cached.get("url", "")
-        if codec == "h264" and _is_hevc_name(cfn.split("/")[-1] if "/" in cfn else cfn):
-            pass
+        cname = cfn.split("/")[-1] if "/" in cfn else cfn
+        # h264 requested but the cached file's REAL codec is HEVC (probed — a
+        # filename check misses every unmarked 2160p x265) → Firefox has no
+        # decoder for it. Re-resolve looking for an H.264 release, but keep the
+        # cached one as a last resort: a Firefox ask must never end up with
+        # LESS than Chrome would have been given.
+        if codec == "h264" and cfn and not firefox_video_ok(cfn, cname):
+            soft_cached = cached
         elif _cached_audio_ok(cached, cfn, accept):
             return cached
         # else: the cached entry is a foreign-audio release (written before
         # the audio-language check) → fall through and re-resolve.
     result = _resolve_stream_impl(tmdb, mtype, season, episode, quality, skip_account, codec, lang)
+    if soft_cached is not None and not (isinstance(result, dict) and result.get("url")):
+        # Nothing playable-by-Firefox exists for this title — an HEVC stream
+        # beats "no stream" (the player's decode-error retry handles it).
+        result = soft_cached
     url = result.get("url") if isinstance(result, dict) else None
     if url and not url_matches_type(url, mtype, season, episode):
         result = {"error": "resolved link is the wrong type (show/movie mismatch)",
@@ -1193,6 +1458,32 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
     # _audio_gate: a release that only carries a foreign dub is never used.
     accept = _accept_langs(mtype, lang)
 
+    # A Firefox ask (codec=h264) must not be handed an HEVC file — Firefox has
+    # NO HEVC decoder, so the viewer sees "no stream" even though a stream was
+    # resolved. HEVC files used to be caught by FILENAME only ("x265"/"HEVC"),
+    # which misses every unmarked 2160p release and most account files. The
+    # real codec is now probed through firefox_video_ok at EVERY point a
+    # candidate is accepted below (account walk, Torrentio batches, second
+    # pass, APIBay/EZTV tail). Never hard-block though: a probed-HEVC file is
+    # remembered by _keep_hevc and served if it is the only thing that exists
+    # (the player's decode-error retry/cinesrc fallback handles it) — "no
+    # stream" is worse.
+    soft_hevc = {"url": None, "title": None}
+
+    def _soft_hevc_result():
+        if not soft_hevc["url"]:
+            return None
+        return {"url": soft_hevc["url"], "source": "realdebrid",
+                "title": (soft_hevc["title"] or "")[:80], "imdb": imdb,
+                "vcodec": "hevc"}
+
+    def _keep_hevc(url, name):
+        """Remember a probed-HEVC file as the last-resort fallback."""
+        if not soft_hevc["url"]:
+            soft_hevc["url"] = url
+            soft_hevc["title"] = name or ""
+        return None
+
     # 0. Fetch Torrentio candidates FIRST (0.1s, parallel-safe) so the slow
     #    account codec probe below overlaps with candidate prep.
     candidates = []
@@ -1216,8 +1507,13 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                 url = rd_find_by_title(q, season, episode, codec)
                 if not url:
                     continue
-                # codec=h264: skip HEVC/AV1 FILES (torrent name may not say it)
-                if codec == "h264" and _is_hevc_name(url.split("/")[-1] if "/" in url else q):
+                # codec=h264 (Firefox): reject HEVC by the REAL probed codec —
+                # the torrent name often does not say it. HEVC is remembered as
+                # a last-resort fallback, never a hard "no stream". No name is
+                # passed: the URL's own filename is the better hint when the
+                # probe cannot tell.
+                if codec == "h264" and not firefox_video_ok(url):
+                    _keep_hevc(url, q)
                     continue
                 # Skip AC-3/DTS account files — they're silent in Chrome.
                 # Filename hint avoids the ~3s ffprobe when the name says it.
@@ -1279,6 +1575,15 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                                         filename=c.get("filename"), season=season, episode=episode)
                 if not url:
                     return None
+                # codec=h264 (Firefox): the RELEASE NAME is only a hint — most
+                # unmarked 2160p x265 releases carry no "x265"/"HEVC" token, so
+                # this decides on the PROBED video codec. It costs nothing: the
+                # audio probe below reads the same header, and it is cached.
+                # Probed HEVC is remembered as a last resort, never a hard
+                # "no stream".
+                if codec == "h264" and not firefox_video_ok(url, c.get("name")):
+                    _keep_hevc(url, c.get("name", ""))
+                    return None
                 if audio_codec_is_browser_safe(url) is False:
                     return None  # silent codec — skip
                 # Audio language: reject a foreign dub outright; report how
@@ -1336,6 +1641,10 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                     url = rd_add_and_stream(c["info_hash"], file_idx=c.get("file_idx"),
                                             filename=c.get("filename"), season=season, episode=episode)
                     if url:
+                        # Same probed-codec gate as the first pass (see _try_one).
+                        if codec == "h264" and not firefox_video_ok(url, c.get("name")):
+                            _keep_hevc(url, c.get("name", ""))
+                            continue
                         safe = audio_codec_is_browser_safe(url)
                         if safe is False:
                             continue
@@ -1346,10 +1655,13 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                         return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
                 except Exception:
                     continue
-    # All candidates tried and none streamed — report honestly, skip the slow
+    # All candidates tried and none streamed — report honestly (or serve the
+    # remembered HEVC if that is all this title has), skip the slow
     # APIBay/EZTV tail (search_eztv can take 30s+).
     if not candidates or tried > 0:
-        return {"error": "no stream available on real-debrid yet (try again in a few minutes)", "imdb": imdb}
+        return _soft_hevc_result() or {
+            "error": "no stream available on real-debrid yet (try again in a few minutes)",
+            "imdb": imdb}
 
     # Remaining sources (APIBay / EZTV)
 
@@ -1392,14 +1704,20 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
             for q in names:
                 if not q:
                     continue
-                url = rd_find_by_title(q)
+                url = rd_find_by_title(q, season, episode, codec)
                 if url:
+                    # codec=h264 (Firefox): probed-codec gate — the name
+                    # pre-filter inside rd_find_by_title cannot see an unmarked
+                    # 2160p x265. HEVC is kept soft, never a hard reject.
+                    if codec == "h264" and not firefox_video_ok(url):
+                        _keep_hevc(url, q)
+                        continue
                     if _audio_gate(url, accept):
                         continue
                     return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
         except Exception:
             pass
-        return {"error": "no torrents found", "imdb": imdb}
+        return _soft_hevc_result() or {"error": "no torrents found", "imdb": imdb}
 
     # NOTE: RD's instantAvailability endpoint is currently disabled (error 37),
     # so we try torrents directly — best-seeded first. RD downloads
@@ -1416,91 +1734,116 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
         try:
             url = rd_add_and_stream(c["info_hash"], file_idx=c.get("file_idx"), season=season, episode=episode)
             if url:
+                # codec=h264 (Firefox): probed-codec gate on the last candidate
+                # source too — prefer an H.264 release, keep probed HEVC soft.
+                if codec == "h264" and not firefox_video_ok(url, c.get("name")):
+                    _keep_hevc(url, c.get("name", ""))
+                    continue
                 if _audio_gate(url, accept):
                     continue
                 return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
         except Exception:
             continue  # 451 / invalid — next candidate
-    return {"error": "could not resolve via real-debrid (all candidates rejected)", "imdb": imdb}
+    return _soft_hevc_result() or {
+        "error": "could not resolve via real-debrid (all candidates rejected)", "imdb": imdb}
 
 
 class Handler(BaseHTTPRequestHandler):
-    def _json(self, obj, status=200):
+    server_version = "repeaks-bridge"
+    sys_version = ""
+
+    def _acao(self):
+        """Tight CORS. Only the site's own origins may read responses from a
+        browser — not `*`, which let ANY website use the bridge as a free RD
+        resolver with the visitor's IP."""
+        o = _request_origin(self)
+        return o if o in ALLOWED_ORIGINS else CORS_ORIGIN
+
+    def _json(self, obj, status=200, extra=None):
         body = json.dumps(obj).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", self._acao())
+        self.send_header("Vary", "Origin")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
+
+    def _denied(self, why, ip, status=403, extra=None):
+        _audit(f"DENY {why} ip={ip} path={urllib.parse.urlparse(self.path).path}")
+        return self._json({"error": "unauthorized" if status == 403 else why}, status, extra)
+
+    def _gate(self):
+        """Auth + rate limit for every /api/rd/* route. Returns a response-ish
+        tuple on rejection, or None to proceed."""
+        ip = _client_ip(self)
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        if not _authorized(self, q.get("t", [None])[0]):
+            return self._denied("no token / bad origin", ip, 403)
+        if not _rate_ok(ip):
+            return self._denied("rate limit", ip, 429, {"Retry-After": "15"})
+        return None
 
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(url.query)
         if url.path == "/health":
-            return self._json({"status": "ok", "service": "rd-bridge", "rd_key": bool(RD_KEY), "port": PORT})
+            # Deliberately minimal: no key/port/path disclosure. The watchdog
+            # only greps for "status": "ok".
+            return self._json({"status": "ok", "service": "rd-bridge"})
         if url.path == "/api/rd/stream":
+            gate = self._gate()
+            if gate:
+                return gate
             tmdb = q.get("tmdb", [None])[0]
             mtype = q.get("type", [None])[0]
             if not tmdb or not mtype:
                 return self._json({"error": "tmdb + type required"}, 400)
-            season = q.get("season", [None])[0]
-            episode = q.get("episode", [None])[0]
-            quality = q.get("quality", [None])[0]
-            skip_account = q.get("skip_account", ["0"])[0] == "1"
-            codec = q.get("codec", [None])[0]
-            lang = q.get("lang", [None])[0]
-            # Run the resolve in a SUBPROCESS with a hard timeout — a hung
-            # RD call can never deadlock the server thread pool this way.
-            import subprocess as _sp
-            import sys as _sys
-            script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resolve_cli.py")
-            args = [_sys.executable, script, tmdb, mtype]
-            if season:
-                args.append(season)
-            if episode:
-                args.append(episode)
-            if quality:
-                args.append(quality)
-            if codec:
-                args.append(f"--codec={codec}")
-            if lang:
-                args.append(f"--lang={lang}")
-            if skip_account:
-                args.append("--skip-account")
+            if not re.fullmatch(r"\d{1,9}", str(tmdb)) or mtype not in ("movie", "tv", "anime"):
+                return self._json({"error": "bad tmdb/type"}, 400)
+            if not _acquire_slot():
+                return self._json({"error": "busy"}, 429, {"Retry-After": "10"})
             try:
-                proc = _sp.run(args, capture_output=True, text=True, timeout=150)
-                out = proc.stdout.strip()
-                if out:
-                    result = json.loads(out.splitlines()[-1])
-                    return self._json(result, 200 if result.get("url") else 404)
-                return self._json({"error": "resolve failed"}, 404)
-            except _sp.TimeoutExpired:
-                return self._json({"error": "resolve timeout (55s)"}, 504)
-            except Exception as e:
-                return self._json({"error": str(e)}, 500)
+                return self._do_resolve(q, tmdb, mtype)
+            finally:
+                _release_slot()
         if url.path == "/api/rd/search":
+            gate = self._gate()
+            if gate:
+                return gate
             qq = q.get("q", [""])[0]
-            if not qq:
+            if not qq or len(qq) > 120:
                 return self._json({"error": "q required"}, 400)
             return self._json(search_apibay(qq, q.get("cat", ["0"])[0]))
         # OpenSubtitles: list subs for a title
         if url.path == "/api/rd/subs":
+            gate = self._gate()
+            if gate:
+                return gate
             tmdb = q.get("tmdb", [None])[0]
             mtype = q.get("type", [None])[0]
             if not tmdb or not mtype:
                 return self._json({"error": "tmdb + type required"}, 400)
-            season = q.get("season", [None])[0]
-            episode = q.get("episode", [None])[0]
-            subs = os_subs(int(tmdb), mtype,
-                           int(season) if season else None,
-                           int(episode) if episode else None)
+            if not re.fullmatch(r"\d{1,9}", str(tmdb)):
+                return self._json({"error": "bad tmdb"}, 400)
+            season = _env_int(q.get("season", [None])[0], 0, 100, None)
+            episode = _env_int(q.get("episode", [None])[0], 0, 5000, None)
+            subs = os_subs(int(tmdb), mtype, season, episode)
             return self._json({"subs": subs})
         # OpenSubtitles: get the converted VTT for a file_id
         if url.path == "/api/rd/sub":
+            gate = self._gate()
+            if gate:
+                return gate
             fid = q.get("file_id", [None])[0]
-            if not fid:
-                return self._json({"error": "file_id required"}, 400)
+            # digits only — file_id lands in a filesystem path AND in an
+            # upstream URL, so anything else is traversal / SSRF.
+            if not fid or not re.fullmatch(r"\d{1,12}", str(fid)):
+                return self._json({"error": "bad file_id"}, 400)
             path = os_download_vtt(fid)
             if not path:
                 return self._json({"error": "download failed"}, 404)
@@ -1510,15 +1853,56 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/vtt; charset=utf-8")
                 self.send_header("Content-Length", str(len(vtt)))
-                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Origin", self._acao())
+                self.send_header("Vary", "Origin")
                 self.end_headers()
                 self.wfile.write(vtt)
             except Exception:
                 return self._json({"error": "read failed"}, 500)
             return
         if url.path == "/api/rd/track":
+            gate = self._gate()
+            if gate:
+                return gate
             return self.do_GET_track(q)
         self._json({"error": "not found"}, 404)
+
+    def _do_resolve(self, q, tmdb, mtype):
+        season = _env_int(q.get("season", [None])[0], 0, 100, None)
+        episode = _env_int(q.get("episode", [None])[0], 0, 5000, None)
+        quality = q.get("quality", [None])[0]
+        skip_account = q.get("skip_account", ["0"])[0] == "1"
+        codec = q.get("codec", [None])[0]
+        lang = q.get("lang", [None])[0]
+        # Run the resolve in a SUBPROCESS with a hard timeout — a hung
+        # RD call can never deadlock the server thread pool this way.
+        import subprocess as _sp
+        import sys as _sys
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resolve_cli.py")
+        args = [_sys.executable, script, str(tmdb), mtype]
+        if season is not None:
+            args.append(str(season))
+        if episode is not None:
+            args.append(str(episode))
+        if quality:
+            args.append(str(quality)[:16])
+        if codec:
+            args.append(f"--codec={str(codec)[:16]}")
+        if lang:
+            args.append(f"--lang={str(lang)[:16]}")
+        if skip_account:
+            args.append("--skip-account")
+        try:
+            proc = _sp.run(args, capture_output=True, text=True, timeout=150)
+            out = proc.stdout.strip()
+            if out:
+                result = json.loads(out.splitlines()[-1])
+                return self._json(result, 200 if result.get("url") else 404)
+            return self._json({"error": "resolve failed"}, 404)
+        except _sp.TimeoutExpired:
+            return self._json({"error": "resolve timeout (55s)"}, 504)
+        except Exception as e:
+            return self._json({"error": str(e)}, 500)
 
     # GET /api/rd/track?url=<rd-url>&lang=eng — stream the RD file remuxed
     # with ONLY the requested audio track (dual-audio anime: pick eng over jpn).
@@ -1536,6 +1920,16 @@ class Handler(BaseHTTPRequestHandler):
             lang = "eng"  # normalise (also keeps the _eng.mp4 cache name)
         if not raw_url:
             return self._json({"error": "url required"}, 400)
+        # SSRF / open-redirect guard: `url` used to be echoed into a 302
+        # Location AND handed straight to ffmpeg, so it could point anywhere
+        # (file://, 127.0.0.1, the LAN). Only RD's own CDN is ever legitimate.
+        if not _is_rd_url(raw_url):
+            _audit(f"DENY track non-rd url ip={_client_ip(self)}")
+            return self._json({"error": "url must be a real-debrid download URL"}, 400)
+        # `lang` is interpolated into a cache FILENAME and an ffmpeg -map
+        # argument, so it must be a bare language tag (was: anything at all).
+        if not re.fullmatch(r"[a-z]{2,3}", lang):
+            return self._json({"error": "bad lang"}, 400)
         # Derive a stable cache key from the RD file ID in the URL
         # (https://{server}.download.real-debrid.com/d/{ID}/{filename}) — the
         # URL may be percent-encoded, so decode before matching.
@@ -1560,7 +1954,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(302)
             self.send_header("Location", raw_url)
             self.send_header("Content-Length", "0")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Origin", self._acao())
+            self.send_header("Vary", "Origin")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
@@ -1587,7 +1982,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
                     self.send_header("Content-Length", str(length))
                     self.send_header("Accept-Ranges", "bytes")
-                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Access-Control-Allow-Origin", self._acao())
+                    self.send_header("Vary", "Origin")
                     self.end_headers()
                     with open(cache_path, "rb") as f:
                         f.seek(start)
@@ -1605,7 +2001,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "video/mp4")
             self.send_header("Content-Length", str(size))
             self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Origin", self._acao())
+            self.send_header("Vary", "Origin")
             self.end_headers()
             with open(cache_path, "rb") as f:
                 while True:
@@ -1627,6 +2024,12 @@ class Handler(BaseHTTPRequestHandler):
             elif _remux_recently_failed(file_id):
                 return self._json({"error": f"no {lang} audio track — remux failed"}, 502)
             else:
+                # ffmpeg pulls the whole multi-GB file and burns 600s of CPU.
+                # Cap how many can run at once so a burst of anonymous calls
+                # cannot pin every core on the Pi (cache hits above never take
+                # a slot, so normal playback is unaffected).
+                if not _acquire_slot():
+                    return self._json({"error": "busy"}, 429, {"Retry-After": "15"})
                 try:
                     cmd = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
                            "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
@@ -1655,6 +2058,8 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                     return self._json({"error": "remux failed"}, 500)
+                finally:
+                    _release_slot()
         # Serve the freshly remuxed file with FULL Range support (the browser
         # needs to seek even on the first play). Reuse the same serving logic
         # as a cache hit by handling the Range header here too.
@@ -1672,7 +2077,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
                 self.send_header("Content-Length", str(length))
                 self.send_header("Accept-Ranges", "bytes")
-                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Origin", self._acao())
+                self.send_header("Vary", "Origin")
                 self.end_headers()
                 with open(cache_path, "rb") as f:
                     f.seek(start)

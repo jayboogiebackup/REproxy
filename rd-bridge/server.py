@@ -307,18 +307,35 @@ def _probe_audio(url, ttl=21600):
     key = _probe_key(url)
     now = time.time()
     c = _audio_probe_cache.get(key)
-    if c and now - c[0] < ttl:
+    # `duration` arrived after this cache shipped: an entry written before it
+    # has no duration field and would make the wrong-content gate blind — one
+    # re-probe per file fixes that (and only once).
+    if c and now - c[0] < ttl and "duration" in (c[1] or {}):
         return c[1]
-    info = {"tracks": None, "safe": None, "vcodec": None}  # type: dict
+    info = {"tracks": None, "safe": None, "vcodec": None, "duration": None}  # type: dict
     import subprocess as _sp
     try:
-        # NO -select_streams: one read returns every stream (video + audio), so
-        # the video codec is known without a second ffprobe.
+        # NO -select_streams: one read returns every stream (video + audio) and
+        # the container duration, so the video codec AND the real runtime are
+        # known without a second ffprobe.
         proc = _sp.run(["ffprobe", "-v", "error",
-                        "-show_entries", "stream=codec_type,codec_name:stream_tags=language",
+                        "-show_entries",
+                        "stream=codec_type,codec_name,duration:stream_tags=language:format=duration",
                         "-of", "json", url],
                        capture_output=True, text=True, timeout=25)
         d = json.loads(proc.stdout or "{}")
+        # REAL runtime of the file. This is the ONLY check that can see through
+        # a mislabeled release: a torrent whose file is NAMED "Show.S08E07…" but
+        # whose content is a two-hour movie (MEASURED 2026-10-11 — the exact
+        # "Rick and Morty s8e7 plays a movie" report: the served .mkv was named
+        # S08E07 and ran 1h59m45s). Container duration first, then the longest
+        # stream duration for containers that omit it.
+        try:
+            _fd = (d.get("format") or {}).get("duration")
+            if _fd is not None and float(_fd) > 0:
+                info["duration"] = float(_fd)
+        except Exception:
+            pass
         tracks = []
         for st in (d.get("streams") or []):
             ctype = (st.get("codec_type") or "").lower()
@@ -332,6 +349,18 @@ def _probe_audio(url, ttl=21600):
             tracks.append({"codec": cname,
                            "lang": ((st.get("tags") or {}).get("language") or "").lower()})
         info["tracks"] = tracks
+        if info["duration"] is None:
+            # Fallback for containers without a format duration: the longest
+            # stream duration is the runtime (a stream-level duration survives
+            # in WebM/some MP4s where the format tag is absent).
+            _sd = 0.0
+            for st in (d.get("streams") or []):
+                try:
+                    _sd = max(_sd, float(st.get("duration") or 0))
+                except Exception:
+                    continue
+            if _sd > 0:
+                info["duration"] = _sd
         codec = tracks[0]["codec"] if tracks else ""
         if codec:
             info["safe"] = codec in SAFE_AUDIO_CODECS
@@ -349,6 +378,266 @@ def _probe_audio(url, ttl=21600):
         return info
     except Exception:
         return info  # can't probe — never block playback on it
+
+
+# ── CONTENT IDENTITY GATE: never serve a file that is not the request ───
+# MEASURED (2026-10-11, owner report "Rick and Morty s8e7 it plays a movie"):
+# the release the resolver picked was a FAKE ThePirateBay upload named
+# "Rick and Morty S08E07 1080p WEB H264-SuccessfulCrab" whose single .mkv was
+# 1h59m45s / 1.5 GB — a two-hour MOVIE wearing an episode's filename (the
+# torrent's file list also carried "Thepiratebay new Version!!.txt" and
+# "Downloaded from thepirateheaven.org.txt"). EVERY gate the resolver had was
+# NAME-based, so it passed cleanly and the viewer got a movie for an episode.
+#
+# The gates below are the only ones that can see through a lie:
+#   * the file's REAL duration (ffprobe — free: it rides the same header read
+#     as the audio tracks) vs TMDB's runtime for that episode/film. A 22-minute
+#     episode that is actually 120 minutes long is not that episode.
+#   * an exact SxxExx / 1x02 NUMBER parse: a file spelling a different episode
+#     than the one asked for is the wrong episode.
+#   * the requested title's own words: a file whose title words share nothing
+#     with the request is a different title (an episode-title-only filename is
+#     exempt — it matches the episode's own TMDB name).
+#   * the torrent's file list: advertisement/installer files bundled next to a
+#     video betray a spam repack, not a scene release.
+# Every one of them fails OPEN: a value we cannot measure is never a reject,
+# because blocking playback on an unknown is worse than trying it.
+_RUNTIME_TTL = 86400
+_tmdb_meta_cache = {}   # "tmdb|tv|s|e" -> (ts, {"runtime": int|None, "title": str})
+
+
+def _tmdb_meta(tmdb, mtype, season=None, episode=None):
+    """TMDB runtime (minutes) + episode title for this request, cached 24h.
+    Best-effort: each field is None/"" when TMDB has no data (never blocks)."""
+    key = f"{tmdb}|{mtype}|{season}|{episode}"
+    c = _tmdb_meta_cache.get(key)
+    if c and time.time() - c[0] < _RUNTIME_TTL:
+        return c[1]
+    meta = {"runtime": None, "title": ""}
+    try:
+        if mtype == "movie":
+            st, body = http_get(f"https://api.themoviedb.org/3/movie/{tmdb}?api_key={TMDB_KEY}", timeout=15)
+            d = json.loads(body)
+            meta["title"] = d.get("title") or ""
+            if d.get("runtime"):
+                meta["runtime"] = int(d["runtime"])
+        else:
+            st, body = http_get(
+                f"https://api.themoviedb.org/3/tv/{tmdb}/season/{int(season or 1)}"
+                f"/episode/{int(episode or 1)}?api_key={TMDB_KEY}", timeout=15)
+            d = json.loads(body)
+            meta["title"] = d.get("name") or ""
+            if d.get("runtime"):
+                meta["runtime"] = int(d["runtime"])
+            if meta["runtime"] is None:
+                st, body = http_get(f"https://api.themoviedb.org/3/tv/{tmdb}?api_key={TMDB_KEY}", timeout=15)
+                ert = (json.loads(body).get("episode_run_time") or [])
+                if ert and ert[0]:
+                    meta["runtime"] = int(ert[0])
+    except Exception:
+        pass
+    _tmdb_meta_cache[key] = (time.time(), meta)
+    return meta
+
+
+def _tmdb_titles(tmdb, mtype):
+    """Every title TMDB holds for the request (localised + original), cached
+    24h. Empty list when unknown — the title check then simply does not run."""
+    key = f"titles|{tmdb}|{mtype}"
+    c = _tmdb_meta_cache.get(key)
+    if c and time.time() - c[0] < _RUNTIME_TTL:
+        return c[1]
+    names = []
+    try:
+        st, body = http_get(
+            f"https://api.themoviedb.org/3/{'movie' if mtype == 'movie' else 'tv'}"
+            f"/{tmdb}?api_key={TMDB_KEY}", timeout=15)
+        d = json.loads(body)
+        for k in ("title", "name", "original_title", "original_name"):
+            if d.get(k):
+                names.append(d[k])
+    except Exception:
+        pass
+    _tmdb_meta_cache[key] = (time.time(), names)
+    return names
+
+
+# Duration tolerances. A file may legitimately be a double episode (2x) or a
+# feature-length special, so "too long" needs real slack; "too short" only
+# catches trailers/samples/partials. Both are env-tunable.
+_DURATION_TOO_LONG_RATIO = float(os.environ.get("BRIDGE_DUR_TOO_LONG_RATIO", "2.6"))
+_DURATION_TOO_LONG_SLACK_MIN = float(os.environ.get("BRIDGE_DUR_TOO_LONG_SLACK", "12"))
+_DURATION_TOO_SHORT_RATIO = float(os.environ.get("BRIDGE_DUR_TOO_SHORT_RATIO", "0.35"))
+_DURATION_MIN_RUNTIME = float(os.environ.get("BRIDGE_DUR_MIN_RUNTIME", "8"))
+
+
+def file_duration(url):
+    """The file's REAL runtime in seconds (probed once, cached 6h), or None."""
+    info = _probe_audio(url)
+    if not isinstance(info, dict):
+        return None
+    if "duration" not in info:
+        # An entry from before the duration probe existed — re-probe once.
+        try:
+            _audio_probe_cache.pop(_probe_key(url), None)
+        except Exception:
+            pass
+        info = _probe_audio(url)
+    d = info.get("duration") if isinstance(info, dict) else None
+    try:
+        return float(d) if d and float(d) > 0 else None
+    except Exception:
+        return None
+
+
+def duration_mismatch(url, tmdb, mtype, season=None, episode=None):
+    """Reason string when the file's REAL duration cannot be the requested
+    episode/film, else None (unknown duration or unknown runtime → None).
+
+    MEASURED: a 23-minute episode (TMDB, Rick and Morty S08E07) served as a
+    7185s = 120-minute file → "> 23*2.6 + 12 = 72 min" → rejected. The same
+    rule catches the inverse: a 22-minute file for a 97-minute film request.
+    """
+    dur = file_duration(url)
+    if not dur:
+        return None
+    exp = _tmdb_meta(tmdb, mtype, season, episode).get("runtime")
+    if not exp or exp < _DURATION_MIN_RUNTIME:
+        return None
+    act_min = dur / 60.0
+    kind = "film" if mtype == "movie" else "episode"
+    if act_min > exp * _DURATION_TOO_LONG_RATIO + _DURATION_TOO_LONG_SLACK_MIN:
+        return f"file runs {act_min:.0f} min but this {kind} is ~{exp} min"
+    if act_min < exp * _DURATION_TOO_SHORT_RATIO:
+        return f"file runs only {act_min:.0f} min but this {kind} is ~{exp} min"
+    return None
+
+
+_EP_PAIR_RES = (
+    re.compile(r"(?<![a-z0-9])s(\d{1,2})[\s._-]*e(\d{1,3})(?!\d)", re.I),
+    re.compile(r"(?<!\d)(\d{1,2})x(\d{2,3})(?!\d)"),
+)
+
+
+def _ep_pairs(name):
+    """Every (season, episode) pair a filename spells (S01E02 / s1e2 /
+    S01.E02 / 1x02). Empty set when the name spells none."""
+    low = (name or "").lower()
+    out = set()
+    for rx in _EP_PAIR_RES:
+        for m in rx.finditer(low):
+            out.add((int(m.group(1)), int(m.group(2))))
+    return out
+
+
+_TITLE_STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "not", "are", "was",
+    "but", "you", "all", "she", "his", "her", "its", "has", "had", "have",
+    "who", "which", "what", "when", "where", "why", "how", "season", "series",
+    "movie", "film", "part", "vol", "volume", "episode", "chapter", "captulo",
+}
+# Release/encoding vocab that says nothing about WHICH title a file is.
+_RELEASE_TAG_TOKENS = {
+    "1080p", "720p", "480p", "2160p", "1440p", "576p", "4k", "uhd", "hdr",
+    "sdr", "dv", "web", "webdl", "webrip", "webhd", "bluray", "blu", "bdrip",
+    "brrip", "dvdrip", "dvd", "hdtv", "remux", "repack", "proper", "internal",
+    "h264", "h265", "x264", "x265", "hevc", "avc", "av1", "xvid", "divx",
+    "aac", "aac2", "ac3", "eac3", "ddp", "dd", "dts", "truehd", "atmos",
+    "opus", "flac", "mp3", "6ch", "2ch", "10bit", "8bit", "hq", "hd",
+    "multi", "multiaudio", "dual", "dubbed", "dub", "subs", "sub", "subbed",
+    "eng", "english", "jpn", "japanese", "ita", "spa", "fre", "ger", "rus",
+    "complete", "extended", "uncut", "uncensored", "upscale", "ai", "amzn",
+    "nf", "dsnp", "max", "hmax", "atvp", "tv", "mkv", "mp4", "avi", "mov",
+    "sbs", "3d", "full", "group", "www", "org", "com", "net", "info",
+}
+
+
+def _title_tokens(s):
+    """Significant title words in a release/file name: ≥3 chars, not a release
+    tag, not a stop word, not a number, not an SxxExx/Exx tag."""
+    out = set()
+    for w in re.split(r"[^a-z0-9]+", (s or "").lower()):
+        if len(w) < 3 or w in _TITLE_STOPWORDS or w in _RELEASE_TAG_TOKENS:
+            continue
+        if re.fullmatch(r"\d+", w):
+            continue
+        if re.fullmatch(r"s\d{1,2}(e\d{1,3})?", w) or re.fullmatch(r"e\d{1,3}", w):
+            continue
+        out.add(w)
+    return out
+
+
+def identity_mismatch(url, tmdb, mtype, season=None, episode=None, names=None):
+    """Reason string when the resolved FILE demonstrably is not the requested
+    title/season/episode, else None.
+
+      * episode numbers: if the filename spells a SxxExx/1x02 marker and the
+        request wants a different (season, episode) → wrong episode. For a
+        movie request, ANY episode marker means it is not a film.
+      * title: if the filename carries its own title words and none of them is
+        a word of the requested title → different title. A filename that is
+        only the EPISODE's own title (no show name) is exempt, because it
+        matches the episode's TMDB name.
+
+    Unknown/ambiguous names always pass (fail-open)."""
+    fn = urllib.parse.unquote(url or "").split("/")[-1]
+    low = fn.lower()
+    pairs = _ep_pairs(low)
+    want = (int(season), int(episode)) if (season and episode) else None
+    if mtype == "movie":
+        if pairs:
+            ptxt = ", ".join(f"S{s:02d}E{e:02d}" for s, e in sorted(pairs))
+            return f"file is a TV episode ({ptxt}), not a film"
+    elif want and pairs and want not in pairs:
+        ptxt = ", ".join(f"S{s:02d}E{e:02d}" for s, e in sorted(pairs))
+        return f"file is {ptxt}, not S{want[0]:02d}E{want[1]:02d}"
+    if names is None:
+        names = _tmdb_titles(tmdb, mtype)
+    want_toks = set()
+    for n in (names or ()):
+        want_toks |= _title_tokens(n)
+    file_toks = _title_tokens(low)
+    if want_toks and len(file_toks) >= 2 and not (file_toks & want_toks):
+        ep_title = _tmdb_meta(tmdb, mtype, season, episode).get("title") or ""
+        if not (file_toks & _title_tokens(ep_title)):
+            return ("file is titled '" + " ".join(sorted(file_toks))[:60]
+                    + "' — no word of the requested title")
+    return None
+
+
+def content_gate(url, tmdb, mtype, season=None, episode=None):
+    """The single content-identity gate every acceptance path must clear.
+    Returns a reason string when the file must NOT be served (wrong medium /
+    wrong episode / wrong title / impossible runtime), else None. Never raises
+    and never blocks on an unknown — a probe/TMDB failure returns None."""
+    try:
+        return (duration_mismatch(url, tmdb, mtype, season, episode)
+                or identity_mismatch(url, tmdb, mtype, season, episode))
+    except Exception:
+        return None
+
+
+# Spam-bundle markers. A scene/P2P release never ships an advertisement .txt,
+# but a REPACK wearing a release's name does — MEASURED on the exact fake
+# served for "Rick and Morty S08E07" (files "Thepiratebay new Version!!.txt"
+# and "Downloaded from thepirateheaven.org.txt" beside the .mkv). Only
+# unambiguous ad/installer markers count: a domain in the TORRENT NAME is a
+# normal release-site tag and must never be a reason to drop a source.
+_FAKE_FILE_RE = re.compile(
+    r"(new version!!|downloaded from|thepirateheaven|download more|"
+    r"visit our (?:site|website)|free download)\.|\.(?:url|lnk|exe|scr|bat|cmd|vbs|jar)$",
+    re.I)
+
+
+def fake_upload(files):
+    """True when a torrent's FILE LIST betrays a spam/repack upload: an
+    advertisement or installer file bundled next to the video. `files` is an
+    RD info file list ([{"path": ...}]) or a list of names."""
+    for f in (files or ()):
+        p = f.get("path") if isinstance(f, dict) else f
+        if p and _FAKE_FILE_RE.search(str(p)):
+            return True
+    return False
 
 
 # ── audio language decision ───────────────────────────────────────────
@@ -1467,6 +1756,8 @@ def rd_find_by_title(q, season=None, episode=None, codec=None):
             if season is not None and episode is not None:
                 try:
                     info = rd_get_cached(t["id"])
+                    if fake_upload(info.get("files")):
+                        continue  # spam/repack bundle — see _FAKE_FILE_RE
                     tag = f"s{int(season):02d}e{int(episode):02d}"
                     links = info.get("links") or []
                     for f in info.get("files", []):
@@ -1520,6 +1811,8 @@ def rd_find_by_title(q, season=None, episode=None, codec=None):
             for _score, t in tv_hits:
                 try:
                     info = rd_get_cached(t["id"])
+                    if fake_upload(info.get("files")):
+                        continue  # spam/repack bundle — see _FAKE_FILE_RE
                     links = info.get("links") or []
                     # Strict tag first (s01e01), then looser episode patterns
                     # (ep 1 / episode 01 / " 01 ") for releases with different
@@ -1665,6 +1958,8 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
         else:
             try:
                 info = rd_get_cached(existing_id)
+                if fake_upload(info.get("files")):
+                    return None  # spam/repack bundle — see _FAKE_FILE_RE
                 links = info.get("links") or []
                 if links:
                     # if we want a specific episode, map file → link
@@ -1806,6 +2101,18 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
 
     links = info.get("links") or []
     if not links:
+        return None
+    # A spam/repack bundle (an advertisement or installer file sitting next to
+    # the video) is not the release whose name it wears — MEASURED: the fake
+    # served for "Rick and Morty S08E07" shipped "Thepiratebay new
+    # Version!!.txt" + "Downloaded from thepirateheaven.org.txt". Never serve
+    # it, and drop it from the account so it cannot be picked up again.
+    if fake_upload(info.get("files")):
+        try:
+            rd_get(f"/torrents/delete/{tid}")
+        except Exception:
+            pass
+        _audit(f"REJECT fake upload bundle (spam files) tid={tid}")
         return None
     if eff_idx is None and season is not None and episode is not None:
         mi = match_episode_file_index([f.get("path", "") for f in (info.get("files") or [])], season, episode)
@@ -2358,6 +2665,12 @@ def url_matches_type(url, mtype, season=None, episode=None):
     has_ep = bool(re.search(r"s\d{1,2}e\d{1,2}", fn)) or bool(re.search(r"(?<!\d)\d{1,2}x\d{2}(?!\d)", fn))
     if mtype == "movie":
         return not has_ep
+    # A file that SPELLS a different episode than the one requested is the
+    # wrong episode — the episode NUMBERS must agree, not merely exist.
+    if season and episode:
+        pairs = _ep_pairs(urllib.parse.unquote((url.split("/")[-1] or "")))
+        if pairs and (int(season), int(episode)) not in pairs:
+            return False
     # tv/anime: need an episode marker
     if has_ep:
         return True
@@ -2407,6 +2720,13 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_ac
             # never hand a dead URL to the player.
             _mark_dead(cfn)
             stale = True
+        elif cfn and content_gate(cfn, tmdb, mtype, season, episode):
+            # A cached link that is not the requested CONTENT — a mislabeled
+            # release cached before the identity gate existed (the "S08E07"
+            # file that was really a two-hour movie) — must never be served
+            # again. Fall through and re-walk instead.
+            _audit("REJECT cached wrong content: " + _url_name(cfn)[:60])
+            stale = True
         if stale:
             cached = None
             cts = None
@@ -2439,10 +2759,25 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_ac
         # beats "no stream" (the player's decode-error retry handles it).
         result = soft_cached
     url = result.get("url") if isinstance(result, dict) else None
-    if url and not url_matches_type(url, mtype, season, episode):
-        result = {"error": "resolved link is the wrong type (show/movie mismatch)",
-                  "imdb": result.get("imdb")}
-    if url and isinstance(result, dict):
+    if url:
+        # FINAL IDENTITY BOUNDARY: what leaves this function must be what was
+        # asked for. Type (show vs movie) first, then CONTENT — duration,
+        # episode numbers, title — so that no path (account library, Torrentio,
+        # MediaFusion, Torznab, APIBay/EZTV tail, or a soft/cached fallback) can
+        # hand the player a file that is not the request.
+        bad = None
+        if not url_matches_type(url, mtype, season, episode):
+            bad = "wrong type (show/movie mismatch)"
+        if not bad:
+            bad = content_gate(url, tmdb, mtype, season, episode)
+        if bad:
+            _audit(f"REJECT at boundary: {bad} :: {_url_name(url)[:60]}")
+            result = {"error": f"resolved link does not match the request ({bad})",
+                      "imdb": (result or {}).get("imdb")}
+    # Cache ONLY a real, verified URL: `url` above may name a link the identity
+    # boundary just rejected, and caching that error would make the title
+    # unplayable for 6h (every play would re-read the cached error).
+    if isinstance(result, dict) and result.get("url"):
         _tag_audio(result, accept)
         _tag_cam(result)
         if soft_cached is not None and result.get("needs_remux"):
@@ -2654,6 +2989,15 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
                 # the account holds one. Never serve that for an English ask.
                 if _audio_gate(url, accept):
                     continue
+                # CONTENT IDENTITY: the account walk is title-matched only — it
+                # never checked WHICH episode/film the stored file is, so a
+                # mislabeled movie (or another episode) sitting in the library
+                # passed. Checked before the remux bookkeeping so a wrong file
+                # is never even held as a fallback.
+                bad = content_gate(url, tmdb, mtype, season, episode)
+                if bad:
+                    _audit(f"REJECT account wrong content: {bad} :: {_url_name(url)[:60]}")
+                    continue
                 if audio_plan(audio_tracks(url), accept) == "remux" and account_remux is None:
                     account_remux = (url, {"name": f"{q} (from account)"})
                     continue  # keep looking for a copy that needs no remux
@@ -2707,6 +3051,14 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
             plan = audio_plan(audio_tracks(u), accept)
             _cand_verdict_set(c, accept, plan)
             if plan == "reject":
+                continue
+            # CONTENT IDENTITY: a MediaFusion "streaming provider" URL is the
+            # file itself and used to be returned with NO episode/title check
+            # at all — one more way the wrong content could reach the player.
+            bad = content_gate(u, tmdb, mtype, season, episode)
+            if bad:
+                _audit(f"REJECT mediafusion wrong content: {bad} :: {_url_name(u)[:60]}")
+                _cand_verdict_set(c, accept, "reject")
                 continue
             if plan == "remux":
                 if mf_remux is None:
@@ -2778,6 +3130,16 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
                 plan = audio_plan(audio_tracks(url), accept)
                 _cand_verdict_set(c, accept, plan)
                 if plan == "reject":
+                    return None
+                # CONTENT IDENTITY: a name-matching release can still BE
+                # something else (the fake "Rick and Morty S08E07 …" that was a
+                # two-hour movie). Reject on measured evidence — runtime,
+                # episode numbers, title — before this candidate is ever
+                # selected. See the CONTENT IDENTITY GATE section.
+                bad = content_gate(url, tmdb, mtype, season, episode)
+                if bad:
+                    _audit(f"REJECT candidate wrong content: {bad} :: {_url_name(url)[:60]}")
+                    _cand_verdict_set(c, accept, "reject")
                     return None
                 return url, c, plan
             except Exception:
@@ -2858,6 +3220,12 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
                         plan = audio_plan(audio_tracks(url), accept)
                         _cand_verdict_set(c, accept, plan)
                         if plan == "reject":
+                            continue
+                        # Same content-identity gate as the main walk.
+                        bad = content_gate(url, tmdb, mtype, season, episode)
+                        if bad:
+                            _audit(f"REJECT candidate wrong content: {bad} :: {_url_name(url)[:60]}")
+                            _cand_verdict_set(c, accept, "reject")
                             continue
                         if plan == "remux":
                             if remux_fb is None:
@@ -2949,6 +3317,12 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
                         continue
                     if _audio_gate(url, accept):
                         continue
+                    # Same content-identity gate (this niche-title account walk
+                    # is title-matched only, like the main one).
+                    bad = content_gate(url, tmdb, mtype, season, episode)
+                    if bad:
+                        _audit(f"REJECT account wrong content: {bad} :: {_url_name(url)[:60]}")
+                        continue
                     return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
         except Exception:
             pass
@@ -2988,6 +3362,12 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
                 plan = audio_plan(audio_tracks(url), accept)
                 _cand_verdict_set(c, accept, plan)
                 if plan == "reject":
+                    continue
+                # Same content-identity gate as every other acceptance path.
+                bad = content_gate(url, tmdb, mtype, season, episode)
+                if bad:
+                    _audit(f"REJECT candidate wrong content: {bad} :: {_url_name(url)[:60]}")
+                    _cand_verdict_set(c, accept, "reject")
                     continue
                 # A release that plays as-is wins; a remux (right audio, not
                 # first) is only the fallback — see _audio_first_rank.

@@ -244,6 +244,99 @@ check("cam flag: DTS audio codec is not a cam", "cam" not in dtsres)
 s._tag_cam({"error": "no stream available"})
 check("cam flag: no-url result untouched", True)
 
+# ── CONTENT IDENTITY GATE (title / season / episode / duration) ─────
+# MEASURED 2026-10-11: "Rick and Morty s8e7 it plays a movie". The release the
+# resolver served was a FAKE ThePirateBay upload named
+# "Rick and Morty S08E07 1080p WEB H264-SuccessfulCrab" whose single .mkv ran
+# 1h59m45s / 1.5 GB — a two-hour movie wearing an episode's filename. Every
+# gate the resolver had was NAME-based, so it passed. These checks are the ones
+# that can see through it. Both TMDB helpers and file_duration are stubbed so
+# the test stays hermetic (no network, no ffprobe).
+s._tmdb_meta = lambda tmdb, mtype, season=None, episode=None: {
+    "runtime": {"movie": 97}.get(mtype, 23), "title": "Ricker than Fiction"}
+s._tmdb_titles = lambda tmdb, mtype: ["Rick and Morty"]
+
+FAKE_URL = ("https://mia5-4.download.real-debrid.com/d/JUVMJS7GSEXLW133/"
+            "Rick%20and%20Morty%20S08E07%201080p%20WEB%20H264-SuccessfulCrab.mkv")
+GOOD_URL = ("https://x.download.real-debrid.com/d/AAAAAAAAAAAA/"
+            "Rick.and.Morty.S08E07.Ricker.than.Fiction.1080p.WEB.H264.mkv")
+
+# episode-number parsing
+check("ep: S08E07 parsed", s._ep_pairs("Rick.and.Morty.S08E07.1080p") == {(8, 7)})
+check("ep: s1e2 parsed", s._ep_pairs("show.s1e2.mkv") == {(1, 2)})
+check("ep: 1x03 parsed", s._ep_pairs("Show.Name.1x03.HDTV") == {(1, 3)})
+check("ep: no marker -> empty", s._ep_pairs("Rick.and.Morty.2025.1080p") == set())
+
+# identity: the wrong MEDIUM (a movie for an episode request) — the title of the
+# fake still said "S08E07", so only the runtime can catch it (next block); the
+# identity check catches the inverse (an episode file for a film request).
+check("identity: movie request + episode file rejected",
+      s.identity_mismatch(GOOD_URL, 999, "movie", None, None, names=["Some Film"]) is not None)
+check("identity: wrong episode number rejected",
+      s.identity_mismatch("https://x/d/A/Show.S08E06.1080p.mkv", 60625, "tv", 8, 7) is not None)
+check("identity: right episode accepted",
+      s.identity_mismatch(GOOD_URL, 60625, "tv", 8, 7) is None)
+check("identity: a different title rejected",
+      s.identity_mismatch("https://x/d/A/Oppenheimer.2023.1080p.WEB.Bluray-CriterionEdition.mkv",
+                          999, "movie", None, None, names=["Some Film"]) is not None)
+check("identity: episode-title-only name is exempt",
+      s.identity_mismatch("https://x/d/A/S08E07.Ricker.than.Fiction.mkv",
+                          60625, "tv", 8, 7) is None)
+check("identity: unparseable name fails open",
+      s.identity_mismatch("https://x/d/A/1080p.mkv", 60625, "tv", 8, 7) is None)
+
+# duration: the actual measured numbers. TMDB says S08E07 is 23 min.
+s.file_duration = lambda url: 7185.792          # the fake: 1h59m45s
+check("duration: 120-min file for a 23-min episode REJECTED",
+      s.duration_mismatch(FAKE_URL, 60625, "tv", 8, 7) is not None)
+s.file_duration = lambda url: 1380.0            # a real 23-min episode
+check("duration: real 23-min episode accepted",
+      s.duration_mismatch(GOOD_URL, 60625, "tv", 8, 7) is None)
+s.file_duration = lambda url: 2700.0            # a 45-min double episode
+check("duration: double-episode (2x) still accepted",
+      s.duration_mismatch(GOOD_URL, 60625, "tv", 8, 7) is None)
+s.file_duration = lambda url: 1300.0            # a 22-min file
+check("duration: short file for a 97-min film REJECTED",
+      s.duration_mismatch(GOOD_URL, 999, "movie") is not None)
+s.file_duration = lambda url: 6000.0            # a 100-min film
+check("duration: real 100-min film accepted",
+      s.duration_mismatch(GOOD_URL, 999, "movie") is None)
+s.file_duration = lambda url: None
+check("duration: unprobeable file fails open",
+      s.duration_mismatch(FAKE_URL, 60625, "tv", 8, 7) is None)
+
+# content_gate: the exact reported case, end to end
+s.file_duration = lambda url: 7185.792
+reason = s.content_gate(FAKE_URL, 60625, "tv", 8, 7)
+check("gate: the measured 'S08E07 is a movie' file is rejected",
+      reason is not None and "min" in reason)
+s.file_duration = lambda url: 1380.0
+check("gate: the real S08E07 file passes", s.content_gate(GOOD_URL, 60625, "tv", 8, 7) is None)
+
+# spam/repack bundles (the file list of the measured fake)
+FAKE_FILES = [{"path": "/Thepiratebay new Version!!.txt", "bytes": 0},
+              {"path": "/Rick and Morty S08E07 1080p WEB H264-SuccessfulCrab.mkv"},
+              {"path": "/Downloaded from thepirateheaven.org.txt", "bytes": 479}]
+CLEAN_FILES = [{"path": "/Rick.and.Morty.S08E07.1080p.mkv"},
+               {"path": "/Rick.and.Morty.S08E07.1080p.srt"},
+               {"path": "/Rick.and.Morty.S08E07.1080p.nfo"}]
+check("fake: the measured spam bundle detected", s.fake_upload(FAKE_FILES))
+check("fake: a clean release file list passes", not s.fake_upload(CLEAN_FILES))
+check("fake: installer extension detected", s.fake_upload(["/movie.mkv", "/setup.exe"]))
+check("fake: a release-site DOMAIN in the name is NOT spam",
+      not s.fake_upload(["/www.UIndex.org - Rick and Morty S08E08 1080p.mkv"]))
+check("fake: empty file list passes", not s.fake_upload([]))
+
+# url_matches_type: the exact-episode bound
+check("type: right episode passes", s.url_matches_type(GOOD_URL, "tv", 8, 7))
+check("type: wrong episode number fails", not s.url_matches_type(
+    "https://x/d/A/Show.S08E06.1080p.mkv", "tv", 8, 7))
+check("type: a movie for a tv request fails", not s.url_matches_type(
+    "https://x/d/A/Some.Movie.2025.1080p.mkv", "tv", 8, 7))
+check("type: an episode for a movie request fails", not s.url_matches_type(GOOD_URL, "movie"))
+check("type: a plain movie passes", s.url_matches_type(
+    "https://x/d/A/Some.Movie.2025.1080p.mkv", "movie"))
+
 print()
 if FAILED:
     print(f"{len(FAILED)} CHECK(S) FAILED")

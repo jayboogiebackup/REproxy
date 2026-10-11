@@ -1141,11 +1141,84 @@ def _mediafusion_stream_base():
     return u.rstrip("/") or None
 
 
-def search_mediafusion(imdb, mtype, season=None, episode=None):
-    """MediaFusion public Stremio addon — the stream objects follow the exact
-    Stremio shape Torrentio uses ({name,title,infoHash,fileIdx,
-    behaviorHints:{bingeGroup,filename},sources}), so infoHash+fileIdx is
-    reused by the same Real-Debrid path.
+def _mediafusion_sid(sid):
+    """Normalise a Stremio meta id into the form MediaFusion accepts.
+
+    MediaFusion is a Stremio addon, so it is addressed by an IMDb id
+    ("tt0137523") or by an explicitly TMDB-prefixed id ("tmdb:550"). A BARE
+    numeric TMDB id is NOT a valid Stremio id — the addon answers it with
+    {"streams":[]}, which is why this source returned 0 candidates while it
+    was being queried with the resolver's internal TMDB number.
+
+    "tt…" and "tmdb:…" pass through untouched; 550 / "550" → "tmdb:550".
+    Returns None when there is nothing usable to query with."""
+    s = str(sid or "").strip()
+    if not s:
+        return None
+    low = s.lower()
+    if low.startswith("tt") or low.startswith("tmdb:"):
+        return s
+    if s.isdigit():
+        return f"tmdb:{s}"
+    return s
+
+
+def _mediafusion_resolve_url(url, timeout=15):
+    """Follow the addon's FIRST redirect (its debrid proxy URL → the provider's
+    direct file URL) and return that, or None when it is not a usable file.
+
+    MediaFusion configured with a debrid "streaming provider" answers with
+    .../streaming_provider/<token>/<hash>, a URL that 302s to the provider's
+    download link. Its failure modes (uncached torrent, expired debrid
+    account) 302 to an elfhosted slate.m3u8 "Connection expired"/"Couldn't
+    start" page instead — caught here on the FIRST hop, so a dead entry costs
+    one cheap request instead of an ffprobe. The resolved URL carries the real
+    filename, which the show/movie type check and the codec/audio gates need
+    (a bare /streaming_provider/<hash> URL has no filename at all)."""
+    try:
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        opener = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Range": "bytes=0-1"})
+        final = ""
+        try:
+            with opener.open(req, timeout=timeout) as r:
+                final = r.geturl() or ""
+        except urllib.error.HTTPError as e:
+            if e.code not in (301, 302, 303, 307, 308):
+                return None
+            final = e.headers.get("Location") or ""
+        if not final or final == url:
+            return None
+        low = final.lower()
+        if "slate.m3u8" in low or "slate.elfhosted.com" in low:
+            return None  # provider error page, not a file
+        if not re.search(r"\.(mkv|mp4|m4v|avi|webm|mov|ts|mpg|mpeg)(\?|$|#)", low):
+            return None  # not a direct media file
+        return final
+    except Exception:
+        return None
+
+
+def search_mediafusion(sid, mtype, season=None, episode=None):
+    """MediaFusion public Stremio addon.
+
+    `sid` is whatever id the caller holds — an IMDb id ("tt…"), a "tmdb:…" id,
+    or a bare TMDB number. It is normalised by _mediafusion_sid() BEFORE the
+    request, because the addon silently returns {"streams":[]} for a bare
+    numeric id.
+
+    TWO stream shapes are supported, because which one you get depends on the
+    addon config in MEDIAFUSION_CONFIG_URL:
+      * RAW TORRENT (infoHash + fileIdx, or a magnet in `url`) — the exact
+        shape Torrentio uses, so info_hash + file_idx is reused by the same
+        Real-Debrid path;
+      * STREAMING PROVIDER: the addon was configured with a debrid account, so
+        it answers with a proxy `url` that redirects to the provider's file.
+        There is no infoHash to add to our own RD account — the URL *is* the
+        stream — so it is carried as `direct_url` and followed at try time
+        (see the MediaFusion direct pass in the resolver).
 
     A BARE /stream/... call returns {"streams":[]} — the addon needs a config
     embedded in the path (from its /configure page). When MEDIAFUSION_CONFIG_URL
@@ -1157,12 +1230,15 @@ def search_mediafusion(imdb, mtype, season=None, episode=None):
             print("[src] mediafusion: MEDIAFUSION_CONFIG_URL not set — source disabled",
                   flush=True)
         return []
+    sid = _mediafusion_sid(sid)
+    if not sid:
+        return []
     try:
         if mtype == "movie":
-            kind, sid = "movie", imdb
+            kind, meta = "movie", sid
         else:
-            kind, sid = "series", f"{imdb}:{season or 1}:{episode or 1}"
-        st, body = http_get(f"{base}/stream/{kind}/{sid}.json", timeout=25)
+            kind, meta = "series", f"{sid}:{season or 1}:{episode or 1}"
+        st, body = http_get(f"{base}/stream/{kind}/{meta}.json", timeout=25)
         d = json.loads(body)
         streams = d.get("streams") or []
         if not streams:
@@ -1171,19 +1247,41 @@ def search_mediafusion(imdb, mtype, season=None, episode=None):
             return []
         hits = []
         for s in streams:
-            ih = s.get("infoHash")
-            if not ih:
-                continue
-            title = s.get("title", "") or ""
             bh = s.get("behaviorHints") or {}
             fname = bh.get("filename", "") or ""
-            name = fname or title
-            m = re.search(r"[\U0001F464]\s*(\d+)", title)
+            title = s.get("title", "") or ""
+            desc = s.get("description", "") or ""
+            name = fname or title or desc
+            url = (s.get("url") or "").strip()
+            ih = s.get("infoHash") or ""
+            direct = ""
+            if not ih and url.lower().startswith("magnet:"):
+                mm = re.search(r"btih:([0-9a-fA-F]{32,40})", url)
+                ih = mm.group(1) if mm else ""
+            if not ih:
+                # No hash to hand to Real-Debrid. An https url is the addon's
+                # own provider proxy (playable); anything else is unusable.
+                if url.lower().startswith("http"):
+                    direct = url
+                else:
+                    continue
+            # Seeders live in the description: "👤 N" (some rows use ▶️ N).
+            m = (re.search(r"\U0001F464\s*(\d+)", desc)
+                 or re.search(r"\u25B6\ufe0f\s*(\d+)", desc))
             seeders = int(m.group(1)) if m else 0
-            hits.append({"name": name[:90], "info_hash": ih, "file_idx": s.get("fileIdx"),
-                         "filename": fname, "seeders": seeders,
-                         "size_gb": _size_gb(name),
-                         "source": "mediafusion", "quality": s.get("name", "")[:30]})
+            size_gb = None
+            vs = bh.get("videoSize")
+            if isinstance(vs, (int, float)) and vs > 0:
+                size_gb = round(vs / (1024.0 ** 3), 2)
+            if size_gb is None:
+                size_gb = _size_gb(name) or _size_gb(desc)
+            hit = {"name": name[:90], "info_hash": ih, "file_idx": s.get("fileIdx"),
+                   "filename": fname, "seeders": seeders, "size_gb": size_gb,
+                   "source": "mediafusion",
+                   "quality": (s.get("name", "") or "")[:30]}
+            if direct:
+                hit["direct_url"] = direct
+            hits.append(hit)
         return hits
     except Exception:
         return []
@@ -2419,9 +2517,17 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
     tor_hits = search_torrentio(imdb, mtype, season, episode)
     _src_count("torrentio", len(tor_hits))
     candidates.extend(tor_hits)
-    mf_hits = search_mediafusion(imdb, mtype, season, episode)
+    # MediaFusion is addressed by an IMDb id ("tt…") or a "tmdb:<n>" id — a BARE
+    # TMDB number silently answers {"streams":[]}, so hand it whichever we have
+    # (it normalises either; see _mediafusion_sid).
+    mf_hits = search_mediafusion(imdb or f"tmdb:{tmdb}", mtype, season, episode)
     _src_count("mediafusion", len(mf_hits))
-    candidates.extend(mf_hits)
+    # Two shapes come back, and only ONE can go through the RD candidate walk:
+    # torrent hits (info_hash → RD add, exactly like Torrentio) and
+    # "streaming provider" hits, which are already-resolved proxy URLs with no
+    # hash to add. The latter are followed + probed in the direct pass below.
+    mf_direct = [h for h in mf_hits if h.get("direct_url")]
+    candidates.extend(h for h in mf_hits if not h.get("direct_url"))
     tz_hits = search_torznab(None, imdb=imdb, mtype=mtype, season=season, episode=episode)
     _src_count("torznab", len(tz_hits))
     candidates.extend(tz_hits)
@@ -2492,6 +2598,50 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
     # alternative is on the table. Drop cams here so the h264 pre-filter, the
     # ordering and the try-loop all see the same HD-only set.
     candidates = _filter_cam_when_hd(candidates)
+
+    # 1b. MediaFusion "streaming provider" streams. The addon is configured with
+    #     a debrid account, so instead of a torrent hash it returns a proxy URL
+    #     that already points at the file — there is no RD add to make, the URL
+    #     IS the stream. It is followed (see _mediafusion_resolve_url) and then
+    #     probed with the SAME codec/audio gates as the account walk, ordered by
+    #     the same popularity/quality key as the RD candidates and BOUNDED, so a
+    #     run of uncached/expired entries cannot stall a resolve: a dead one is
+    #     rejected on the first cheap hop, before any ffprobe. A release needing
+    #     the play-time remux is only ever remembered, never selected over one
+    #     that plays as-is (mf_remux, used as a last-resort fallback below).
+    mf_remux = None
+    if mf_direct:
+        mf_deadline = time.time() + 20
+        mf_order = sorted(mf_direct,
+                          key=lambda c: _candidate_order_key(c, want_h, lang, codec, accept))
+        for c in mf_order[:5]:
+            if time.time() > mf_deadline:
+                break
+            u = _mediafusion_resolve_url(c["direct_url"])
+            if not u:
+                continue  # uncached / expired account / not a media file
+            if _is_dead(u):
+                continue
+            if codec == "h264" and not firefox_video_ok(u, c.get("name")):
+                _keep_hevc(u, c.get("name", ""))
+                continue
+            if audio_codec_is_browser_safe(u) is False:
+                _cand_verdict_set(c, accept, "reject")
+                continue
+            if _foreign_only_name(c.get("name", "")):
+                _cand_verdict_set(c, accept, "reject")
+                continue
+            plan = audio_plan(audio_tracks(u), accept)
+            _cand_verdict_set(c, accept, plan)
+            if plan == "reject":
+                continue
+            if plan == "remux":
+                if mf_remux is None:
+                    mf_remux = (u, c)
+                continue
+            return {"url": u, "source": "mediafusion",
+                    "title": c.get("name", "")[:80], "imdb": imdb}
+
     if candidates:
         # Browser-playable first (H264 > HEVC/AV1), biased to requested quality.
         # codec=h264: filter HEVC/AV1 out — but SOFT: if every candidate is
@@ -2653,6 +2803,12 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
         if account_remux is not None:
             url, c = account_remux
             return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
+        # A MediaFusion stream whose accepted audio needs the play-time remux:
+        # still better than "no stream" (the player's remux/decode-error path
+        # handles it), exactly like account_remux above.
+        if mf_remux is not None:
+            url, c = mf_remux
+            return {"url": url, "source": "mediafusion", "title": c.get("name", "")[:80], "imdb": imdb}
         return _soft_hevc_result() or {
             "error": "no stream available on real-debrid yet (try again in a few minutes)",
             "imdb": imdb}

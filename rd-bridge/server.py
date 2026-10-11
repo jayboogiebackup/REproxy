@@ -1903,6 +1903,80 @@ def search_torznab(query, imdb=None, mtype=None, season=None, episode=None):
         return []
 
 
+# ── Concurrent source fan-out ─────────────────────────────────────────────
+# Torrentio + MediaFusion + Torznab used to be fetched ONE AFTER ANOTHER, so the
+# resolve paid the SUM of their latencies. MEASURED (The Office S01E01,
+# 2026-10-11): Torrentio 0.37s, Torznab 0.00s, MediaFusion 15.20s (elfhosted
+# cold) → 15.58s serial before the walk even started. Fetched together the wall
+# clock is the SLOWEST source, not the sum.
+#
+# `BRIDGE_SOURCE_TIMEOUT` caps EACH source (default 12s): a hung indexer can no
+# longer hold the whole resolve hostage — its late result is simply dropped and
+# the sources that answered are still used. Set it higher to be more patient,
+# 0 (or negative) to disable the cap.
+_SOURCE_TIMEOUT = float(os.environ.get("BRIDGE_SOURCE_TIMEOUT", "12"))
+
+# The player-feedback preview (see preview_candidates) deliberately uses a SHORT
+# budget: Torrentio answers in ~0.4s, so a 3s window already yields a real
+# candidate list to show while the viewer waits, without making the preview
+# itself a stall. Feedback only — it never touches the resolve path.
+_PREVIEW_TIMEOUT = float(os.environ.get("BRIDGE_PREVIEW_TIMEOUT", "3"))
+
+
+def _fetch_sources(imdb, tmdb, mtype, season=None, episode=None, budget=None):
+    """Fetch every configured candidate source CONCURRENTLY.
+
+    Returns (torrentio_hits, mediafusion_hits, torznab_hits) in that fixed
+    order (so the candidate ordering downstream is identical to the old serial
+    code). A source that errors or overruns the per-source cap contributes an
+    empty list — never a fabricated one — exactly like the old `except: []`.
+    `budget` overrides the per-source cap in seconds (None → _SOURCE_TIMEOUT).
+    """
+    import concurrent.futures as _cf
+
+    cap = _SOURCE_TIMEOUT if budget is None else budget
+
+    def _torrentio():
+        return search_torrentio(imdb, mtype, season, episode)
+
+    def _mediafusion():
+        # MediaFusion is addressed by an IMDb id ("tt…") or a "tmdb:<n>" id — a
+        # BARE TMDB number silently answers {"streams":[]} (see _mediafusion_sid).
+        return search_mediafusion(imdb or f"tmdb:{tmdb}", mtype, season, episode)
+
+    def _torznab():
+        return search_torznab(None, imdb=imdb, mtype=mtype, season=season, episode=episode)
+
+    out = {"torrentio": [], "mediafusion": [], "torznab": []}
+    ex = _cf.ThreadPoolExecutor(max_workers=3)
+    try:
+        futs = {ex.submit(_torrentio): "torrentio",
+                ex.submit(_mediafusion): "mediafusion",
+                ex.submit(_torznab): "torznab"}
+        try:
+            for fut in _cf.as_completed(futs, timeout=(cap if cap and cap > 0 else None)):
+                name = futs[fut]
+                try:
+                    out[name] = fut.result() or []
+                except Exception:
+                    out[name] = []
+        except _cf.TimeoutError:
+            # At least one source overran the cap. Harvest whatever else already
+            # finished; abandon the stragglers (their own http timeout still
+            # bounds them). Never block here — that would defeat the cap.
+            for fut, name in futs.items():
+                if fut.done() and not fut.cancelled():
+                    try:
+                        out[name] = fut.result() or []
+                    except Exception:
+                        out[name] = []
+    finally:
+        # wait=False: a straggler source must NOT stall the resolve. It keeps
+        # running in its worker thread until its own http timeout fires.
+        ex.shutdown(wait=False)
+    return out["torrentio"], out["mediafusion"], out["torznab"]
+
+
 def rd_instant_available(hashes):
     """Check which hashes are cached on RD (POST /torrents/instantAvailability).
        Returns dict hash → files."""
@@ -3291,31 +3365,16 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
             soft_hevc["title"] = name or ""
         return None
 
-    # 0. Fetch Torrentio candidates FIRST (0.1s, parallel-safe) so the slow
-    #    account codec probe below overlaps with candidate prep.
-    #    Configurable sources are gathered here too, in front of the same
-    #    cam/quality/audio gates: MediaFusion (Stremio addon, infoHash+fileIdx)
-    #    and Torznab (Jackett on the Pi, INERT unless TORZNAB_* are set).
-    candidates = []
-    tor_hits = search_torrentio(imdb, mtype, season, episode)
-    _src_count("torrentio", len(tor_hits))
-    candidates.extend(tor_hits)
-    # MediaFusion is addressed by an IMDb id ("tt…") or a "tmdb:<n>" id — a BARE
-    # TMDB number silently answers {"streams":[]}, so hand it whichever we have
-    # (it normalises either; see _mediafusion_sid).
-    mf_hits = search_mediafusion(imdb or f"tmdb:{tmdb}", mtype, season, episode)
-    _src_count("mediafusion", len(mf_hits))
-    # Two shapes come back, and only ONE can go through the RD candidate walk:
-    # torrent hits (info_hash → RD add, exactly like Torrentio) and
-    # "streaming provider" hits, which are already-resolved proxy URLs with no
-    # hash to add. The latter are followed + probed in the direct pass below.
-    mf_direct = [h for h in mf_hits if h.get("direct_url")]
-    candidates.extend(h for h in mf_hits if not h.get("direct_url"))
-    tz_hits = search_torznab(None, imdb=imdb, mtype=mtype, season=season, episode=episode)
-    _src_count("torznab", len(tz_hits))
-    candidates.extend(tz_hits)
-
-    # 1. The user's OWN RD library (Harbor-style, instant) — already-
+    # 0. THE ACCOUNT LIBRARY WALK RUNS FIRST. ORDERING IS A LATENCY
+    #    DECISION, NOT A PREFERENCE (MEASURED 2026-10-11): the account walk
+    #    costs ~1-5s and frequently HITS, while the indexer fan-out below can
+    #    cost 15s+ on its own (MediaFusion cold = 15.20s). Running the
+    #    indexers first made every library hit pay for them too — the visible
+    #    "stuck on loading repokapone for shows" stall. MEASURED for
+    #    The Office S01E01: account-hit resolve 4.3s vs 18.4s when the
+    #    account is skipped. The fan-out is now paid ONLY when the account
+    #    has nothing usable, which is exactly where it is needed.
+    # 0. The user's OWN RD library (Harbor-style, instant) — already-
     #    downloaded content always works, no 451, no waiting. Only check the
     #    PRIMARY titles. skip_account=True bypasses this so Torrentio
     #    candidates with browser-playable audio get picked instead.
@@ -3379,6 +3438,29 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
                 return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
         except Exception:
             pass
+    # 1. Indexer candidates — fetched CONCURRENTLY (see _fetch_sources), in
+    #    front of the same cam/quality/audio gates: Torrentio (100+ indexers),
+    #    MediaFusion (Stremio addon: infoHash+fileIdx OR a provider
+    #    direct_url) and Torznab (Jackett on the Pi, INERT unless TORZNAB_*
+    #    are set). Concurrent because serially the resolve paid the SUM of
+    #    their latencies (MEASURED: MediaFusion 15.20s cold + Torrentio
+    #    0.37s = 15.58s) whereas together it pays only the slowest; and
+    #    _fetch_sources caps each source so one hung indexer can no longer
+    #    hold the whole resolve hostage.
+    candidates = []
+    tor_hits, mf_hits, tz_hits = _fetch_sources(imdb, tmdb, mtype, season, episode)
+    _src_count("torrentio", len(tor_hits))
+    candidates.extend(tor_hits)
+    _src_count("mediafusion", len(mf_hits))
+    # Two shapes come back, and only ONE can go through the RD candidate
+    # walk: torrent hits (info_hash → RD add, exactly like Torrentio) and
+    # "streaming provider" hits, which are already-resolved proxy URLs with
+    # no hash to add. The latter are followed + probed in the direct pass
+    # below.
+    mf_direct = [h for h in mf_hits if h.get("direct_url")]
+    candidates.extend(h for h in mf_hits if not h.get("direct_url"))
+    _src_count("torznab", len(tz_hits))
+    candidates.extend(tz_hits)
 
     order = []
     tried = 0
@@ -3767,6 +3849,82 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
             or {"error": "could not resolve via real-debrid (all candidates rejected)", "imdb": imdb})
 
 
+# ── Player feedback: candidate preview ─────────────────────────────────────
+# The resolve above can take several seconds (account walk) or tens of seconds
+# (indexer fan-out + candidate walk) on a cold title, and the player used to
+# show nothing but "Loading repokapone…" for that whole time. These two helpers
+# let the player render WHAT IS BEING TRIED as soon as the first results arrive.
+def _account_library_matches(tmdb, mtype, season=None, episode=None):
+    """Fast, unrestrict-free account scan: filenames ALREADY in the RD library
+    that match this title by word boundaries. FEEDBACK ONLY — it deliberately
+    skips the per-file probes, gates and unrestrict that the resolve's own
+    account walk does, so it must never be treated as a resolve decision."""
+    try:
+        st, body = http_get(
+            f"https://api.themoviedb.org/3/{'movie' if mtype == 'movie' else 'tv'}/{tmdb}?api_key={TMDB_KEY}",
+            timeout=10)
+        tdata = json.loads(body)
+    except Exception:
+        return []
+    words = set()
+    for k in ("title", "name", "original_title", "original_name"):
+        v = tdata.get(k)
+        if v:
+            for w in str(v).lower().split():
+                if len(w) > 2:
+                    words.add(w)
+    if not words:
+        return []
+    hits = []
+    try:
+        for t in rd_get_torrents():
+            if t.get("status") != "downloaded" or not t.get("links"):
+                continue
+            fn = t.get("filename") or ""
+            low = fn.lower()
+            if any(re.search(rf"(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])", low) for w in words):
+                hits.append(fn[:90])
+    except Exception:
+        pass
+    return hits
+
+
+def preview_candidates(tmdb, mtype, season=None, episode=None, quality=None, lang=None,
+                       codec=None, budget=None):
+    """Read-only candidate preview for PLAYER FEEDBACK.
+
+    Runs the SAME source fan-out the resolve uses (concurrently, with a SHORT
+    budget so the list arrives while the viewer is still waiting) plus the light
+    account-library scan, and reports what the resolve is about to walk. It NEVER
+    adds a torrent, never calls unrestrict and never writes the resolve cache —
+    it can only report, so a slow indexer cannot damage the resolve path.
+    """
+    try:
+        imdb = tmdb_to_imdb(tmdb, "movie" if mtype == "movie" else "tv")
+        tor, mf, tz = _fetch_sources(imdb, tmdb, mtype, season, episode,
+                                     budget=(_PREVIEW_TIMEOUT if budget is None else budget))
+        accept = _accept_langs(mtype, lang)
+        want_h = 1080 if quality == "1080" else 720 if quality == "720" else 480 if quality == "480" else None
+        merged = _filter_cam_when_hd(list(tor) + list(mf) + list(tz))
+        try:
+            merged = sorted(merged, key=lambda c: _candidate_order_key(c, want_h, lang, codec, accept))
+        except Exception:
+            pass
+        return {
+            "imdb": imdb,
+            "counts": {"torrentio": len(tor), "mediafusion": len(mf), "torznab": len(tz)},
+            "account": _account_library_matches(tmdb, mtype, season, episode)[:8],
+            "candidates": [
+                {"name": (c.get("name") or "")[:90], "source": c.get("source", ""),
+                 "seeders": int(c.get("seeders") or 0), "size_gb": c.get("size_gb")}
+                for c in merged[:30]
+            ],
+            "total": len(merged),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "repeaks-bridge"
     sys_version = ""
@@ -3828,6 +3986,36 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "busy"}, 429, {"Retry-After": "10"})
             try:
                 return self._do_resolve(q, tmdb, mtype)
+            finally:
+                _release_slot()
+        # Read-only candidate PREVIEW for PLAYER FEEDBACK. The resolve above can
+        # take seconds (account walk) or tens of seconds (indexer fan-out) on a
+        # cold title, during which the player used to show nothing but "Loading
+        # repokapone…". This route runs the SAME source fan-out with a SHORT
+        # budget (see preview_candidates) so the client can render WHAT IS BEING
+        # TRIED as soon as the first results arrive. It is strictly read-only —
+        # no torrent add, no unrestrict, no resolve-cache write — so a slow or
+        # hung indexer on this path can never damage the resolve.
+        if url.path == "/api/rd/candidates":
+            gate = self._gate()
+            if gate:
+                return gate
+            tmdb = q.get("tmdb", [None])[0]
+            mtype = q.get("type", [None])[0]
+            if not tmdb or not mtype:
+                return self._json({"error": "tmdb + type required"}, 400)
+            if not re.fullmatch(r"\d{1,9}", str(tmdb)) or mtype not in ("movie", "tv", "anime"):
+                return self._json({"error": "bad tmdb/type"}, 400)
+            if not _acquire_slot():
+                return self._json({"error": "busy"}, 429, {"Retry-After": "10"})
+            try:
+                return self._json(preview_candidates(
+                    int(tmdb), mtype,
+                    _env_int(q.get("season", [None])[0], 0, 100, None),
+                    _env_int(q.get("episode", [None])[0], 0, 5000, None),
+                    quality=q.get("quality", [None])[0],
+                    lang=q.get("lang", [None])[0],
+                    codec=q.get("codec", [None])[0]))
             finally:
                 _release_slot()
         if url.path == "/api/rd/search":

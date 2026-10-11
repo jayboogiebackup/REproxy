@@ -32,6 +32,7 @@ import time
 import urllib.error
 import urllib.request
 import urllib.parse
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from rd_flow import match_episode_file_index, pick_rd_files, pick_link_index, VIDEO_EXTS  # noqa: E402
@@ -563,6 +564,46 @@ PORT = int(os.environ.get("RD_PORT", "8801"))
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
 
+# =========================================================================
+# CANDIDATE SOURCES (configurable)
+#
+# Torrentio config segment — joined by "|" and inserted into the URL path
+# before /stream/... `qualityfilter` drops cams/screeners/3D AT THE INDEXER,
+# so they never even enter the candidate list (belt-and-braces on top of the
+# in-process CAM rule, _filter_cam_when_hd).
+#   NOTE: `language=english` is a VERIFIED NO-OP in Torrentio ("No need to
+#   filter english since it's hard to predict which entries are english").
+#   Do NOT rely on it — the real language gate is _audio_gate/_foreign_only_name.
+# =========================================================================
+TORRENTIO_BASE = os.environ.get("TORRENTIO_BASE", "https://torrentio.strem.fun").strip().rstrip("/")
+TORRENTIO_CONFIG = os.environ.get(
+    "TORRENTIO_CONFIG", "qualityfilter=cam,scr,threed|sort=qualitysize"
+).strip().strip("/")
+
+# MediaFusion — keyless public Stremio addon. A BARE /stream/... call returns
+# {"streams":[]}: a CONFIG URL generated from its /configure page (the config
+# is an encrypted token embedded in the path) is REQUIRED. Set
+# MEDIAFUSION_CONFIG_URL to e.g.
+#   https://mediafusion.elfhosted.com/<encrypted-token>/manifest.json
+# Leave it EMPTY to skip the source (logged once, never fatal).
+MEDIAFUSION_CONFIG_URL = os.environ.get("MEDIAFUSION_CONFIG_URL", "").strip()
+
+# Torznab slot (Jackett/Prowlarr on the Pi). INERT unless BOTH are set.
+TORZNAB_URL = os.environ.get("TORZNAB_URL", "").strip().rstrip("/")
+TORZNAB_API_KEY = os.environ.get("TORZNAB_API_KEY", "").strip()
+TORZNAB_PATH = os.environ.get(
+    "TORZNAB_PATH", "/api/v2.0/indexers/all/results/torznab/api"
+).strip()
+
+# Per-resolve candidate counts by source. Diagnostic only: attached to the
+# resolve result as `_sources` and surfaced solely when the caller asks
+# debug=1 (stripped from every normal response). Never affects the walk.
+_SRC_COUNTS = {}
+
+
+def _src_count(name, n):
+    _SRC_COUNTS[name] = _SRC_COUNTS.get(name, 0) + int(n or 0)
+
 
 # =========================================================================
 # CACHE PROVENANCE + DEAD-LINK FAILOVER
@@ -1031,12 +1072,16 @@ def search_apibay(q, category="0"):
 
 
 def search_torrentio(imdb, mtype, season=None, episode=None):
-    """Torrentio public API — 100+ indexers, returns infoHash + fileIdx + seeders."""
+    """Torrentio public API — 100+ indexers, returns infoHash + fileIdx + seeders.
+       The configured segment (default qualityfilter=cam,scr,threed|sort=
+       qualitysize) is inserted before /stream/... so cams/screeners/3D are
+       dropped AT THE INDEXER and never reach the candidate list."""
     try:
+        cfg = f"{TORRENTIO_CONFIG}/" if TORRENTIO_CONFIG else ""
         if mtype == "movie":
-            url = f"https://torrentio.strem.fun/stream/movie/{imdb}.json"
+            url = f"{TORRENTIO_BASE}/{cfg}stream/movie/{imdb}.json"
         else:
-            url = f"https://torrentio.strem.fun/stream/series/{imdb}:{season or 1}:{episode or 1}.json"
+            url = f"{TORRENTIO_BASE}/{cfg}stream/series/{imdb}:{season or 1}:{episode or 1}.json"
         st, body = http_get(url, timeout=25)
         d = json.loads(body)
         hits = []
@@ -1074,6 +1119,147 @@ def search_eztv(imdb, season=None, episode=None):
             hits.append({"name": t.get("title", ""), "info_hash": t.get("hash", ""),
                          "seeders": t.get("seeders", 0), "source": "eztv",
                          "magnet": t.get("magnet_url", "")})
+        return hits
+    except Exception:
+        return []
+
+
+# ── MediaFusion (public Stremio addon) ────────────────────────────────────
+_MEDIAFUSION_WARNED = [False]
+
+
+def _mediafusion_stream_base():
+    """Derive the /stream base from the configured MediaFusion URL. Accepts
+    either .../<encrypted-token>/manifest.json (the addon's /configure output)
+    or a bare .../<encrypted-token> path. None when unconfigured."""
+    u = MEDIAFUSION_CONFIG_URL
+    if not u:
+        return None
+    u = u.split("?")[0].rstrip("/")
+    if u.endswith("/manifest.json"):
+        u = u[: -len("/manifest.json")]
+    return u.rstrip("/") or None
+
+
+def search_mediafusion(imdb, mtype, season=None, episode=None):
+    """MediaFusion public Stremio addon — the stream objects follow the exact
+    Stremio shape Torrentio uses ({name,title,infoHash,fileIdx,
+    behaviorHints:{bingeGroup,filename},sources}), so infoHash+fileIdx is
+    reused by the same Real-Debrid path.
+
+    A BARE /stream/... call returns {"streams":[]} — the addon needs a config
+    embedded in the path (from its /configure page). When MEDIAFUSION_CONFIG_URL
+    is unset the source is skipped with ONE clear log line, never an error."""
+    base = _mediafusion_stream_base()
+    if not base:
+        if not _MEDIAFUSION_WARNED[0]:
+            _MEDIAFUSION_WARNED[0] = True
+            print("[src] mediafusion: MEDIAFUSION_CONFIG_URL not set — source disabled",
+                  flush=True)
+        return []
+    try:
+        if mtype == "movie":
+            kind, sid = "movie", imdb
+        else:
+            kind, sid = "series", f"{imdb}:{season or 1}:{episode or 1}"
+        st, body = http_get(f"{base}/stream/{kind}/{sid}.json", timeout=25)
+        d = json.loads(body)
+        streams = d.get("streams") or []
+        if not streams:
+            # A bare/expired token answers an empty list — not an error.
+            print("[src] mediafusion: 0 streams (config token missing/expired?)", flush=True)
+            return []
+        hits = []
+        for s in streams:
+            ih = s.get("infoHash")
+            if not ih:
+                continue
+            title = s.get("title", "") or ""
+            bh = s.get("behaviorHints") or {}
+            fname = bh.get("filename", "") or ""
+            name = fname or title
+            m = re.search(r"[\U0001F464]\s*(\d+)", title)
+            seeders = int(m.group(1)) if m else 0
+            hits.append({"name": name[:90], "info_hash": ih, "file_idx": s.get("fileIdx"),
+                         "filename": fname, "seeders": seeders,
+                         "size_gb": _size_gb(name),
+                         "source": "mediafusion", "quality": s.get("name", "")[:30]})
+        return hits
+    except Exception:
+        return []
+
+
+# ── Torznab (Jackett/Prowlarr on the Pi) ──────────────────────────────────
+def _torznab_enabled():
+    return bool(TORZNAB_URL and TORZNAB_API_KEY)
+
+
+def _magnet_hash(magnet):
+    m = re.search(r"btih:([0-9a-fA-F]{32,40})", magnet or "")
+    return m.group(1) if m else ""
+
+
+def search_torznab(query, imdb=None, mtype=None, season=None, episode=None):
+    """Standard Torznab XML search (Jackett/Prowlarr). ENV-driven and INERT:
+    when TORZNAB_URL or TORZNAB_API_KEY is unset this returns [] immediately
+    (no I/O, no logging, no delay) so an uninstalled Jackett cannot break a
+    resolve. Uses t=movie/tvsearch with imdbid when an IMDb id is known, else
+    a plain t=search&q=. Parses title, size, seeders, infohash/magnet."""
+    if not _torznab_enabled():
+        return []
+    try:
+        params = {"apikey": TORZNAB_API_KEY, "limit": "50"}
+        if imdb and mtype == "movie":
+            params["t"] = "movie"
+            params["imdbid"] = imdb.lstrip("t")
+        elif imdb and mtype in ("tv", "anime"):
+            params["t"] = "tvsearch"
+            params["imdbid"] = imdb.lstrip("t")
+            if season is not None:
+                params["season"] = season
+            if episode is not None:
+                params["ep"] = episode
+        else:
+            params["t"] = "search"
+        if query:
+            params["q"] = query
+        url = f"{TORZNAB_URL}{TORZNAB_PATH}?" + urllib.parse.urlencode(params)
+        st, body = http_get(url, timeout=25)
+        root = ET.fromstring(body)
+        hits = []
+        for item in root.iter("item"):
+            title = (item.findtext("title") or "").strip()
+            if not title:
+                continue
+            ih = ""
+            seeders = 0
+            magnet = ""
+            for el in item.iter():
+                tag = el.tag.split("}")[-1]  # strip any torznab namespace
+                if tag == "attr":
+                    nm = (el.get("name") or "").lower()
+                    val = el.get("value") or ""
+                    if nm == "infohash" and val:
+                        ih = val
+                    elif nm in ("seeders", "seed") and val.isdigit():
+                        seeders = int(val)
+                    elif nm == "magneturl" and val:
+                        magnet = val
+                elif tag in ("link", "enclosure") and not magnet:
+                    magnet = (el.get("url") or el.text or "").strip()
+            if not ih:
+                ih = _magnet_hash(magnet)
+            if not ih:
+                g = (item.findtext("guid") or "").strip()
+                if re.fullmatch(r"[0-9a-fA-F]{40}", g):
+                    ih = g
+            if not ih:
+                continue  # RD needs a hash — cannot use this row
+            size = (item.findtext("size") or "").strip()
+            size_gb = int(size) / (1024.0 ** 3) if size.isdigit() else None
+            hits.append({"name": title[:90], "info_hash": ih, "seeders": seeders,
+                         "size_gb": size_gb, "source": "torznab",
+                         "magnet": magnet, "quality": title[:30]})
         return hits
     except Exception:
         return []
@@ -2174,6 +2360,18 @@ def _is_hevc_name(name):
 
 
 def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None):
+    """Wrapper around the real walk. Resets the per-source diagnostic counter,
+    then attaches the resulting `_sources` counts to the result dict. Purely
+    informational — the walk and its behaviour are unchanged."""
+    _SRC_COUNTS.clear()
+    result = _resolve_stream_impl_inner(tmdb, mtype, season, episode, quality,
+                                        skip_account, codec, lang)
+    if isinstance(result, dict):
+        result["_sources"] = dict(_SRC_COUNTS)
+    return result
+
+
+def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None):
     """Full flow → direct stream URL. codec='h264' filters to H.264/AVC only.
     lang='dub' prefers English-dubbed releases for anime."""
     if not RD_KEY:
@@ -2214,8 +2412,19 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
 
     # 0. Fetch Torrentio candidates FIRST (0.1s, parallel-safe) so the slow
     #    account codec probe below overlaps with candidate prep.
+    #    Configurable sources are gathered here too, in front of the same
+    #    cam/quality/audio gates: MediaFusion (Stremio addon, infoHash+fileIdx)
+    #    and Torznab (Jackett on the Pi, INERT unless TORZNAB_* are set).
     candidates = []
-    candidates.extend(search_torrentio(imdb, mtype, season, episode))
+    tor_hits = search_torrentio(imdb, mtype, season, episode)
+    _src_count("torrentio", len(tor_hits))
+    candidates.extend(tor_hits)
+    mf_hits = search_mediafusion(imdb, mtype, season, episode)
+    _src_count("mediafusion", len(mf_hits))
+    candidates.extend(mf_hits)
+    tz_hits = search_torznab(None, imdb=imdb, mtype=mtype, season=season, episode=episode)
+    _src_count("torznab", len(tz_hits))
+    candidates.extend(tz_hits)
 
     # 1. The user's OWN RD library (Harbor-style, instant) — already-
     #    downloaded content always works, no 451, no waiting. Only check the
@@ -2458,14 +2667,20 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
         year = (tdata.get("release_date") or "")[:4]
         hits = search_apibay(f"{title} {year}", category="0")
         imdb_l = imdb.lower()
-        candidates.extend([h for h in hits if h.get("imdb", "").lower() == imdb_l])
+        imdb_matches = [h for h in hits if h.get("imdb", "").lower() == imdb_l]
+        _src_count("apibay", len(imdb_matches))
+        candidates.extend(imdb_matches)
     else:
         # EZTV by IMDb id (per-episode match) + APIBay fallback
-        candidates.extend(search_eztv(imdb, season, episode))
+        ez_hits = search_eztv(imdb, season, episode)
+        _src_count("eztv", len(ez_hits))
+        candidates.extend(ez_hits)
         st, body = http_get(f"https://api.themoviedb.org/3/tv/{tmdb}?api_key={TMDB_KEY}", timeout=15)
         tdata = json.loads(body)
         q = f"{tdata.get('name','')} S{int(season or 1):02d}E{int(episode or 1):02d}"
-        candidates.extend(search_apibay(q, category="205"))
+        ab_hits = search_apibay(q, category="205")
+        _src_count("apibay", len(ab_hits))
+        candidates.extend(ab_hits)
 
     # HARD RULE 1 again: the APIBay/EZTV tail can add cams the Torrentio set
     # did not have — re-apply before the final ordering below.
@@ -2720,6 +2935,7 @@ class Handler(BaseHTTPRequestHandler):
             args.append("--nocache")
         if dead:
             args.append(f"--dead={dead}")
+        debug = q.get("debug", ["0"])[0] == "1"
         try:
             proc = _sp.run(args, capture_output=True, text=True, timeout=150)
             out = proc.stdout.strip()
@@ -2730,6 +2946,11 @@ class Handler(BaseHTTPRequestHandler):
                     # cached URL after a renewal (a changed `v` = new session =
                     # every previously cached link is dead).
                     result["v"] = _cache_fingerprint()
+                    # Per-source candidate counts are exposed ONLY when the
+                    # caller explicitly asks debug=1 (diagnostic; stripped from
+                    # every normal response so the payload stays identical).
+                    if not debug:
+                        result.pop("_sources", None)
                 return self._json(result, 200 if result.get("url") else 404)
             return self._json({"error": "resolve failed"}, 404)
         except _sp.TimeoutExpired:

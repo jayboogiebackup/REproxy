@@ -2396,6 +2396,7 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_ac
                   "imdb": result.get("imdb")}
     if url and isinstance(result, dict):
         _tag_audio(result, accept)
+        _tag_cam(result)
         if soft_cached is not None and result.get("needs_remux"):
             # The walk just searched for a release that plays as-is and found
             # none: remember that, so the next play serves this remux link
@@ -2419,6 +2420,30 @@ def _tag_audio(result, accept):
     plan = audio_plan(audio_tracks(url), accept)
     result["audio"] = plan
     result["needs_remux"] = plan == "remux"
+    return result
+
+
+def _tag_cam(result):
+    """Attach the CAM verdict to a resolve result so the player can WARN the
+    viewer: `cam: True` marks a stream whose selected release is a cam /
+    telesync / telecine — a recording made inside a cinema, the lowest
+    fidelity tier there is (blurry picture, audience noise).
+
+    This can only ever be set when no HD alternative existed: _filter_cam_when_hd
+    drops every cam release the moment the candidate set holds one genuine
+    720p+ release, so a cam that survives to selection means it is genuinely
+    the only thing this title has right now. The stream is still returned and
+    still plays — the flag is honesty for the viewer, never a block.
+
+    Verdict source: the release name when the resolver knows it (Torrentio /
+    MediaFusion / APIBay / EZTV candidates all carry it), otherwise the real
+    filename inside the RD URL — the account-library path returns a title-only
+    match, so the stored file's own name is the only truthful signal there.
+    """
+    if not result.get("url"):
+        return result
+    if _is_cam_release(result.get("title") or "") or _is_cam_release(_url_name(result["url"])):
+        result["cam"] = True
     return result
 
 

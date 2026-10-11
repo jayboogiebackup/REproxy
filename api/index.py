@@ -1003,11 +1003,20 @@ def api_rd_track():
                     yield chunk
             finally:
                 resp.close()
-        status = 206 if rng else 200
+        # Pass the BRIDGE's real status through instead of deriving it from the
+        # client's Range header. `206 if rng else 200` fabricated a `206 Partial
+        # Content` (with no `Content-Range`) for the bridge's non-range-capable
+        # streaming remux — a malformed partial response the media element
+        # rejects on the first byte. RD and the completed cache file both return
+        # a real 206 + Content-Range for a ranged request, so they are unchanged.
+        status = resp.status
         hdrs = {
             "Cache-Control": "no-store",
             "Access-Control-Allow-Origin": "*",
-            "Accept-Ranges": "bytes",
+            # Mirror the upstream's real range capability (a growing/live file
+            # answers `none`); default to `bytes` when the upstream is silent
+            # (RD's CDN omits the header on a complete file).
+            "Accept-Ranges": resp.headers.get("Accept-Ranges") or "bytes",
         }
         cr = resp.headers.get("Content-Range")
         if cr:

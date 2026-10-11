@@ -525,125 +525,6 @@ def _remux_recently_failed(file_id, ttl=60):
     return bool(ts and time.time() - ts < ttl)
 
 
-# ── streaming remux jobs: first play starts in seconds, cache fills behind ──
-# A play that needs the ffmpeg remux used to BLOCK until the whole multi-GB
-# file had been pulled from Real-Debrid (MEASURED 2026-10-11: RD→Pi ≈4.7 MB/s,
-# a 6.8 GB episode ⇒ ~24 min before the first byte; the player aborts at 120 s
-# so the viewer saw "no stream available"). The remux now runs as a BACKGROUND
-# JOB instead: ffmpeg emits a fragmented MP4 (frag_keyframe+empty_moov, no
-# Content-Length) into track_cache/<id>_<lang>.mp4.tmp and the request streams
-# that GROWING file to the client as bytes appear (first useful bytes in
-# ~3-4 s, measured 2 MB in 3.4 s). The job owns the ffmpeg process, so it
-# survives the client disconnecting — the cache still completes and the next
-# play is served from it with full Range/seek support.
-_REMUX_JOBS = {}              # file_id -> {"tmp","cache","done","ok","pos","proc"}
-_REMUX_JOBS_GUARD = threading.Lock()
-_REMUX_JOB_STALE = 3 * 3600   # sweep .tmp left by a process killed mid-remux
-
-
-def _remux_job_sweep(cache_dir):
-    """Delete .tmp files orphaned by a killed process (service restart mid-remux)."""
-    now = time.time()
-    try:
-        for fn in os.listdir(cache_dir):
-            if fn.endswith(".tmp"):
-                p = os.path.join(cache_dir, fn)
-                try:
-                    if now - os.path.getmtime(p) > _REMUX_JOB_STALE:
-                        os.unlink(p)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-
-def _remux_job_start_or_attach(file_id, tmp_path, cache_path, raw_url, lang,
-                               cache_dir):
-    """Start the background remux job for this RD file id, or attach to the one
-    already running. Returns (job, status): status is "started", "attached"
-    (the job is already filling the SAME .tmp — never start a second
-    multi-GB ffmpeg) or "busy" (global ffmpeg slot cap reached)."""
-    with _REMUX_JOBS_GUARD:
-        job = _REMUX_JOBS.get(file_id)
-        if job is not None and not job["done"].is_set():
-            return job, "attached"
-        if not _acquire_slot():
-            return None, "busy"
-        job = {"tmp": tmp_path, "cache": cache_path, "done": threading.Event(),
-               "ok": False, "pos": 0, "proc": None}
-        _REMUX_JOBS[file_id] = job
-    _remux_job_sweep(cache_dir)
-    threading.Thread(target=_remux_job_run, args=(file_id, job, raw_url, lang),
-                     daemon=True).start()
-    return job, "started"
-
-
-def _remux_job_run(file_id, job, raw_url, lang):
-    """The background remux. Owns ffmpeg + the .tmp file for its whole life, so
-    a client disconnect cannot abort it — the cache still fills. Writes the
-    fragmented MP4 to .tmp, then renames it to the real cache name on a clean
-    ffmpeg exit; a failure marks the file id so the next request fails fast
-    instead of re-running a doomed remux."""
-    import subprocess as _sp
-    proc = None
-    out = None
-    ok = False
-    try:
-        cmd = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
-               "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
-               "-c", "copy", "-strict", "-2",
-               "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"]
-        proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL)
-        job["proc"] = proc
-        out = open(job["tmp"], "wb")
-        po = proc.stdout
-        if po is None:  # stdout=PIPE, so this cannot happen — guard for typing
-            raise RuntimeError("ffmpeg stdout unavailable")
-        while True:
-            chunk = po.read(65536)
-            if not chunk:
-                break
-            try:
-                out.write(chunk)
-                out.flush()
-            except Exception:
-                pass
-            job["pos"] += len(chunk)
-        rc = proc.wait(timeout=120)
-        ok = (rc == 0 and job["pos"] > 0)
-    except Exception:
-        ok = False
-    finally:
-        try:
-            if out:
-                out.close()
-        except Exception:
-            pass
-        try:
-            if proc and proc.poll() is None:
-                proc.kill()
-        except Exception:
-            pass
-        _release_slot()
-        if ok:
-            try:
-                os.replace(job["tmp"], job["cache"])
-            except Exception:
-                ok = False
-        if not ok:
-            _remux_mark_failed(file_id)
-            try:
-                if os.path.exists(job["tmp"]):
-                    os.unlink(job["tmp"])
-            except Exception:
-                pass
-        job["ok"] = ok
-        job["done"].set()
-        with _REMUX_JOBS_GUARD:
-            if _REMUX_JOBS.get(file_id) is job:
-                del _REMUX_JOBS[file_id]
-
-
 def audio_codec_is_browser_safe(url, ttl=3600, filename_hint=None):
     """Probe the file's audio codec via ffprobe (header-only, ~3s, cached).
     Returns True when the audio will play in browsers (AAC/MP3/Opus/Vorbis/
@@ -1857,16 +1738,6 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
     info = None
     selected = False
     eff_idx = file_idx
-    # How many polls we allow once RD reports it is DOWNLOADING the torrent on
-    # their side. A torrent RD already holds goes straight to "downloaded"
-    # after selectFiles; "downloading"/"queued" therefore means it is NOT
-    # cached, and polling it is pure dead time for the viewer (MEASURED: the
-    # old budget was 10 x 2 s = ~20 s PER uncached candidate, which is what
-    # turned a walk of uncached releases into the reported timeouts). Bail
-    # after ~4 s instead — the caller moves on to the next candidate. Local
-    # counter (not `attempt`, which also counts the conversion polls) so
-    # concurrent candidates cannot share it.
-    dl_polls = 0
     try:
         for attempt in range(60):  # up to ~2min: cached = instant, non-cached = RD downloads
             try:
@@ -1911,15 +1782,14 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
             if status == "downloaded":
                 break
             if status in ("downloading", "queued"):
-                # RD is fetching it on THEIR servers (Stremio-style) — i.e. this
-                # candidate is NOT cached. Give it a very short grace (a cached
-                # torrent reports "downloaded" essentially immediately after
-                # selection) and move on, so one uncached release cannot eat the
-                # whole resolve deadline (see dl_polls above).
-                dl_polls += 1
-                if dl_polls > 3:
+                # RD is fetching it on THEIR servers (Stremio-style). For huge
+                # packs this can take minutes — don't block the whole resolve;
+                # give it a few polls then give up (caller tries next hash).
+                # Local counter (not global) — concurrent candidates must not
+                # share this.
+                if attempt >= 10:
                     break
-                time.sleep(1.2)
+                time.sleep(2)
                 continue
             if status in ("error", "virus", "dead"):
                 break
@@ -2282,37 +2152,6 @@ def _quality_rank_browser(c, codec=None, want_h=None):
     return _FIREFOX_RANK_BASE - abs(h - target) - overshoot
 
 
-def _mark_in_account(candidates):
-    """Flag candidates whose torrent is ALREADY in the RD account with a
-    playable link. Those resolve with no magnet add, no RD-side fetch and no
-    polling — `rd_add_and_stream` returns straight from its existing-torrent
-    branch, i.e. they ARE the 'direct file' path (measured 2026-10-11: the
-    account walk answers in ~0.5-1 s while every UNCACHED candidate can burn
-    up to ~20 s of status polling and still fail — the dominant source of the
-    resolve timeouts).
-
-    This is the only reliable cached signal available: RD's
-    /torrents/instantAvailability now answers `{}` for every hash (verified
-    live against 5 known-good hashes AND a random control — dead endpoint), so
-    account membership is used instead. It costs nothing: /torrents is already
-    fetched and cached in memory for 5 s. Never blocks, never raises."""
-    if not candidates:
-        return candidates
-    try:
-        have = {(t.get("hash") or "").lower() for t in rd_get_torrents()
-                if t.get("status") == "downloaded" and t.get("links")}
-    except Exception:
-        return candidates
-    if not have:
-        return candidates
-    for c in candidates:
-        try:
-            c["in_account"] = (c.get("info_hash") or "").lower() in have
-        except Exception:
-            pass
-    return candidates
-
-
 def _candidate_order_key(c, want_h, lang, codec, accept=None):
     # Rule 1 (cam never above HD) is enforced structurally: the cam flag is the
     # FIRST key (1 = cam, so it sorts last ascending), so even a cam that
@@ -2347,16 +2186,6 @@ def _candidate_order_key(c, want_h, lang, codec, accept=None):
     afr = _audio_first_rank(c, accept)
     quality = -_quality_rank_browser(c, codec, want_h)
     native = _audio_native_rank(c, accept)
-    # CACHED-FIRST (task 2026-10-11: "aggressively prefer RD-cached candidates
-    # so most plays take the direct-file path"). A candidate already in the RD
-    # account resolves instantly and cannot time out; an uncached one can spend
-    # ~20 s polling and still fail. It sits AFTER the cam floor and the audio
-    # playability gate (an as-is release still beats a remux one) but AHEAD of
-    # quality: reliability/instead-of-timeout wins the tie between a release we
-    # can serve now and one we may not be able to serve at all. Quality still
-    # decides among candidates of the same account status, so the owner's
-    # quality mandate is untouched wherever it is actually actionable.
-    acct = 0 if c.get("in_account") else 1
     tail = (_lang_rank(c, lang),
             _candidate_tier(c, codec, want_h),
             _size_rank(_candidate_size_gb(c)),
@@ -2365,22 +2194,21 @@ def _candidate_order_key(c, want_h, lang, codec, accept=None):
     if (lang or "").lower() == "dub":
         # ANIME DUB: the requested audio is a NON-DEFAULT alternate track, so
         # "which release can hand the player English first, without the remux?"
-        # is the dominant axis, ahead of resolution, and ahead of cachedness —
-        # a cached release that cannot serve the dub is useless. Ladder:
-        # 0 (proven/declared English first) → 1 (untagged, unconfirmed) →
-        # 2 (needs the remux) → 3 (carries no accepted audio). Quality still
-        # decides INSIDE each class, so the owner's rule holds among candidates
-        # that can serve the dub at all.
-        return (cam, afr, acct) + (quality, native) + tail
+        # is the dominant axis, ahead of resolution — an untagged 1080p on a dub
+        # ask is almost always Japanese audio that either fails the probe or
+        # needs the stall-prone remux, while the one release that PROVES
+        # English-first plays instantly. Ladder: 0 (proven/declared English
+        # first) → 1 (untagged, unconfirmed) → 2 (needs the remux) → 3 (carries
+        # no accepted audio). Quality still decides INSIDE each class, so the
+        # owner's rule holds among candidates that can serve the dub at all.
+        return (cam, afr) + (quality, native) + tail
     # MOVIE / TV / ANIME SUB: the requested language is the medium's default
-    # (or JPN is accepted too), so quality stays primary inside each class —
-    # but a candidate that cannot play as-is (needs the blocking remux, rank 2,
-    # or carries no accepted audio at all, rank 3) is gated BELOW every
-    # candidate that can, and an already-cached candidate is preferred over one
-    # that may have to be fetched. That is a correctness/availability bound on
-    # rule 2, never a quality preference: it merely stops an
-    # unusable-for-this-request release from leading the walk.
-    return (cam, 0 if afr <= 1 else 1, acct, quality, afr, native) + tail
+    # (or JPN is accepted too), so quality stays primary — but a candidate that
+    # cannot play as-is (needs the blocking remux, rank 2, or carries no
+    # accepted audio at all, rank 3) is gated BELOW every candidate that can.
+    # That is a correctness bound on rule 2, never a quality preference: it
+    # merely stops an unusable-for-this-request release from leading the walk.
+    return (cam, 0 if afr <= 1 else 1, quality, afr, native) + tail
 
 
 def codec_rank(name, want_height=None):
@@ -2843,9 +2671,6 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
     # alternative is on the table. Drop cams here so the h264 pre-filter, the
     # ordering and the try-loop all see the same HD-only set.
     candidates = _filter_cam_when_hd(candidates)
-    # CACHED-FIRST: mark candidates the account already holds (instant,
-    # no-timeout direct-file path) before the ordering below consults it.
-    _mark_in_account(candidates)
 
     # 1b. MediaFusion "streaming provider" streams. The addon is configured with
     #     a debrid account, so instead of a torrent hash it returns a proxy URL
@@ -3089,9 +2914,6 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
     # HARD RULE 1 again: the APIBay/EZTV tail can add cams the Torrentio set
     # did not have — re-apply before the final ordering below.
     candidates = _filter_cam_when_hd(candidates)
-    # CACHED-FIRST: mark candidates the account already holds (instant,
-    # no-timeout direct-file path) before the ordering below consults it.
-    _mark_in_account(candidates)
 
     if not candidates:
         # Niche content may already be in the user's RD account — match by
@@ -3373,6 +3195,7 @@ class Handler(BaseHTTPRequestHandler):
     # later plays serve the cached file with full Range support (instant start,
     # seekable) — this is what makes dub playback fast in Firefox.
     def do_GET_track(self, q):
+        import subprocess as _sp
         import urllib.parse as _up
         raw_url = q.get("url", [None])[0]
         lang = (q.get("lang", ["eng"])[0] or "eng").lower()
@@ -3471,99 +3294,99 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
             return
-        # Not cached — STREAM the remux live while a BACKGROUND JOB tees the
-        # same bytes into the disk cache. (This replaces a blocking full-file
-        # remux with -movflags faststart: MEASURED 2026-10-11 at RD→Pi ≈4.7 MB/s
-        # on a 6.8 GB episode ⇒ ~24 min before the first byte, so every
-        # remux-path play died at the player's 120 s abort.) The job owns ffmpeg
-        # into track_cache/<id>_<lang>.mp4.tmp; THIS request streams that growing
-        # file, so playback starts in ~3-4 s. On a clean ffmpeg exit the .tmp is
-        # renamed to the real cache name and every later play is served from the
-        # cache branch above with full Range/seek support. A client disconnect
-        # only stops this response — the job keeps filling the cache.
+        # Not cached — remux to a file FIRST (faststart: moov atom at front),
+        # then serve the complete file with Content-Length. This makes the
+        # video load like a normal file (progressively buffered, seekable),
+        # NOT a live stream. First play waits for the remux; later plays hit
+        # the cache instantly with full Range support.
         tmp_path = cache_path + ".tmp"
-        if _remux_recently_failed(file_id):
-            return self._json({"error": f"no {lang} audio track — remux failed"}, 502)
-        job, status = _remux_job_start_or_attach(
-            file_id, tmp_path, cache_path, raw_url, lang, cache_dir)
-        if status == "busy":
-            return self._json({"error": "busy"}, 429, {"Retry-After": "15"})
-        if job is None:  # cannot happen (busy handled above) — typing guard
-            return self._json({"error": "remux unavailable"}, 500)
-        # A Range request cannot be answered as a 206 while the total size is
-        # unknown, but the OFFSET can still be honoured — if the seek target has
-        # already been written, start there instead of replaying from 0.
-        start_at = 0
-        _rm = re.match(r"\s*bytes=(\d+)-", self.headers.get("Range", "") or "")
-        if _rm:
-            start_at = int(_rm.group(1))
+        with _remux_lock(file_id):
+            # Another request may have finished the remux while we waited.
+            if os.path.exists(cache_path):
+                pass
+            elif _remux_recently_failed(file_id):
+                return self._json({"error": f"no {lang} audio track — remux failed"}, 502)
+            else:
+                # ffmpeg pulls the whole multi-GB file and burns 600s of CPU.
+                # Cap how many can run at once so a burst of anonymous calls
+                # cannot pin every core on the Pi (cache hits above never take
+                # a slot, so normal playback is unaffected).
+                if not _acquire_slot():
+                    return self._json({"error": "busy"}, 429, {"Retry-After": "15"})
+                try:
+                    cmd = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
+                           "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
+                           "-c", "copy", "-strict", "-2", "-movflags", "faststart", "-f", "mp4", tmp_path]
+                    proc = _sp.Popen(cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                    proc.wait(timeout=600)
+                    if proc.returncode != 0 or not os.path.exists(tmp_path):
+                        # The wanted track could not be extracted. The old code
+                        # fell back to audio track 0 — which is how a Spanish/
+                        # Italian dub ended up playing as "English". Fail
+                        # instead: the player re-resolves (English or nothing).
+                        _remux_mark_failed(file_id)
+                        try:
+                            if os.path.exists(tmp_path):
+                                os.unlink(tmp_path)
+                        except Exception:
+                            pass
+                        return self._json(
+                            {"error": f"no {lang} audio track — refusing foreign audio fallback"}, 502)
+                    os.rename(tmp_path, cache_path)
+                except Exception:
+                    _remux_mark_failed(file_id)
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+                    except Exception:
+                        pass
+                    return self._json({"error": "remux failed"}, 500)
+                finally:
+                    _release_slot()
+        # Serve the freshly remuxed file with FULL Range support (the browser
+        # needs to seek even on the first play). Reuse the same serving logic
+        # as a cache hit by handling the Range header here too.
+        size = os.path.getsize(cache_path)
+        rng = self.headers.get("Range", "")
+        if rng:
+            try:
+                rng = rng.replace("bytes=", "").split("-")
+                start = int(rng[0]) if rng[0] else 0
+                end = int(rng[1]) if len(rng) > 1 and rng[1] else size - 1
+                end = min(end, size - 1)
+                length = end - start + 1
+                self.send_response(206)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Access-Control-Allow-Origin", self._acao())
+                self.send_header("Vary", "Origin")
+                self.end_headers()
+                with open(cache_path, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = f.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                return
+            except Exception:
+                pass
         self.send_response(200)
         self.send_header("Content-Type", "video/mp4")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Accept-Ranges", "none")
-        self.send_header("Connection", "close")
-        self.send_header("Access-Control-Allow-Origin", self._acao())
-        self.send_header("Vary", "Origin")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.close_connection = True
-        pos = start_at
-        stalled_since = time.time()
-        client_gone = False
-        try:
+        with open(cache_path, "rb") as f:
             while True:
-                # Read from whichever file holds the bytes right now: the .tmp
-                # while the job runs, the renamed cache file once it completed.
-                if os.path.exists(cache_path):
-                    src = cache_path
-                elif os.path.exists(tmp_path):
-                    src = tmp_path
-                else:
-                    src = None
-                fsz = pos
-                if src is not None:
-                    try:
-                        fsz = os.path.getsize(src)
-                    except OSError:
-                        fsz = pos
-                if fsz > pos and src:
-                    try:
-                        with open(src, "rb") as f:
-                            f.seek(pos)
-                            data = f.read()
-                    except OSError:
-                        data = b""
-                    if data:
-                        pos += len(data)
-                        try:
-                            self.wfile.write(data)
-                            self.wfile.flush()
-                        except Exception:
-                            # Client went away (BrokenPipe/ConnectionReset):
-                            # end this response, leave the background job alone.
-                            client_gone = True
-                            break
-                        stalled_since = time.time()
-                        continue
-                if job["done"].is_set():
-                    if src == cache_path:
-                        try:
-                            total = os.path.getsize(cache_path)
-                        except OSError:
-                            total = pos
-                        if pos >= total:
-                            break  # complete file fully delivered
-                        continue
-                    break  # job failed / .tmp gone — end the stream honestly
-                if time.time() - stalled_since > 90:
-                    # ffmpeg or the RD read stalled for 90 s with nothing new:
-                    # end the response rather than hold the socket open forever
-                    # (the player's own stall watchdog takes over from here).
-                    _audit(f"track remux stalled file_id={file_id}")
+                chunk = f.read(65536)
+                if not chunk:
                     break
-                time.sleep(0.15)
-        finally:
-            if client_gone:
-                _audit(f"track client left — remux keeps filling cache file_id={file_id}")
+                self.wfile.write(chunk)
         return
 
     def log_message(self, format, *args):

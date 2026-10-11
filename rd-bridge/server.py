@@ -1939,6 +1939,41 @@ def rd_find_existing_torrent(info_hash):
     return None, 0
 
 
+# ── RD provider-block signal (HTTP 451 "Unavailable For Legal Reasons") ──
+# MEASURED 2026-10-11 (The Odyssey, tt33764258): EVERY fresh candidate was
+# refused by RD with HTTP 451 in ~0.5s, so the walk spent its whole budget
+# failing and then reported the generic "no stream available … try again in a
+# few minutes" — which tells the viewer to retry something that can never
+# succeed. These counters let the resolver tell "the provider blocks this
+# title" apart from "nobody is seeding it (yet)".
+_rd_block_stats = {"adds": 0, "n451": 0}
+
+
+def _rd_block_snapshot():
+    return (_rd_block_stats["adds"], _rd_block_stats["n451"])
+
+
+def _is_451(exc):
+    """True when an exception is an HTTP 451 from RD (infringing content the
+    account is not allowed to serve)."""
+    return isinstance(exc, urllib.error.HTTPError) and getattr(exc, "code", None) == 451
+
+
+def _rd_add_and_stream_error(imdb, adds0, n451_0):
+    """The error dict the resolver reports when the walk found nothing.
+
+    Distinctly surfaces a provider-wide block: if EVERY fresh magnet add this
+    walk attempted came back 451, the honest message is "the provider blocks
+    all of these", not an invitation to retry in a few minutes."""
+    adds = _rd_block_stats["adds"] - adds0
+    n451 = _rd_block_stats["n451"] - n451_0
+    if n451 and adds and n451 >= adds:
+        return {"error": "all candidates are blocked by the provider "
+                         "(real-debrid: HTTP 451 Unavailable For Legal Reasons)",
+                "imdb": imdb, "blocked": True}
+    return None
+
+
 def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, episode=None):
     """Harbor-proven flow: addMagnet → poll → selectFiles/{id} (files=1,2,3)
        → poll downloaded → pickLinkIndex → unrestrict → direct URL.
@@ -2022,9 +2057,15 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
               f"&tr=udp://exodus.desync.com:6969/announce")
     if filename:
         magnet += f"&dn={urllib.parse.quote(filename[:80])}"
+    _rd_block_stats["adds"] += 1
     try:
         added = rd_post("/torrents/addMagnet", {"magnet": magnet})
-    except Exception:
+    except Exception as e:
+        if _is_451(e):
+            # MEASURED: RD refuses the whole title this way (all candidates,
+            # ~0.5s each). Recorded so the resolver can say so instead of the
+            # generic "try again in a few minutes".
+            _rd_block_stats["n451"] += 1
         return None
     tid = added.get("id")
     if not tid:
@@ -2033,6 +2074,7 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
     info = None
     selected = False
     eff_idx = file_idx
+    uncached_polls = 0  # DEDICATED cache-miss budget (see below)
     try:
         for attempt in range(60):  # up to ~2min: cached = instant, non-cached = RD downloads
             try:
@@ -2077,14 +2119,20 @@ def rd_add_and_stream(info_hash, file_idx=None, filename=None, season=None, epis
             if status == "downloaded":
                 break
             if status in ("downloading", "queued"):
-                # RD is fetching it on THEIR servers (Stremio-style). For huge
-                # packs this can take minutes — don't block the whole resolve;
-                # give it a few polls then give up (caller tries next hash).
-                # Local counter (not global) — concurrent candidates must not
-                # share this.
-                if attempt >= 10:
+                # RD is fetching it on THEIR servers (Stremio-style). A torrent
+                # RD ALREADY holds reports `downloaded` right after selectFiles,
+                # so `downloading`/`queued` means it is NOT cached and the wait
+                # is unbounded — give up fast and let the caller try the next
+                # hash. Dedicated counter, NOT `attempt`: `attempt` also counts
+                # the magnet-conversion / file-selection polls, so reusing it
+                # (the old `if attempt >= 10: time.sleep(2)`) burned ~20s per
+                # uncached candidate — 5 batches was the whole 115s resolve
+                # deadline, i.e. the reported "no stream" timeouts. Budget:
+                # ~3 polls × 1.2s ≈ 3.6s per uncached candidate.
+                uncached_polls += 1
+                if uncached_polls >= 3:
                     break
-                time.sleep(2)
+                time.sleep(1.2)
                 continue
             if status in ("error", "virus", "dead"):
                 break
@@ -2226,6 +2274,14 @@ def _lang_rank(c, lang):
 # English) is not misread as dual-audio.
 _MULTI_AUDIO_TOKENS = {"DUAL", "MULTI"}
 _ENG_DECL_TOKENS = {"ENG", "ENGLISH", "ENGDUB", "DUBBED"}
+# A BARE "ENG"/"EN" token is the weakest English signal — it appears as one of
+# many language tags on multi-language releases. It only proves English-first
+# when nothing in the name declares a foreign language. MEASURED 2026-10-11:
+# "Obsession.(2025).WEB-DL.HDR.DV8.2160p.3xUkr.Eng" scored as
+# PROVEN-English-first (rank 0) although "3xUkr" is a THREE-Ukrainian-track
+# release — the bare "Eng" tag was matched and the Ukr majority ignored.
+# Spelled-out declarations (ENGLISH/ENGDUB/DUBBED) stay strong on their own.
+_STRONG_ENG_TOKENS = {"ENGLISH", "ENGDUB", "DUBBED"}
 _JPN_DECL_TOKENS = {"JPN", "JAPANESE", "JAP"}
 _NEVER_RANK = 3  # carries no accepted audio: never served, so never tried
 
@@ -2252,6 +2308,14 @@ def _audio_first_rank(c, accept):
     is deliberately conservative — it never overrides a proven verdict and an
     unmarked name stays in the neutral tier — because the probe and the try
     loop still decide what is actually returned.
+
+    Rank 0 ("the accepted audio is PROVEN first") therefore requires either a
+    real probed verdict of "fits" (an ffprobe that saw the accepted language as
+    stream[0]) or a name that declares it unambiguously. Untagged/"und" audio
+    is NEVER rank 0 — untagged is exactly what the probe reports when it could
+    not confirm the first track, so it stays rank 1 (acceptable, unconfirmed)
+    and never counts as proven. A bare ENG token next to a declared foreign
+    language is likewise not proof (see _STRONG_ENG_TOKENS).
     """
     accept = tuple(accept or ())
     if not accept:
@@ -2275,8 +2339,25 @@ def _audio_first_rank(c, accept):
         # already fits — an anime request demotes nothing for being JPN-first.
         return 0
     toks = set(re.split(r"[^A-Za-z0-9]+", name.upper()))
+    # Multi-language releases glue a TRACK COUNT onto the language tag
+    # ("3xUkr" = three Ukrainian tracks, "2xEng"): whole-token matching sees
+    # "3XUKR", which is in no token set, so the foreign majority was invisible
+    # (MEASURED: "...2160p.3xUkr.Eng" → 0). Expand the "Nx<LANG>" forms first.
+    xtoks = set(toks)
+    for t in toks:
+        m = re.match(r"^\d+X?(.+)$", t)
+        if m:
+            xtoks.add(m.group(1))
     multi_audio = bool(toks & _MULTI_AUDIO_TOKENS) and "AUDIO" in toks
-    eng_decl = bool(toks & _ENG_DECL_TOKENS)
+    eng_decl = bool(xtoks & _ENG_DECL_TOKENS)
+    # A bare ENG/EN next to a declared FOREIGN language does NOT prove
+    # English-first — the foreign tracks are the majority (measured:
+    # "...2160p.3xUkr.Eng" = three Ukrainian tracks + one English tag). Only a
+    # spelled-out English declaration (ENGLISH/ENGDUB/DUBBED) survives a
+    # competing foreign language token.
+    if (eng_decl and not (xtoks & _STRONG_ENG_TOKENS)
+            and bool(xtoks & (FOREIGN_NAME_TOKENS | _FOREIGN_LANG_WORDS))):
+        return 1  # acceptable, but the language is UNCONFIRMED — not "proven"
     if eng_decl and not multi_audio:
         return 0  # "English Dub" / "[ENG]" — English is very likely track 1
     if multi_audio or (toks & _JPN_DECL_TOKENS):
@@ -2445,7 +2526,11 @@ def _quality_rank_browser(c, codec=None, want_h=None):
         never outranked by the browser default.
 
     The cam floor is preserved in both branches so a cam can never outrank a
-    genuine release no matter which browser asks (see rule 1)."""
+    genuine release no matter which browser asks (see rule 1).
+
+    NOTE (2026-10-11): this rank is now only the FIDELITY component of the
+    primary key — `_primary_sanity` runs ahead of it so a nominal 4K cannot
+    outrank a browser-playable 1080p on resolution alone (see below)."""
     name = c.get("name", "")
     if _is_cam_release(name):
         return 0
@@ -2457,6 +2542,49 @@ def _quality_rank_browser(c, codec=None, want_h=None):
     target = want_h or _FIREFOX_SWEET_SPOT
     overshoot = 1 if h > target else 0
     return _FIREFOX_RANK_BASE - abs(h - target) - overshoot
+
+
+# ── plausibility in the PRIMARY key (not only the tail) ───────────────
+# MEASURED 2026-10-11: for a plain browser ask a 4K HEVC/x265 release used to
+# outrank a 1080p H.264 one, because resolution was the primary key and every
+# sanity check (size, tier, codec) lived in the TAIL — where it can never
+# demote a nominally-higher resolution. That is the measured cause of the
+# wrong-aspect / implausible-size picks (Micro4K upscales: a "2160p" name on a
+# ~2 GB file) and of heavy 4K HEVC streams a browser cannot keep up with.
+# These checks now run in the PRIMARY key, ahead of the fidelity tiebreak, so
+# resolution can only win among candidates that are plausible at all.
+_RES_MIN_GB = {2160: 3.5, 1440: 1.8, 1080: 0.7, 720: 0.25, 576: 0.15, 480: 0.08}
+
+
+def _res_size_sanity(h, gb):
+    """0 = the size is plausible for the claimed height; 2 = implausibly small
+    for that height (a Micro4K-style upscale / a mislabelled release);
+    1 = not enough information to judge (never a demotion on its own)."""
+    if h is None or gb is None:
+        return 1
+    mn = _RES_MIN_GB.get(h)
+    if mn is None:
+        return 1
+    return 2 if gb < mn else 0
+
+
+def _primary_sanity(c, codec, want_h):
+    """Plausibility tuple for the PRIMARY ordering key (lower = better):
+        (browser-codec sanity, size sanity, resolution/size sanity)
+    * browser-codec sanity: for a Chrome/unknown ask a 4K (or >1080p)
+      HEVC/x265 release is demoted below every H.264/AV1 release — the
+      measured wrong-aspect / implausible-size class. A Firefox ask
+      (codec="h264") never reaches here with HEVC: it is filtered out earlier
+      (see the h264_only prefilter in the walk).
+    * size sanity: _size_rank (sample / absurd size).
+    * resolution/size sanity: _res_size_sanity (upscale detection).
+    The cam floor still runs BEFORE this (it is the first key element), so a
+    cam can never be promoted by any of these checks."""
+    n = (c.get("name", "") or "").upper()
+    h = _release_height(n)
+    gb = _candidate_size_gb(c)
+    codec_bad = 1 if (codec != "h264" and _is_hevc_name(n) and (h or 0) > 1080) else 0
+    return (codec_bad, _size_rank(gb), _res_size_sanity(h, gb))
 
 
 def _candidate_order_key(c, want_h, lang, codec, accept=None):
@@ -2493,11 +2621,25 @@ def _candidate_order_key(c, want_h, lang, codec, accept=None):
     afr = _audio_first_rank(c, accept)
     quality = -_quality_rank_browser(c, codec, want_h)
     native = _audio_native_rank(c, accept)
+    # Plausibility is a PRIMARY key element now, not a tail tiebreak: a
+    # nominally-higher resolution that is implausible (4K HEVC for a plain
+    # browser ask, a "2160p" Micro4K-style upscale, an absurd/small size)
+    # must lose to a plausible lower-resolution release. See _primary_sanity.
+    plaus = _primary_sanity(c, codec, want_h)
+    # DETERMINISM (measured 2026-10-11): the candidate set carried 182
+    # candidates but only 170 distinct keys — 11 groups tied on everything,
+    # and their order was decided by SOURCE (fetch arrival) order, so the same
+    # request could return a different release run to run. `info_hash` is a
+    # stable, unique identifier, so it is the FINAL tiebreak: identical keys
+    # can no longer exist, and the picked release is reproducible. (Seeders
+    # still lead the popularity axis and can vary live — that is the intended
+    # popularity-first behaviour; this only removes the arbitrary tie.)
     tail = (_lang_rank(c, lang),
             _candidate_tier(c, codec, want_h),
             _size_rank(_candidate_size_gb(c)),
             -int(c.get("seeders") or 0),
-            codec_rank(c.get("name", ""), want_h))
+            codec_rank(c.get("name", ""), want_h),
+            (c.get("info_hash") or "").lower())
     if (lang or "").lower() == "dub":
         # ANIME DUB: the requested audio is a NON-DEFAULT alternate track, so
         # "which release can hand the player English first, without the remux?"
@@ -2508,14 +2650,14 @@ def _candidate_order_key(c, want_h, lang, codec, accept=None):
         # first) → 1 (untagged, unconfirmed) → 2 (needs the remux) → 3 (carries
         # no accepted audio). Quality still decides INSIDE each class, so the
         # owner's rule holds among candidates that can serve the dub at all.
-        return (cam, afr) + (quality, native) + tail
+        return (cam, afr) + plaus + (quality, native) + tail
     # MOVIE / TV / ANIME SUB: the requested language is the medium's default
     # (or JPN is accepted too), so quality stays primary — but a candidate that
     # cannot play as-is (needs the blocking remux, rank 2, or carries no
     # accepted audio at all, rank 3) is gated BELOW every candidate that can.
     # That is a correctness bound on rule 2, never a quality preference: it
     # merely stops an unusable-for-this-request release from leading the walk.
-    return (cam, 0 if afr <= 1 else 1, quality, afr, native) + tail
+    return (cam, 0 if afr <= 1 else 1, plaus, quality, afr, native) + tail
 
 
 def codec_rank(name, want_height=None):
@@ -2901,6 +3043,10 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
     # (the player's decode-error retry/cinesrc fallback handles it) — "no
     # stream" is worse.
     soft_hevc = {"url": None, "title": None}
+    # Snapshot the RD provider-block counters BEFORE any magnet add, so the
+    # failure paths can tell "the provider blocks every candidate (HTTP 451)"
+    # apart from "nothing resolved (uncached / no HD / all rejected)".
+    _block0 = _rd_block_snapshot()
 
     def _soft_hevc_result():
         if not soft_hevc["url"]:
@@ -3250,9 +3396,12 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
         if mf_remux is not None:
             url, c = mf_remux
             return {"url": url, "source": "mediafusion", "title": c.get("name", "")[:80], "imdb": imdb}
-        return _soft_hevc_result() or {
-            "error": "no stream available on real-debrid yet (try again in a few minutes)",
-            "imdb": imdb}
+        # Provider-wide block (HTTP 451) is reported DISTINCTLY — "try again in
+        # a few minutes" is actively misleading when RD refuses every candidate.
+        return (_rd_add_and_stream_error(imdb, *_block0)
+                or _soft_hevc_result()
+                or {"error": "no stream available on real-debrid yet (try again in a few minutes)",
+                    "imdb": imdb})
 
     # Remaining sources (APIBay / EZTV)
 
@@ -3384,8 +3533,9 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
     if account_remux is not None:
         url, c = account_remux
         return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
-    return _soft_hevc_result() or {
-        "error": "could not resolve via real-debrid (all candidates rejected)", "imdb": imdb}
+    return (_rd_add_and_stream_error(imdb, *_block0)
+            or _soft_hevc_result()
+            or {"error": "could not resolve via real-debrid (all candidates rejected)", "imdb": imdb})
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -3574,6 +3724,20 @@ class Handler(BaseHTTPRequestHandler):
     # The remux is cached to disk (keyed by RD file hash): first play remuxes,
     # later plays serve the cached file with full Range support (instant start,
     # seekable) — this is what makes dub playback fast in Firefox.
+    #
+    # KNOWN COST (measured 2026-10-11, NOT fixed here): this is the BLOCKING
+    # remux — it writes the WHOLE file (`-movflags faststart`) before serving a
+    # single byte. MEASURED: first byte at +58s for a 611 MB file; ~4.7 MB/s
+    # RD CDN → Pi, so a 6.8 GB episode extrapolates to ~26 min (the client
+    # aborts at 120s → the viewer sees "no stream available").
+    # The streaming fragmented-MP4 variant (`-movflags frag_keyframe+empty_moov
+    # -f mp4 pipe:1`, first bytes in ~3.4s) is deliberately NOT restored: the
+    # last attempt broke playback ("loads then fails", commit 00ff8e4) and it
+    # has never been verified by ACTUALLY PLAYING a video end to end. It MUST
+    # stay disabled until that verification exists — a working blocking remux
+    # beats a faster one that serves nothing. Callers should prefer the
+    # as-is path (`plan in ("fits","unknown")` → 302) so this branch is only
+    # reached for dual-audio files that genuinely need it.
     def do_GET_track(self, q):
         import subprocess as _sp
         import urllib.parse as _up

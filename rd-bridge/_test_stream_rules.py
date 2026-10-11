@@ -90,6 +90,11 @@ check("rule1d: 480p WEB ordered before 480p cam",
       "WEB" in o4[0]["name"].upper() and s._is_cam_release(o4[-1]["name"]))
 
 # ── RULE 2: highest fidelity first ──────────────────────────────────
+# …with the 2026-10-11 caveat: for a plain browser ask a 4K HEVC/x265 must NOT
+# outrank a 1080p H.264 (the measured wrong-aspect / implausible-size class,
+# incl. Micro4K upscales). Plausibility is a PRIMARY key element now, so the
+# 2160p HEVC release here is demoted below every H.264 one; among the H.264
+# releases fidelity still decides.
 mix = [
     C("Movie.2024.720p.WEB-DL.H264"),
     C("Movie.2024.480p.DVDRip.XviD"),
@@ -99,11 +104,33 @@ mix = [
 ]
 om = sorted(mix, key=lambda c: s._candidate_order_key(c, None, None, None))
 order_names = [c["name"] for c in om]
-check("rule2: 2160 first", "2160p" in order_names[0])
-check("rule2: 1080 second", "1080p" in order_names[1])
-check("rule2: 720 third", "720p" in order_names[2])
-check("rule2: 480 fourth", "480p" in order_names[3])
-check("rule2: unmarked last (no cam present)", "WEB-DL.x264" in order_names[4] and order_names[4].endswith("x264"))
+check("rule2: 1080p H.264 first (4K HEVC demoted)", "1080p" in order_names[0])
+check("rule2: 720p second", "720p" in order_names[1])
+check("rule2: 480p third", "480p" in order_names[2])
+check("rule2: unmarked fourth (no cam present)",
+      "WEB-DL.x264" in order_names[3] and order_names[3].endswith("x264"))
+check("rule2: 4K HEVC/2160p LAST for a plain browser ask", "2160p" in order_names[4])
+
+# 4K H.264 (a browser CAN decode it) still wins on fidelity — the demotion is
+# about the CODEC + height, not about 4K per se.
+mix_h264_4k = [
+    C("Movie.2024.2160p.WEB-DL.H264", seeders=1, size_gb=9.0),
+    C("Movie.2024.1080p.WEB-DL.H264", seeders=5000, size_gb=3.0),
+]
+o4k = sorted(mix_h264_4k, key=lambda c: s._candidate_order_key(c, None, None, None))
+check("quality: 4K H.264 still outranks 1080p H.264 (no over-demotion)",
+      "2160p" in o4k[0]["name"])
+
+# A "2160p" release whose size is implausible for 2160p (a Micro4K-style
+# upscale) must lose to a plausible 1080p even though its name says 4K.
+upscale = [
+    C("Movie.2024.2160p.WEB-DL.H265.Micro4K", size_gb=2.0),
+    C("Movie.2024.1080p.WEB-DL.H264", size_gb=5.0),
+]
+ous = sorted(upscale, key=lambda c: s._candidate_order_key(c, None, None, None))
+check("quality: Micro4K upscale loses to a plausible 1080p", "1080p" in ous[0]["name"])
+check("sanity: implausible size flagged below the 2160p threshold",
+      s._res_size_sanity(2160, 2.0) == 2 and s._res_size_sanity(2160, 12.0) == 0)
 
 # cam is a floor: it must never appear above ANY non-cam, whatever the tokens
 mix2 = [C("Movie.2024.2160p.HDCAM.HEVC"), C("Movie.2024.480p.WEB-DL.H264")]
@@ -211,6 +238,69 @@ s._cand_verdict_set(probed2, ("eng",), "fits")
 check("fit: probe verdict (fits) outranks a 'dual-audio' name", s._audio_first_rank(probed2, ("eng",)) == 0)
 s._cand_verdict_set(probed2, ("eng",), "reject")
 check("fit: probe verdict (reject) is never tried again", s._audio_first_rank(probed2, ("eng",)) == 3)
+
+# ── DETERMINISM: identical request → identical pick ─────────────────
+# MEASURED 2026-10-11: 182 candidates produced only 170 distinct order keys —
+# 11 tie groups whose order was decided by SOURCE (fetch arrival) order, so the
+# same request could return a different release run to run. info_hash is now
+# the FINAL key element, so keys are unique and the order is reproducible.
+import random as _rnd
+tie_set = [C(f"Show.2024.1080p.WEB-DL.H264-GRP{i}", seeders=100) for i in range(12)]
+for _i, _c in enumerate(tie_set):  # unique, stable hashes: the ONLY difference
+    _c["info_hash"] = f"{_i:040x}"
+tie_set[1]["info_hash"] = tie_set[1]["info_hash"].upper()  # case-insensitive
+_keys = [s._candidate_order_key(c, None, None, None) for c in tie_set]
+check("determinism: keys are unique even for otherwise-identical candidates",
+      len(set(_keys)) == len(_keys))
+check("determinism: final key element is the lowercased info_hash",
+      all(k[-1] == (c.get("info_hash") or "").lower() for k, c in zip(_keys, tie_set)))
+_base = [c["info_hash"] for c in sorted(tie_set, key=lambda c: s._candidate_order_key(c, None, None, None))]
+_stable = True
+for _ in range(8):
+    _shuf = tie_set[:]
+    _rnd.shuffle(_shuf)
+    if [c["info_hash"] for c in sorted(_shuf, key=lambda c: s._candidate_order_key(c, None, None, None))] != _base:
+        _stable = False
+        break
+check("determinism: same set shuffled 8x → identical order", _stable)
+
+# ── AUDIO: a bare ENG token next to a foreign majority is NOT proof ──
+# MEASURED bug: '…HDR.DV8.2160p.3xUkr.Eng' scored as PROVEN-English-first
+# (rank 0) although the name declares three Ukrainian tracks.
+check("audio: bare ENG + foreign majority is NOT proven-English-first",
+      s._audio_first_rank(C("Obsession.(2025).WEB-DL.HDR.DV8.2160p.3xUkr.Eng"), ("eng",)) == 1)
+check("audio: unopposed bare ENG still proves English-first",
+      s._audio_first_rank(C("Movie.2024.1080p.WEB-DL.H264.Eng"), ("eng",)) == 0)
+check("audio: unopposed bare .ENG tag still proves English-first",
+      s._audio_first_rank(C("Movie.2024.1080p.WEB-DL.ENG"), ("eng",)) == 0)
+check("audio: bare ENG + spelled-out foreign language is not proof",
+      s._audio_first_rank(C("Movie.2024.1080p.WEB-DL.SPANISH.Eng"), ("eng",)) == 1)
+check("audio: a spelled-out English declaration survives a foreign tag",
+      s._audio_first_rank(C("Movie.2024.1080p.SPANISH.ENGLISH.Dub"), ("eng",)) == 0)
+# untagged/und can never be rank 0 (proven) — the probe reports "unknown"
+_untagged = C("Show.2024.1080p.WEB-DL")
+s._cand_verdict_set(_untagged, ("eng",), "unknown")
+check("audio: probe-untagged is rank 1 (unconfirmed), never 'proven'",
+      s._audio_first_rank(_untagged, ("eng",)) == 1)
+
+# ── RD 451: reported distinctly, never as "try again in a few minutes" ──
+import urllib.error as _ue
+check("rd451: _is_451 detects HTTP 451",
+      s._is_451(_ue.HTTPError("u", 451, "Unavailable For Legal Reasons", None, None)) is True)
+check("rd451: _is_451 ignores other HTTP errors",
+      s._is_451(_ue.HTTPError("u", 403, "Forbidden", None, None)) is False)
+check("rd451: _is_451 ignores non-HTTP exceptions", s._is_451(RuntimeError("x")) is False)
+_saved_stats = dict(s._rd_block_stats)
+s._rd_block_stats["adds"] = 5
+s._rd_block_stats["n451"] = 5
+_err = s._rd_add_and_stream_error("tt33764258", 0, 0)
+check("rd451: every fresh add 451 → distinct 'blocked by the provider' error",
+      bool(_err) and _err.get("blocked") is True
+      and "451" in _err.get("error", "") and "try again" not in _err.get("error", ""))
+s._rd_block_stats["n451"] = 2
+check("rd451: a partial block does NOT claim the whole title is blocked",
+      s._rd_add_and_stream_error("tt33764258", 0, 0) is None)
+s._rd_block_stats.update(_saved_stats)
 
 # ── CAM WARNING FLAG: the player must warn, never block ─────────────
 # _tag_cam marks the resolve result when the SELECTED release is a cam so the

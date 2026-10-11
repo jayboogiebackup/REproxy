@@ -814,6 +814,235 @@ def _remux_recently_failed(file_id, ttl=60):
     return bool(ts and time.time() - ts < ttl)
 
 
+# ── streaming remux jobs (BEHIND A FLAG, OFF BY DEFAULT) ─────────────────
+# The default track path is the BLOCKING remux: buffer the whole file to disk
+# with `-movflags faststart`, then serve it with Content-Length + full Range.
+# It is correct and seekable, but it serves ZERO bytes until the entire file
+# has been copied (MEASURED 2026-10-11: +58s for a 611 MB file at 4.39 MB/s;
+# a 6.8 GB episode extrapolates to ~24-26 min, and the player aborts at 120s).
+#
+# The streaming variant below removes that wait: ffmpeg emits a fragmented MP4
+# (frag_keyframe+empty_moov, no Content-Length) and the request streams the
+# GROWING temp file to the client as bytes appear (measured ~3.4s to the first
+# 2 MB). A background job owns ffmpeg, so it survives a client disconnect and
+# still fills the disk cache; the next play is served from the cache with full
+# Range/seek support.
+#
+# WHY IT IS OFF BY DEFAULT: an earlier ship of exactly this code (commit
+# de847df) was reverted (00ff8e4, "loads then fails") because the client sent
+# the track request through the CF relay → Vercel REproxy chain, which buffers
+# and strips Accept-Ranges and destroyed the live stream. The client is now
+# DIRECT-FIRST (browser → https://rd.repeaks.xyz/api/rd/track), which is the
+# missing half. Even so: per verification-and-testing.md §5, this path is only
+# ever switched on after a REAL end-to-end play (first frame AND a seek) has
+# been observed. Until `BRIDGE_STREAMING_REMUX=1` is set in the environment,
+# `do_GET_track` keeps using the blocking remux — a working slow path beats a
+# faster one that serves nothing.
+#
+# NOTE: read at CALL time, not as a module constant. The .env loader lives far
+# below (near RD_KEY), so a module-level `os.environ.get` here would always see
+# the default and `BRIDGE_STREAMING_REMUX=1` in .env would silently do nothing.
+STREAMING_REMUX_ENV = "BRIDGE_STREAMING_REMUX"
+
+
+def streaming_remux_enabled():
+    """True when the flag-gated streaming remux is switched on."""
+    return os.environ.get(STREAMING_REMUX_ENV, "0").strip() == "1"
+
+_REMUX_JOBS = {}              # file_id -> {"tmp","cache","done","ok","size","proc"}
+_REMUX_JOBS_GUARD = threading.Lock()
+_REMUX_JOB_STALE = 3 * 3600   # sweep .tmp orphaned by a process killed mid-remux
+_REMUX_STALL_BAIL = 90        # no new bytes for this long ⇒ end the response
+
+
+def _remux_job_sweep(cache_dir):
+    """Delete .tmp files orphaned by a killed process (service restart mid-remux)."""
+    now = time.time()
+    try:
+        for fn in os.listdir(cache_dir):
+            if fn.endswith(".tmp"):
+                p = os.path.join(cache_dir, fn)
+                try:
+                    if now - os.path.getmtime(p) > _REMUX_JOB_STALE:
+                        os.unlink(p)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _remux_job_start_or_attach(file_id, tmp_path, cache_path, raw_url, lang,
+                               cache_dir):
+    """Start the background remux job for this RD file id, or attach to the one
+    already running. Returns (job, status): "started", "attached" (the job is
+    already filling the SAME .tmp — never start a second multi-GB ffmpeg) or
+    "busy" (global ffmpeg slot cap reached → the caller answers 429)."""
+    with _REMUX_JOBS_GUARD:
+        job = _REMUX_JOBS.get(file_id)
+        if job is not None and not job["done"].is_set():
+            return job, "attached"
+        if not _acquire_slot():
+            return None, "busy"
+        job = {"tmp": tmp_path, "cache": cache_path, "done": threading.Event(),
+               "ok": False, "pos": 0, "proc": None}
+        _REMUX_JOBS[file_id] = job
+    _remux_job_sweep(cache_dir)
+    threading.Thread(target=_remux_job_run, args=(file_id, job, raw_url, lang),
+                     daemon=True).start()
+    return job, "started"
+
+
+def _remux_job_run(file_id, job, raw_url, lang):
+    """The background remux. Owns ffmpeg + the .tmp file for its whole life, so
+    a client disconnect cannot abort it — the cache still fills. Writes the
+    fragmented MP4 to .tmp, then `os.replace`s it to the real cache name on a
+    clean exit; a failure marks the file id so the next request fails fast
+    instead of re-running a doomed remux."""
+    import subprocess as _sp
+    proc = None
+    out = None
+    ok = False
+    try:
+        cmd = ["ffmpeg", "-v", "error", "-y", "-i", raw_url,
+               "-map", "0:v:0", "-map", f"0:a:m:language:{lang}",
+               "-c", "copy", "-strict", "-2",
+               "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"]
+        proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL)
+        job["proc"] = proc
+        out = open(job["tmp"], "wb")
+        po = proc.stdout
+        if po is None:  # stdout=PIPE, so this cannot happen — typing guard
+            raise RuntimeError("ffmpeg stdout unavailable")
+        while True:
+            chunk = po.read(65536)
+            if not chunk:
+                break
+            try:
+                out.write(chunk)
+                out.flush()
+            except Exception:
+                pass
+            # `pos` is the reader-visible high-water mark; the bytes are already
+            # flushed to the .tmp, so a streaming reader can serve them now.
+            job["pos"] += len(chunk)
+        rc = proc.wait(timeout=120)
+        ok = (rc == 0 and job["pos"] > 0)
+    except Exception:
+        ok = False
+    finally:
+        try:
+            if out:
+                out.close()
+        except Exception:
+            pass
+        try:
+            if proc and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+        _release_slot()
+        if ok:
+            try:
+                os.replace(job["tmp"], job["cache"])
+            except Exception:
+                ok = False
+        if not ok:
+            _remux_mark_failed(file_id)
+            try:
+                if os.path.exists(job["tmp"]):
+                    os.unlink(job["tmp"])
+            except Exception:
+                pass
+        job["ok"] = ok
+        job["done"].set()
+        with _REMUX_JOBS_GUARD:
+            if _REMUX_JOBS.get(file_id) is job:
+                del _REMUX_JOBS[file_id]
+
+
+def _serve_streaming_remux(handler, job, cache_path, tmp_path, file_id):
+    """Stream the job's growing file to the client (the streaming-remux branch).
+
+    Traps this handles (each cost a session to learn):
+      * `os.replace(tmp, cache)` MOVES the file out from under a lagging client.
+        So read from `cache_path` if it exists, else `tmp_path` — and only end
+        the response when the job is done AND pos has reached the FINAL size.
+        Ending on "the tmp is gone" truncates a client that was behind.
+      * A live stream has no known total size, so a 206 is impossible: honour
+        the Range OFFSET if the job has already written past it, but answer 200
+        with `Accept-Ranges: none` + `Connection: close` so the browser does not
+        treat it as seekable (seeks work on the NEXT play, from the cache).
+      * NEVER kill ffmpeg on client abort — the job must outlive the request.
+        A broken pipe only ends this response.
+      * A no-growth stall bail so a wedged RD read cannot hold the socket open.
+    """
+    start_at = 0
+    _rm = re.match(r"\s*bytes=(\d+)-\s*$", handler.headers.get("Range", "") or "")
+    if _rm:
+        start_at = int(_rm.group(1))
+    handler.send_response(200)
+    handler.send_header("Content-Type", "video/mp4")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Accept-Ranges", "none")
+    handler.send_header("Connection", "close")
+    handler.send_header("Access-Control-Allow-Origin", handler._acao())
+    handler.send_header("Vary", "Origin")
+    handler.end_headers()
+    # BaseHTTPRequestHandler here is HTTP/1.0, so a body with no Content-Length
+    # is framed by connection close — that is what makes the live stream legal.
+    handler.close_connection = True
+    pos = start_at
+    stalled_since = time.time()
+    client_gone = False
+    try:
+        while True:
+            src = cache_path if os.path.exists(cache_path) else (
+                tmp_path if os.path.exists(tmp_path) else None)
+            fsz = pos
+            if src is not None:
+                try:
+                    fsz = os.path.getsize(src)
+                except OSError:
+                    fsz = pos
+            if src is not None and fsz > pos:
+                try:
+                    with open(src, "rb") as f:
+                        f.seek(pos)
+                        data = f.read(min(1 << 20, fsz - pos))
+                except OSError:
+                    data = b""
+                if data:
+                    pos += len(data)
+                    try:
+                        handler.wfile.write(data)
+                        handler.wfile.flush()
+                    except Exception:
+                        # Client went away (BrokenPipe/Reset): end THIS response,
+                        # leave the background job filling the cache.
+                        client_gone = True
+                        break
+                    stalled_since = time.time()
+                    continue
+            if job["done"].is_set():
+                if src == cache_path:
+                    try:
+                        total = os.path.getsize(cache_path)
+                    except OSError:
+                        total = pos
+                    if pos >= total:
+                        break  # complete file fully delivered
+                    continue
+                break  # job failed / .tmp gone — end the stream honestly
+            if time.time() - stalled_since > _REMUX_STALL_BAIL:
+                _audit(f"track streaming remux stalled file_id={file_id}")
+                break
+            time.sleep(0.15)
+    finally:
+        if client_gone:
+            _audit(f"track client left — streaming remux keeps filling "
+                   f"cache file_id={file_id}")
+
+
 def audio_codec_is_browser_safe(url, ttl=3600, filename_hint=None):
     """Probe the file's audio codec via ffprobe (header-only, ~3s, cached).
     Returns True when the audio will play in browsers (AAC/MP3/Opus/Vorbis/
@@ -3725,19 +3954,22 @@ class Handler(BaseHTTPRequestHandler):
     # later plays serve the cached file with full Range support (instant start,
     # seekable) — this is what makes dub playback fast in Firefox.
     #
-    # KNOWN COST (measured 2026-10-11, NOT fixed here): this is the BLOCKING
-    # remux — it writes the WHOLE file (`-movflags faststart`) before serving a
-    # single byte. MEASURED: first byte at +58s for a 611 MB file; ~4.7 MB/s
+    # KNOWN COST of the DEFAULT path (measured 2026-10-11): the blocking remux
+    # writes the WHOLE file (`-movflags faststart`) before serving a single
+    # byte. MEASURED: first byte at +58s for a 611 MB file; ~4.7 MB/s
     # RD CDN → Pi, so a 6.8 GB episode extrapolates to ~26 min (the client
     # aborts at 120s → the viewer sees "no stream available").
     # The streaming fragmented-MP4 variant (`-movflags frag_keyframe+empty_moov
-    # -f mp4 pipe:1`, first bytes in ~3.4s) is deliberately NOT restored: the
-    # last attempt broke playback ("loads then fails", commit 00ff8e4) and it
-    # has never been verified by ACTUALLY PLAYING a video end to end. It MUST
-    # stay disabled until that verification exists — a working blocking remux
-    # beats a faster one that serves nothing. Callers should prefer the
-    # as-is path (`plan in ("fits","unknown")` → 302) so this branch is only
-    # reached for dual-audio files that genuinely need it.
+    # -f mp4 pipe:1`, first bytes in ~3.4s) is now implemented and gated behind
+    # `BRIDGE_STREAMING_REMUX` (STREAMING_REMUX above), default OFF. It was
+    # shipped once (de847df) and reverted (00ff8e4, "loads then fails") because
+    # the client routed the track request through the CF relay → Vercel chain,
+    # which buffers/strips Accept-Ranges; the client is now direct-first, which
+    # removes that cause. It is still ONLY enabled after a real end-to-end play
+    # (first frame AND seek) is observed — a working blocking remux beats a
+    # faster one that serves nothing. Callers should prefer the as-is path
+    # (`plan in ("fits","unknown")` → 302) so this branch is only reached for
+    # dual-audio files that genuinely need it.
     def do_GET_track(self, q):
         import subprocess as _sp
         import urllib.parse as _up
@@ -3844,6 +4076,25 @@ class Handler(BaseHTTPRequestHandler):
         # NOT a live stream. First play waits for the remux; later plays hit
         # the cache instantly with full Range support.
         tmp_path = cache_path + ".tmp"
+        # ── STREAMING REMUX — FLAG-GATED, OFF BY DEFAULT (see STREAMING_REMUX)
+        # Same ffmpeg copy, but the client is served the bytes AS THEY APPEAR
+        # (fragmented MP4, no Content-Length) instead of waiting for the whole
+        # multi-GB file. A background job owns ffmpeg so the disk cache still
+        # completes even if the viewer leaves. Only enabled after real playback
+        # evidence (first frame + seek) — the blocking path below is the default.
+        if streaming_remux_enabled():
+            if os.path.exists(cache_path):
+                pass  # a job finished while we were checking — fall through to the cache serve below
+            else:
+                if _remux_recently_failed(file_id):
+                    return self._json({"error": f"no {lang} audio track — remux failed"}, 502)
+                job, status = _remux_job_start_or_attach(
+                    file_id, tmp_path, cache_path, raw_url, lang, cache_dir)
+                if status == "busy":
+                    return self._json({"error": "busy"}, 429, {"Retry-After": "15"})
+                if job is None:  # cannot happen (busy handled above) — typing guard
+                    return self._json({"error": "remux unavailable"}, 500)
+                return _serve_streaming_remux(self, job, cache_path, tmp_path, file_id)
         with _remux_lock(file_id):
             # Another request may have finished the remux while we waited.
             if os.path.exists(cache_path):

@@ -10,6 +10,17 @@ os.environ.setdefault("TMDB_API_KEY", "test-key")
 
 import server as s  # noqa: E402
 
+# ── hermetic probe-verdict cache ────────────────────────────────────
+# The candidate probe verdicts are keyed by info_hash and PERSISTED to the very
+# file the live bridge reads (.cand_verdict_cache.json). The synthetic
+# candidates below carry 6-char hashes ("show.2", "[grp] "), so a run of this
+# script would write its own verdicts into that shared cache — and the NEXT run
+# would read them back, overriding the filename hints the checks below assert
+# on. Isolate the cache: start empty, never load, never save.
+s._cand_verdict = {}
+s._cand_verdict_load = lambda: None
+s._cand_verdict_save = lambda: None
+
 FAILED = []
 
 
@@ -159,6 +170,79 @@ check("firefox: explicit quality=480 puts 480p top", "480p" in of480[0])
 # …while Chrome stays strictly highest-quality-first even with an explicit pick
 oc480 = [c["name"] for c in sorted(ladder, key=lambda c: s._candidate_order_key(c, 480, None, None))]
 check("chrome: explicit quality=480 does NOT override strict order", "2160p" in oc480[0])
+
+# ── RULE 3: a release that PLAYS AS-IS is preferred over a remux ────
+# MEASURED: Mushoku Tensei S1E1 resolved to a [Opus 2.0][AV1] dual-audio
+# release whose first track is Japanese → the English ask paid the ffmpeg
+# remux: TTFB 22.2s, no first byte in 150s → "no stream available".
+check("fit: dual-audio name is a remux risk", s._audio_first_rank(C("[Grp] Show S01 [Dual-Audio] [1080p]"), ("eng",)) == 2)
+check("fit: multi-audio name is a remux risk", s._audio_first_rank(C("[Grp] Show S01 (Multi-Audio) 1080p"), ("eng",)) == 2)
+check("fit: Japanese release is a remux risk for an English ask",
+      s._audio_first_rank(C("[Grp] Show S01 [Japanese] 1080p"), ("eng",)) == 2)
+check("fit: English dub name plays as-is",
+      s._audio_first_rank(C("[Grp] Show S01 [English Dub] [WEB-DL]"), ("eng",)) == 0)
+check("fit: unmarked name is neutral (unknown)",
+      s._audio_first_rank(C("[Grp] Show S01 [1080p]"), ("eng",)) == 1)
+check("fit: multi-SUBS is not read as multi-audio",
+      s._audio_first_rank(C("Show.2024.1080p.MULTi.Subs.AAC.x264"), ("eng",)) == 1)
+check("fit: foreign-only release is never tried",
+      s._audio_first_rank(C("Show.2024.1080p.SPANISH.DUBBED"), ("eng",)) == 3)
+check("fit: anime (jpn accepted) demotes nothing for being JPN-first",
+      s._audio_first_rank(C("[Grp] Show S01 [Dual-Audio] 1080p"), ("jpn", "eng")) == 0)
+
+# a fitting release outranks a higher-quality one that would need the remux
+fitmix = [
+    C("Show.2024.1080p.WEB-DL.x265.Dual-Audio-GROUP", seeders=999),
+    C("Show.2024.720p.WEB-DL.H264.English-Dub-GROUP", seeders=1),
+]
+ofit = sorted(fitmix, key=lambda c: s._candidate_order_key(c, None, None, None, ("eng",)))
+check("fit: 720p that plays beats 1080p that needs a remux", "Dub" in ofit[0]["name"])
+# …but for an ANIME request (jpn accepted) the dual-audio release is fine, so
+# the quality rule is untouched: 1080p still comes first.
+ofit_anime = sorted(fitmix, key=lambda c: s._candidate_order_key(c, None, None, None, ("jpn", "eng")))
+check("fit: anime keeps quality-first (dual-audio 1080p still first)", "1080p" in ofit_anime[0]["name"])
+
+# a PROBED verdict outranks the filename hint (the name may not say it)
+probed = C("Show.2024.1080p.WEB-DL.x265-GROUP")
+s._cand_verdict_set(probed, ("eng",), "remux")
+check("fit: probe verdict (remux) outranks a neutral name", s._audio_first_rank(probed, ("eng",)) == 2)
+probed2 = C("[Grp] Show S01 [Dual-Audio] 1080p")
+s._cand_verdict_set(probed2, ("eng",), "fits")
+check("fit: probe verdict (fits) outranks a 'dual-audio' name", s._audio_first_rank(probed2, ("eng",)) == 0)
+s._cand_verdict_set(probed2, ("eng",), "reject")
+check("fit: probe verdict (reject) is never tried again", s._audio_first_rank(probed2, ("eng",)) == 3)
+
+# ── CAM WARNING FLAG: the player must warn, never block ─────────────
+# _tag_cam marks the resolve result when the SELECTED release is a cam so the
+# player can raise its warning popup. It must only ever fire on a real cam
+# marker, and must never fire on a clean HD release.
+camres = {"url": "https://cdn.example/Movie.2024.1080p.HDCAM.x264-GROUP.mkv",
+          "title": "Movie.2024.1080p.HDCAM.x264-GROUP"}
+s._tag_cam(camres)
+check("cam flag: set for a cam release name", camres.get("cam") is True)
+
+cleanres = {"url": "https://cdn.example/Movie.2024.1080p.WEB-DL.DDP5.1.H264-GROUP.mkv",
+            "title": "Movie.2024.1080p.WEB-DL.DDP5.1.H264-GROUP"}
+s._tag_cam(cleanres)
+check("cam flag: NOT set for a clean HD release", "cam" not in cleanres)
+
+# the filename inside the RD URL is the fallback signal (account-library path
+# carries a title-only match, so the stored file's own name decides)
+urlonly = {"url": "https://cdn.example/Movie.2024.TELESYNC.XviD-AVID.mkv",
+           "title": "Some Movie (from account)"}
+s._tag_cam(urlonly)
+check("cam flag: set from the RD URL filename when the title proves nothing",
+      urlonly.get("cam") is True)
+
+# a legit DTS audio codec must NOT trip the cam flag (the tokeniser trap)
+dtsres = {"url": "https://cdn.example/Movie.2024.1080p.BluRay.DTS.x264-GROUP.mkv",
+          "title": "Movie.2024.1080p.BluRay.DTS.x264-GROUP"}
+s._tag_cam(dtsres)
+check("cam flag: DTS audio codec is not a cam", "cam" not in dtsres)
+
+# a resolve with no url is never tagged
+s._tag_cam({"error": "no stream available"})
+check("cam flag: no-url result untouched", True)
 
 print()
 if FAILED:

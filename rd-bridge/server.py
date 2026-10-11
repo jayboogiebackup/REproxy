@@ -428,7 +428,7 @@ FOREIGN_NAME_TOKENS = {
     "UKR", "NLD", "DUT", "SWE", "NOR", "HUN", "RON", "ELL", "BUL", "HRV",
     "SRP", "SLO", "CES", "CZE", "HEB", "THA", "VIE", "TUR", "HIN", "ARA",
     "ZHO", "KOR", "BEN", "TAM", "TEL", "MSA", "LATINO", "CASTELLANO",
-    "ESPANOL", "SUBTITULADO", "SUBTITULADA", "DUBBED",
+    "ESPANOL", "SUBTITULADO", "SUBTITULADA",
     # ── added 2026-10-11 (seen in the live resolve cache / Torrentio sets) ──
     # MEASURED misses that let foreign dubs through: "Lanterns.S01E01-E02.
     # 1080p.Ru.Ultradox" (RU) and "Breaking Bad (Integrale) VOSTFR + FRENCH
@@ -446,6 +446,15 @@ FOREIGN_NAME_TOKENS = {
     # false positive came from loose matching ("The Italian Job").
     "RU", "VFF", "VFQ", "VF", "TRUEFRENCH", "GERDUB", "SPANIS",
     "ITADUB", "SPADUB", "FRDUB", "RUDUB", "DUBLADO",
+    # NOTE: "DUBBED" is deliberately NOT a foreign-audio token here. On its own
+    # it is an ENGLISH declaration — "Mushoku.Tensei.S01E01.DUBBED.XviD-AFG" is
+    # a genuine English dub release, and holding "DUBBED" as a foreign marker
+    # hard-rejected exactly the releases a dub request needs (MEASURED on
+    # tt13293588: that torrent was the only explicitly-DUBBED candidate and
+    # _foreign_only_name buried it at rank 3 = never tried, while _ENG_DECL_
+    # TOKENS already counts "DUBBED" as an English signal). It only announces
+    # FOREIGN audio when the name also spells the language out — see
+    # _FOREIGN_LANG_WORDS / _foreign_only_name ("...1080p.SPANISH.DUBBED").
     # NOTE: "VOSTFR" is deliberately NOT here. VOSTFR (version originale
     # sous-titrée en français) describes FRENCH SUBTITLES over the ORIGINAL
     # audio — usually English. Treating it as a foreign-audio marker rejected
@@ -453,6 +462,14 @@ FOREIGN_NAME_TOKENS = {
 }
 ENGLISH_NAME_TOKENS = {"ENG", "ENGLISH", "EN", "MULTI", "DUAL", "MULTIAUDIO",
                        "DUALAUDIO", "ENGDUB", "VOSTENG"}
+# Spelled-out language words that turn a bare "DUBBED" into a FOREIGN-audio
+# marker ("1080p.SPANISH.DUBBED", "LATINO.DUBBED"). Kept OUT of
+# FOREIGN_NAME_TOKENS on purpose: those words are common inside English titles
+# ("The Italian Job"), so they are only ever consulted next to "DUBBED", where
+# the release is unambiguously announcing WHICH dub it carries.
+_FOREIGN_LANG_WORDS = {"SPANISH", "CASTELLANO", "LATINO", "ESPANOL", "ITALIAN",
+                       "PORTUGUESE", "PORTUGUES", "FRENCH", "GERMAN", "RUSSIAN",
+                       "VFF", "VFQ", "TRUEFRENCH"}
 
 
 def _foreign_only_name(name):
@@ -461,7 +478,12 @@ def _foreign_only_name(name):
     if not name:
         return False
     toks = set(re.split(r"[^A-Za-z0-9]+", name.upper()))
-    if not (toks & FOREIGN_NAME_TOKENS):
+    foreign = bool(toks & FOREIGN_NAME_TOKENS)
+    if not foreign and "DUBBED" in toks:
+        # a bare "DUBBED" is English; only a *qualified* dub ("SPANISH.DUBBED")
+        # is foreign (see _FOREIGN_LANG_WORDS)
+        foreign = bool(toks & _FOREIGN_LANG_WORDS)
+    if not foreign:
         return False
     return not (toks & ENGLISH_NAME_TOKENS)
 
@@ -2134,33 +2156,59 @@ def _candidate_order_key(c, want_h, lang, codec, accept=None):
     # Rule 1 (cam never above HD) is enforced structurally: the cam flag is the
     # FIRST key (1 = cam, so it sorts last ascending), so even a cam that
     # claims "2160p" sorts below a 480p WEB.
-    # Key 2 is the OWNER'S RULE: QUALITY FIRST — highest fidelity wins, always
-    # ("always pick the highest quality stream first then go down the list").
-    # A FIREFOX ask is the one deliberate exception (1080p-first for smooth
-    # playback); see _quality_rank_browser.
-    # Key 3 is the WITHIN-TIER audio-fit preference, and only that: inside the
-    # SAME resolution tier a release whose accepted audio already IS its first
-    # track streams immediately, while one that stores the wanted audio second
-    # only survives via the blocking ffmpeg remux (MEASURED: 22.2s to first
-    # byte and no completion in 150s for Mushoku Tensei S1E1 → "no stream
-    # available"). Key 4 prefers a native-compatible SURROUND track so a
-    # proper 5.1 that decodes natively wins over a stereo name inside the same
-    # tier ("bad sound"). Language, browser-safety tier, size sanity,
-    # popularity and codec_rank break the remaining ties.
+    # Rule 2 (the owner's rule) is QUALITY FIRST — highest fidelity wins among
+    # candidates that can actually be served for THIS request ("always pick the
+    # highest quality stream first then go down the list"). A FIREFOX ask is the
+    # one deliberate exception (1080p-first for smooth playback); see
+    # _quality_rank_browser.
+    # Rule 3 (audio playability, restored 2026-10-11) bounds rule 2: a candidate
+    # that cannot hand the player the requested audio AS-IS is never allowed to
+    # outrank one that can. See the two branches below.
     #
-    # REGRESSION FIXED 2026-10-11: _audio_first_rank was key #2, ABOVE fidelity,
-    # so a 720p AAC release outranked a 1080p Opus one and a stereo name beat a
-    # proper 5.1 one — the "a lot of shows are low quality with bad sound"
-    # report. It is now a within-tier tiebreak (keys 3/4), never a quality veto.
-    return (1 if _is_cam_release(c.get("name", "")) else 0,
-            -_quality_rank_browser(c, codec, want_h),
-            _audio_first_rank(c, accept or ("eng",)),
-            _audio_native_rank(c, accept or ("eng",)),
-            _lang_rank(c, lang),
+    # HISTORY (do not re-break): 7971d86 demoted the audio-fit rank
+    # (_audio_first_rank) to a within-quality TIEBREAK. The MEASURED consequence
+    # for an ANIME DUB ask (accept=("eng",)) — its own test pinned the rule and
+    # failed: "fit: 720p that plays beats 1080p that needs a remux" — was that
+    # the whole candidate ladder is ordered by resolution first, and the dub
+    # walk then leads with high-resolution releases whose FIRST track is
+    # Japanese (fansubs / dual-audio). MEASURED on Mushoku Tensei S1E1
+    # (tt13293588, 50 candidates): the only release that carries English FIRST
+    # ("[Yameii-Unofficial] … [English Dub] [FUNi WEB-DL]") sorted at position
+    # 36/50, far past the point the walk gives up (MAX_FITS_BATCHES=5 → ≤15
+    # candidates once a remux fallback is in hand). The resolve therefore spent
+    # 69s and returned the 1080p dual-audio REMUX; the player routes a dub to
+    # /api/rd/track, which must pull the entire multi-GB file before it can
+    # serve a byte (MEASURED: 22.2s TTFB, nothing in 150s, client timeout 120s)
+    # → the viewer sees "no stream available". A SUB ask is immune (accept=("jpn",
+    # "eng") → every candidate is as-is → 6s).
+    accept = tuple(accept or ("eng",))
+    cam = 1 if _is_cam_release(c.get("name", "")) else 0
+    afr = _audio_first_rank(c, accept)
+    quality = -_quality_rank_browser(c, codec, want_h)
+    native = _audio_native_rank(c, accept)
+    tail = (_lang_rank(c, lang),
             _candidate_tier(c, codec, want_h),
             _size_rank(_candidate_size_gb(c)),
             -int(c.get("seeders") or 0),
             codec_rank(c.get("name", ""), want_h))
+    if (lang or "").lower() == "dub":
+        # ANIME DUB: the requested audio is a NON-DEFAULT alternate track, so
+        # "which release can hand the player English first, without the remux?"
+        # is the dominant axis, ahead of resolution — an untagged 1080p on a dub
+        # ask is almost always Japanese audio that either fails the probe or
+        # needs the stall-prone remux, while the one release that PROVES
+        # English-first plays instantly. Ladder: 0 (proven/declared English
+        # first) → 1 (untagged, unconfirmed) → 2 (needs the remux) → 3 (carries
+        # no accepted audio). Quality still decides INSIDE each class, so the
+        # owner's rule holds among candidates that can serve the dub at all.
+        return (cam, afr) + (quality, native) + tail
+    # MOVIE / TV / ANIME SUB: the requested language is the medium's default
+    # (or JPN is accepted too), so quality stays primary — but a candidate that
+    # cannot play as-is (needs the blocking remux, rank 2, or carries no
+    # accepted audio at all, rank 3) is gated BELOW every candidate that can.
+    # That is a correctness bound on rule 2, never a quality preference: it
+    # merely stops an unusable-for-this-request release from leading the walk.
+    return (cam, 0 if afr <= 1 else 1, quality, afr, native) + tail
 
 
 def codec_rank(name, want_height=None):

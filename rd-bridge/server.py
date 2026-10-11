@@ -140,6 +140,63 @@ def _audio_probe_cache_load():
 _audio_probe_cache_load()
 
 
+# ── candidate audio-fit verdicts (persisted) ──────────────────────────
+# MEASURED (2026-09-27): Mushoku Tensei S1E1 (tmdb=94664) resolved to
+# "[BlackRabbit] ... [Bluray-1080p][Opus 2.0][AV1]" whose FIRST audio track is
+# Japanese, so an English request needed the ffmpeg remux: TTFB 22.2s and NO
+# first byte in 150s → the player reports "no stream available". A release
+# whose accepted audio already IS its first track plays instantly (no remux,
+# no multi-GB copy on the Pi). So the resolver prefers releases that FIT, and
+# remembers per torrent what the probe decided so a later resolve of the same
+# title goes straight to a fitting release:
+#   "fits"/"unknown" → plays as-is        (never pay a remux for it)
+#   "remux"          → right audio, not first (only ever a fallback)
+#   "reject"         → no accepted audio at all (never try it again)
+_cand_verdict = {}   # "info_hash|accept" -> (timestamp, plan)
+_CAND_VERDICT_TTL = 21600
+
+
+def _verdict_key(info_hash, accept):
+    return f"{(info_hash or '').lower()}|{'+'.join(accept or ())}"
+
+
+def _cand_verdict_get(c, accept):
+    e = _cand_verdict.get(_verdict_key(c.get("info_hash"), accept))
+    if e and time.time() - e[0] < _CAND_VERDICT_TTL:
+        return e[1]
+    return None
+
+
+def _cand_verdict_save():
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cand_verdict_cache.json")
+        with open(p, "w") as f:
+            json.dump({k: (v[0], v[1]) for k, v in _cand_verdict.items()}, f)
+    except Exception:
+        pass
+
+
+def _cand_verdict_set(c, accept, plan):
+    try:
+        _cand_verdict[_verdict_key(c.get("info_hash"), accept)] = (time.time(), plan)
+        _cand_verdict_save()
+    except Exception:
+        pass
+
+
+def _cand_verdict_load():
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cand_verdict_cache.json")
+        with open(p) as f:
+            for k, (ts, v) in json.load(f).items():
+                _cand_verdict[k] = (ts, v)
+    except Exception:
+        pass
+
+
+_cand_verdict_load()
+
+
 def _probe_key(url):
     """Stable cache key for an RD file: the file id in /d/{ID}/... (survives
     CDN host rotation)."""
@@ -371,6 +428,23 @@ FOREIGN_NAME_TOKENS = {
     "SRP", "SLO", "CES", "CZE", "HEB", "THA", "VIE", "TUR", "HIN", "ARA",
     "ZHO", "KOR", "BEN", "TAM", "TEL", "MSA", "LATINO", "CASTELLANO",
     "ESPANOL", "SUBTITULADO", "SUBTITULADA", "DUBBED",
+    # ── added 2026-10-11 (seen in the live resolve cache / Torrentio sets) ──
+    # MEASURED misses that let foreign dubs through: "Lanterns.S01E01-E02.
+    # 1080p.Ru.Ultradox" (RU) and "Breaking Bad (Integrale) VOSTFR + FRENCH
+    # 720p" (French audio) were both served to an English request.
+    #   RU   – Russian (the 2-letter form; "RUS" was already here)
+    #   VFF/VFQ/VF/TRUEFRENCH – French-audio release tags (VOSTFR is NOT one:
+    #          it means French SUBS over the original audio — still excluded)
+    #   GERDUB – German dub (the glued form; "GER"/"DEU" were already here)
+    #   SPANIS – common sloppy tag for a Spanish dub ("SPA" was already here)
+    #   ITADUB/SPADUB/FRDUB/RUDUB/DUBLADO – glued dub tags
+    # Whole-token matching only (see _foreign_only_name): a title word that
+    # merely CONTAINS one of these ("Anita"→ITA, "Rush"→RU, "Italiano") is a
+    # different token and is never matched. Word forms that are common English
+    # title words (SPANISH/ITALIAN/FRENCH/GERMAN) stay OUT on purpose — a prior
+    # false positive came from loose matching ("The Italian Job").
+    "RU", "VFF", "VFQ", "VF", "TRUEFRENCH", "GERDUB", "SPANIS",
+    "ITADUB", "SPADUB", "FRDUB", "RUDUB", "DUBLADO",
     # NOTE: "VOSTFR" is deliberately NOT here. VOSTFR (version originale
     # sous-titrée en français) describes FRENCH SUBTITLES over the ORIGINAL
     # audio — usually English. Treating it as a foreign-audio marker rejected
@@ -736,7 +810,15 @@ def _link_live(url, timeout=6):
         return True
 
 
-_cache_purge_stale_provenance()
+# The import-time purge is for the resolve SUBPROCESS (resolve_cli.py imports
+# this module) and for boot: a link from a previous RD session must be dropped
+# before it can be served. A TEST or TOOL that imports this module with a
+# placeholder key must never inherit that side effect — with an unverifiable
+# token the fingerprint is inconclusive, the "token changed" branch fires and
+# the live resolve cache is wiped. RD_SKIP_CACHE_PURGE=1 opts out (set by
+# _test_stream_rules.py before it imports this module).
+if not os.environ.get("RD_SKIP_CACHE_PURGE"):
+    _cache_purge_stale_provenance()
 
 
 # =========================================================================
@@ -1525,6 +1607,99 @@ def _lang_rank(c, lang):
     return 0
 
 
+# Name markers that announce the FIRST audio track is NOT the accepted one.
+# "DUAL"/"MULTI" only count as an AUDIO signal together with an AUDIO token,
+# so a "Multi.Subs"/"MULTi." release (multi-language SUBTITLES, audio usually
+# English) is not misread as dual-audio.
+_MULTI_AUDIO_TOKENS = {"DUAL", "MULTI"}
+_ENG_DECL_TOKENS = {"ENG", "ENGLISH", "ENGDUB", "DUBBED"}
+_JPN_DECL_TOKENS = {"JPN", "JAPANESE", "JAP"}
+_NEVER_RANK = 3  # carries no accepted audio: never served, so never tried
+
+
+def _audio_first_rank(c, accept):
+    """Where a candidate sits on "is the accepted audio the FIRST track?":
+      0 = PROVEN as-is (a probe verdict of "fits", or the name declares the
+          accepted language) — the accepted audio IS track 1: no remux needed
+      1 = unknown/untagged (the name proves nothing, or the probe saw only
+          untagged streams) — plays as-is, but the language is UNCONFIRMED
+      2 = the accepted audio is NOT first → the slow play-time ffmpeg remux
+      3 = carries no accepted audio at all → never worth a try
+
+    NOTE (2026-10-11): the probe verdict "unknown" (untagged/und streams) used
+    to score 0, i.e. it tied with a PROVEN "fits". That let an untagged
+    Spanish/Italian dub outrank a release with a real English first track
+    inside the same resolution tier — one of the ways "movies are only
+    Spanish" happened. Untagged is still ACCEPTABLE (rank 1, far above a
+    remux or a reject) and still fails open, it is simply not allowed to beat
+    a candidate whose English audio we actually proved.
+
+    The PROBE verdict (persisted per torrent, see _cand_verdict) always wins: it
+    is a real ffprobe of the file, while a name is only a hint. The hint itself
+    is deliberately conservative — it never overrides a proven verdict and an
+    unmarked name stays in the neutral tier — because the probe and the try
+    loop still decide what is actually returned.
+    """
+    accept = tuple(accept or ())
+    if not accept:
+        return 1
+    v = _cand_verdict_get(c, accept)
+    if v == "reject":
+        return _NEVER_RANK
+    if v == "fits":
+        return 0  # PROVEN: the accepted language is the file's first track
+    if v == "unknown":
+        return 1  # probed but untagged — acceptable, unconfirmed (see NOTE)
+    if v == "remux":
+        return 2
+    name = c.get("name", "") or ""
+    if "eng" not in accept:
+        return 1
+    if _foreign_only_name(name):
+        return _NEVER_RANK  # a declared foreign-only release can never be served
+    if "jpn" in accept:
+        # Japanese is accepted as well, so a Japanese-first (dual/multi) release
+        # already fits — an anime request demotes nothing for being JPN-first.
+        return 0
+    toks = set(re.split(r"[^A-Za-z0-9]+", name.upper()))
+    multi_audio = bool(toks & _MULTI_AUDIO_TOKENS) and "AUDIO" in toks
+    eng_decl = bool(toks & _ENG_DECL_TOKENS)
+    if eng_decl and not multi_audio:
+        return 0  # "English Dub" / "[ENG]" — English is very likely track 1
+    if multi_audio or (toks & _JPN_DECL_TOKENS):
+        # Dual/Multi-Audio stores the original Japanese track first (that is
+        # why it needs the remux); a proven "fits" verdict still outranks this.
+        return 1 if eng_decl else 2
+    return 1
+
+
+# A "native-compatible" SURROUND release: a browser-SAFE codec (AAC/Opus/FLAC/
+# Vorbis — the ones a <video> element can actually decode, see
+# SAFE_AUDIO_CODECS) declared together with a surround channel tag. Applied
+# only as a WITHIN-TIER tiebreak, and only as a PROMOTION (rank 0/1, never a
+# demotion), so it can never push a candidate below one it already beat.
+# AC-3/E-AC-3/DTS/TrueHD are deliberately NOT counted as "native" here even
+# though releases label them 5.1: in THIS bridge they are browser-SILENT
+# (audio_codec_is_browser_safe → False), so promoting them would only spend a
+# wasted add/probe on a file the try loop immediately rejects. Within the same
+# resolution the ranking therefore ends up preferring e.g. "AAC 5.1" / "Opus
+# 5.1" over a plain stereo name, which is the "bad sound" fix.
+_SAFE_SURROUND_RE = re.compile(
+    r"(?:AAC|OPUS|FLAC|VORBIS)[\s._-]?(?:5\.1|7\.1|6CH|51CH|6CH\.)"
+    r"|(?:5\.1|7\.1|6CH)[\s._-]?(?:AAC|OPUS|FLAC|VORBIS)", re.I)
+
+
+def _audio_native_rank(c, accept):
+    """0 = the release declares a browser-safe SURROUND track (AAC/Opus/FLAC
+    + 5.1/6CH) — best "sound" that still decodes natively, no remux;
+    1 = everything else (plain stereo, an unmarked name, or a surround tag on
+    a browser-unsafe codec). Never demotes, so it is safe as a tiebreak."""
+    name = c.get("name", "") or ""
+    if not name:
+        return 1
+    return 0 if _SAFE_SURROUND_RE.search(name) else 1
+
+
 def _candidate_tier(c, codec, want_h):
     """0 = release name looks browser-sensible, higher = more suspicious.
     Name-based only (the real decision is the ffprobe gate at try time)."""
@@ -1671,16 +1846,32 @@ def _quality_rank_browser(c, codec=None, want_h=None):
     return _FIREFOX_RANK_BASE - abs(h - target) - overshoot
 
 
-def _candidate_order_key(c, want_h, lang, codec):
-    # Rule 1 (cam never above HD) is also enforced structurally: the cam flag
-    # is the FIRST key (1 = cam, so it sorts last ascending), so even a cam
-    # that claims "2160p" sorts below a 480p WEB. Rule 2 (fidelity first) is
-    # the second key and is BROWSER-AWARE: Chrome orders strictly highest
-    # quality first, Firefox puts 1080p top for smooth playback (see
-    # _quality_rank_browser). Language, browser-safety tier, size sanity,
-    # popularity and codec_rank break ties.
+def _candidate_order_key(c, want_h, lang, codec, accept=None):
+    # Rule 1 (cam never above HD) is enforced structurally: the cam flag is the
+    # FIRST key (1 = cam, so it sorts last ascending), so even a cam that
+    # claims "2160p" sorts below a 480p WEB.
+    # Key 2 is the OWNER'S RULE: QUALITY FIRST — highest fidelity wins, always
+    # ("always pick the highest quality stream first then go down the list").
+    # A FIREFOX ask is the one deliberate exception (1080p-first for smooth
+    # playback); see _quality_rank_browser.
+    # Key 3 is the WITHIN-TIER audio-fit preference, and only that: inside the
+    # SAME resolution tier a release whose accepted audio already IS its first
+    # track streams immediately, while one that stores the wanted audio second
+    # only survives via the blocking ffmpeg remux (MEASURED: 22.2s to first
+    # byte and no completion in 150s for Mushoku Tensei S1E1 → "no stream
+    # available"). Key 4 prefers a native-compatible SURROUND track so a
+    # proper 5.1 that decodes natively wins over a stereo name inside the same
+    # tier ("bad sound"). Language, browser-safety tier, size sanity,
+    # popularity and codec_rank break the remaining ties.
+    #
+    # REGRESSION FIXED 2026-10-11: _audio_first_rank was key #2, ABOVE fidelity,
+    # so a 720p AAC release outranked a 1080p Opus one and a stereo name beat a
+    # proper 5.1 one — the "a lot of shows are low quality with bad sound"
+    # report. It is now a within-tier tiebreak (keys 3/4), never a quality veto.
     return (1 if _is_cam_release(c.get("name", "")) else 0,
             -_quality_rank_browser(c, codec, want_h),
+            _audio_first_rank(c, accept or ("eng",)),
+            _audio_native_rank(c, accept or ("eng",)),
             _lang_rank(c, lang),
             _candidate_tier(c, codec, want_h),
             _size_rank(_candidate_size_gb(c)),
@@ -1898,12 +2089,21 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_ac
         if codec == "h264" and cfn and not firefox_video_ok(cfn, cname):
             soft_cached = cached
         elif _cached_audio_ok(cached, cfn, accept):
-            return cached
+            # A cached entry whose audio has to be REMUXED is the one result we
+            # never trust blindly — the remux is exactly what times out (see
+            # _audio_first_rank). Walk ONCE for a release that plays as-is and
+            # keep this cached link as the fallback. `fits_checked` records that
+            # that walk already happened, so a title whose only releases need a
+            # remux pays for the search once, not on every single play.
+            if cached.get("needs_remux") and not cached.get("fits_checked"):
+                soft_cached = cached
+            else:
+                return cached
         # else: the cached entry is a foreign-audio release (written before
         # the audio-language check) → fall through and re-resolve.
     result = _resolve_stream_impl(tmdb, mtype, season, episode, quality, skip_account, codec, lang)
     if soft_cached is not None and not (isinstance(result, dict) and result.get("url")):
-        # Nothing playable-by-Firefox exists for this title — an HEVC stream
+        # Nothing playable exists for this title — a cached HEVC / remux stream
         # beats "no stream" (the player's decode-error retry handles it).
         result = soft_cached
     url = result.get("url") if isinstance(result, dict) else None
@@ -1912,6 +2112,11 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_ac
                   "imdb": result.get("imdb")}
     if url and isinstance(result, dict):
         _tag_audio(result, accept)
+        if soft_cached is not None and result.get("needs_remux"):
+            # The walk just searched for a release that plays as-is and found
+            # none: remember that, so the next play serves this remux link
+            # straight from cache instead of re-walking the account.
+            result["fits_checked"] = True
         _resolve_cache_set(ck, result)
     return result
 
@@ -2016,6 +2221,14 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
     #    downloaded content always works, no 451, no waiting. Only check the
     #    PRIMARY titles. skip_account=True bypasses this so Torrentio
     #    candidates with browser-playable audio get picked instead.
+    #
+    #    BUT: an account file that needs the play-time REMUX is not "instant"
+    #    either — that remux has to pull the whole multi-GB file before it can
+    #    serve a single byte (MEASURED: 22.2s to first byte and nothing in
+    #    150s → the player reports "no stream available"). So such a file is
+    #    kept as a FALLBACK and the candidate walk below still gets to look for
+    #    a release that plays as-is (see _audio_first_rank).
+    account_remux = None
     if not skip_account:
         try:
             st, body = http_get(f"https://api.themoviedb.org/3/{'movie' if mtype == 'movie' else 'tv'}/{tmdb}?api_key={TMDB_KEY}", timeout=15)
@@ -2053,6 +2266,9 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                 # the account holds one. Never serve that for an English ask.
                 if _audio_gate(url, accept):
                     continue
+                if audio_plan(audio_tracks(url), accept) == "remux" and account_remux is None:
+                    account_remux = (url, {"name": f"{q} (from account)"})
+                    continue  # keep looking for a copy that needs no remux
                 return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
         except Exception:
             pass
@@ -2088,7 +2304,7 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
         # one is tried first (then codec_rank breaks ties). See
         # _candidate_order_key.
         order = sorted(candidates,
-                       key=lambda c: _candidate_order_key(c, want_h, lang, codec))
+                       key=lambda c: _candidate_order_key(c, want_h, lang, codec, accept))
         # Stremio-style: try candidates until one streams. Cached = instant;
         # non-cached = RD downloads on their servers (30s-3min).
         # PARALLEL batches (3 at a time): each add is independent, so this
@@ -2118,12 +2334,17 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                     _keep_hevc(url, c.get("name", ""))
                     return None
                 if audio_codec_is_browser_safe(url) is False:
+                    _cand_verdict_set(c, accept, "reject")
                     return None  # silent codec — skip
                 # Audio language: reject a foreign dub outright; report how
-                # the file has to be played ("fits" = play it as-is).
+                # the file has to be played ("fits" = play it as-is) and REMEMBER
+                # the verdict so a later resolve of this title can go straight
+                # to a release that needs no remux (see _audio_first_rank).
                 if _foreign_only_name(c.get("name", "")):
+                    _cand_verdict_set(c, accept, "reject")
                     return None
                 plan = audio_plan(audio_tracks(url), accept)
+                _cand_verdict_set(c, accept, plan)
                 if plan == "reject":
                     return None
                 return url, c, plan
@@ -2131,14 +2352,28 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                 return None
 
         BATCH = 3
-        # A candidate whose English audio is not its first track needs the
-        # blocking remux. Before paying that, look one extra batch further for
-        # a release that plays as-is (bounded: 2 batches max, so the resolve
-        # never turns into a long walk).
-        MAX_BATCHES_FOR_FITS = 2
-        fallback = None  # (url, candidate) needing a remux
+        # A candidate whose accepted audio is not its FIRST track needs the
+        # blocking play-time remux — and that remux is what times out
+        # (MEASURED: 22.2s to first byte, nothing in 150s). So a remux result is
+        # never *selected* while an untried candidate might still play as-is: it
+        # is only ever the FALLBACK. The extra search is bounded twice over —
+        # by the resolve deadline above and by MAX_FITS_BATCHES once a fallback
+        # exists — so the walk can never turn into a long stall, and the
+        # fallback is always returned if no fitting release turns up.
+        MAX_FITS_BATCHES = 5       # ≤15 candidates spent looking for a "fits"
+        FITS_SEARCH_SECONDS = 40   # …and never longer than this
+        # Pre-seeded with the account's own copy when that copy needs the remux:
+        # it is still better than "no stream", and having it in hand is exactly
+        # what makes the extra search below cheap and bounded.
+        fallback = account_remux  # (url, candidate) needing a remux
+        fits_deadline = time.time() + FITS_SEARCH_SECONDS
         for bi, start in enumerate(range(0, len(order), BATCH)):
             if time.time() > deadline:
+                break
+            # No fallback yet → keep walking (returning nothing is worse).
+            # Fallback in hand → give the remaining candidates a bounded look.
+            if fallback is not None and (bi + 1 > MAX_FITS_BATCHES
+                                         or time.time() > fits_deadline):
                 break
             batch = order[start:start + BATCH]
             with _cf.ThreadPoolExecutor(max_workers=BATCH) as ex:
@@ -2153,17 +2388,18 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                         return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
                     if fallback is None:
                         fallback = (url, c)
-            if fallback is not None and bi + 1 >= MAX_BATCHES_FOR_FITS:
-                break
         if fallback is not None:
             # No as-is release found — play the right audio via the remux
             # (cached after the first time) rather than a foreign dub.
             url, c = fallback
             return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
         # Second pass: try the best-seeded candidates (may include cached HEVC
-        # that browsers with hardware decode CAN play)
+        # that browsers with hardware decode CAN play). Same playability rule as
+        # the main walk: a release that plays as-is wins, a remux is kept only
+        # as the fallback for when nothing fits.
         if time.time() < deadline:
             byseed = sorted(candidates, key=lambda c: -int(c.get("seeders") or 0))
+            remux_fb = None
             for c in byseed:
                 if tried >= 14 or time.time() > deadline:
                     break
@@ -2182,18 +2418,32 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                             continue
                         safe = audio_codec_is_browser_safe(url)
                         if safe is False:
+                            _cand_verdict_set(c, accept, "reject")
                             continue
                         if _foreign_only_name(c.get("name", "")):
+                            _cand_verdict_set(c, accept, "reject")
                             continue
-                        if audio_plan(audio_tracks(url), accept) == "reject":
+                        plan = audio_plan(audio_tracks(url), accept)
+                        _cand_verdict_set(c, accept, plan)
+                        if plan == "reject":
+                            continue
+                        if plan == "remux":
+                            if remux_fb is None:
+                                remux_fb = (url, c)
                             continue
                         return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
                 except Exception:
                     continue
+            if remux_fb is not None:
+                url, c = remux_fb
+                return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
     # All candidates tried and none streamed — report honestly (or serve the
-    # remembered HEVC if that is all this title has), skip the slow
-    # APIBay/EZTV tail (search_eztv can take 30s+).
+    # account's own copy / the remembered HEVC if that is all this title has),
+    # skip the slow APIBay/EZTV tail (search_eztv can take 30s+).
     if not candidates or tried > 0:
+        if account_remux is not None:
+            url, c = account_remux
+            return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
         return _soft_hevc_result() or {
             "error": "no stream available on real-debrid yet (try again in a few minutes)",
             "imdb": imdb}
@@ -2258,7 +2508,11 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                     return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
         except Exception:
             pass
-        return _soft_hevc_result() or {"error": "no torrents found", "imdb": imdb}
+        return (_soft_hevc_result()
+                or ({"url": account_remux[0], "source": "realdebrid",
+                     "title": account_remux[1].get("name", "")[:80], "imdb": imdb}
+                    if account_remux else None)
+                or {"error": "no torrents found", "imdb": imdb})
 
     # NOTE: RD's instantAvailability endpoint is currently disabled (error 37),
     # so we try torrents directly — best-seeded first. RD downloads
@@ -2267,8 +2521,9 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
     # cached/unflagged hashes resolve instantly. Also wait longer for RD to
     # fetch non-cached torrents (RD does the downloading, not us).
     # Same popularity-first, sanity-filtered ordering as the main walk.
-    order = sorted(candidates, key=lambda c: _candidate_order_key(c, want_h, lang, codec))
+    order = sorted(candidates, key=lambda c: _candidate_order_key(c, want_h, lang, codec, accept))
     tried = 0
+    remux_fb = None
     for c in order:
         if tried >= 40:
             break
@@ -2283,11 +2538,28 @@ def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, s
                 if codec == "h264" and not firefox_video_ok(url, c.get("name")):
                     _keep_hevc(url, c.get("name", ""))
                     continue
-                if _audio_gate(url, accept):
+                if _foreign_only_name(c.get("name", "")):
+                    _cand_verdict_set(c, accept, "reject")
+                    continue
+                plan = audio_plan(audio_tracks(url), accept)
+                _cand_verdict_set(c, accept, plan)
+                if plan == "reject":
+                    continue
+                # A release that plays as-is wins; a remux (right audio, not
+                # first) is only the fallback — see _audio_first_rank.
+                if plan == "remux":
+                    if remux_fb is None:
+                        remux_fb = (url, c)
                     continue
                 return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
         except Exception:
             continue  # 451 / invalid — next candidate
+    if remux_fb is not None:
+        url, c = remux_fb
+        return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
+    if account_remux is not None:
+        url, c = account_remux
+        return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
     return _soft_hevc_result() or {
         "error": "could not resolve via real-debrid (all candidates rejected)", "imdb": imdb}
 

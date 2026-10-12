@@ -2886,7 +2886,22 @@ def _primary_sanity(c, codec, want_h):
     n = (c.get("name", "") or "").upper()
     h = _release_height(n)
     gb = _candidate_size_gb(c)
-    codec_bad = 1 if (codec != "h264" and _is_hevc_name(n) and (h or 0) > 1080) else 0
+    # ── video-codec capability of the ask (measured 2026-10-11) ────────
+    # A browser ask that cannot decode HEVC/AV1/VP9 must never let such a
+    # release LEAD the candidate order. This demotion used to fire only for
+    # HEVC names ABOVE 1080p AND only for a non-h264 ask — and _is_hevc_name
+    # missed the "H 265" form entirely. MEASURED consequence: the top-14
+    # candidates for MobLand S02E01 were all 2160p HEVC, and The Office S01E01's
+    # #1 candidate was an x265 HEVC release, so the player was handed a stream
+    # its decoder cannot render (Chromium has no hvc1 → black screen → fallback
+    # handoff). Now it fires at EVERY height and for BOTH browser asks:
+    #   * the default (Chromium / unknown) ask has no HEVC decoder at all;
+    #   * codec="h264" declared H.264-only support (no HEVC/AV1/VP9).
+    # AV1/VP9 are demoted only for the h264-only ask — Firefox/Chrome/Edge all
+    # decode AV1 natively, so the default ask keeps them. This is a DEMOTION,
+    # never a filter: an HEVC-only title still resolves.
+    limited = _is_hevc_name(n) or (codec == "h264" and ("AV1" in n or "VP9" in n))
+    codec_bad = 1 if limited else 0
     return (codec_bad, _size_rank(gb), _res_size_sanity(h, gb))
 
 
@@ -3305,9 +3320,18 @@ def _audio_gate(url, accept):
 def _is_hevc_name(name):
     """True when a filename indicates HEVC video (unplayable in Firefox —
     no HEVC support at all). AV1 is EXCLUDED from the list: Firefox/Chrome/
-    Edge all decode AV1 natively, so AV1 files are playable."""
-    n = (name or "").upper()
-    return any(x in n for x in ("HEVC", "X265", "H265", "X.265", "H.265"))
+    Edge all decode AV1 natively, so AV1 files are playable.
+
+    Separator-INSENSITIVE (measured 2026-10-11): releases spell the codec
+    "H265", "H.265", "H 265", "H-265", "H_265", "X265" and "HEVC". Matching on
+    the glued token alone MISSED every spaced/punctuated form — and those are
+    extremely common on 2160p releases ("...DoVi HDR H 265-playWEB"). HEVC then
+    went undetected: the "h264" prefilter kept it, _primary_sanity did not
+    demote it, and it led the candidate order to a browser that cannot decode
+    it. Strip every non-alphanumeric character and upper-case before matching so
+    all separator variants collapse onto the same glued token."""
+    n = re.sub(r"[^A-Za-z0-9]", "", name or "").upper()
+    return any(x in n for x in ("HEVC", "X265", "H265"))
 
 
 def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None):

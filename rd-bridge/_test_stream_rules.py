@@ -218,8 +218,9 @@ check("fit: anime (jpn accepted) demotes nothing for being JPN-first",
       s._audio_first_rank(C("[Grp] Show S01 [Dual-Audio] 1080p"), ("jpn", "eng")) == 0)
 
 # a fitting release outranks a higher-quality one that would need the remux
+# (both H.264 so the check isolates the AUDIO-FIT rule from the codec bound)
 fitmix = [
-    C("Show.2024.1080p.WEB-DL.x265.Dual-Audio-GROUP", seeders=999),
+    C("Show.2024.1080p.WEB-DL.H264.Dual-Audio-GROUP", seeders=999),
     C("Show.2024.720p.WEB-DL.H264.English-Dub-GROUP", seeders=1),
 ]
 ofit = sorted(fitmix, key=lambda c: s._candidate_order_key(c, None, None, None, ("eng",)))
@@ -228,6 +229,44 @@ check("fit: 720p that plays beats 1080p that needs a remux", "Dub" in ofit[0]["n
 # the quality rule is untouched: 1080p still comes first.
 ofit_anime = sorted(fitmix, key=lambda c: s._candidate_order_key(c, None, None, None, ("jpn", "eng")))
 check("fit: anime keeps quality-first (dual-audio 1080p still first)", "1080p" in ofit_anime[0]["name"])
+
+# ── codec-capability bound (measured 2026-10-11) ────────────────────
+# A release whose NAME declares a codec the asking browser cannot decode is
+# demoted below every decodable release. It BOUNDS quality exactly like the
+# audio-fit bound above, and it is a DEMOTION, never a filter (an HEVC-only
+# title still resolves). Causes, both measured: the top-14 candidates for
+# MobLand S02E01 were all 2160p HEVC written as "H 265" — a spaced form
+# _is_hevc_name used to miss — and The Office S01E01's #1 candidate was an x265
+# HEVC release; the player (Chromium has no hvc1) then failed to decode the
+# stream it was handed ("loads then fails").
+check("codec: spaced 'H 265' is detected as HEVC", s._is_hevc_name("Show.2024.2160p.H 265-GRP"))
+check("codec: 'H.265' / 'H-265' / 'H_265' are detected", all(
+    s._is_hevc_name(x) for x in ("Movie.2024.H.265", "Movie.2024.H-265", "Movie.2024.H_265")))
+check("codec: H.264 (spaced or glued) is not HEVC", not any(
+    s._is_hevc_name(x) for x in ("Movie.2024.1080p.H.264.x264", "Movie.2024.1080p.H 264-GRP")))
+check("codec: AV1 is not HEVC (it plays natively)", not s._is_hevc_name("Movie.2024.1080p.AV1"))
+# an HEVC release never leads a browser ask (default = Chromium: no hvc1)
+cx = [C("Show.2024.2160p.WEB-DL.H 265-GROUP", seeders=999),
+      C("Show.2024.1080p.WEB-DL.H264-GROUP", seeders=1)]
+ocx = sorted(cx, key=lambda c: s._candidate_order_key(c, None, None, None))
+check("codec: spaced-HEVC 2160p does NOT outrank a 1080p H264 (default ask)", "H264" in ocx[0]["name"])
+# …and a 1080p HEVC does not lead either (the old demotion needed >1080p)
+cy = [C("Show.2024.1080p.BluRay.x265.HEVC-GROUP", seeders=999),
+      C("Show.2024.1080p.WEB-DL.H264-GROUP", seeders=1)]
+ocy = sorted(cy, key=lambda c: s._candidate_order_key(c, None, None, None))
+check("codec: 1080p HEVC does NOT outrank a 1080p H264 (default ask)", "H264" in ocy[0]["name"])
+# codec=h264 (declared H.264-only) also demotes AV1/VP9 …
+cz = [C("Show.2024.1080p.WEB-DL.AV1-GROUP", seeders=999),
+      C("Show.2024.1080p.WEB-DL.H264-GROUP", seeders=1)]
+ocz = sorted(cz, key=lambda c: s._candidate_order_key(c, None, None, "h264"))
+check("codec: AV1 demoted for the h264-only ask", "H264" in ocz[0]["name"])
+# …but the default ask keeps AV1 (Firefox/Chrome/Edge decode it natively)
+ocd = sorted(cz, key=lambda c: s._candidate_order_key(c, None, None, None))
+check("codec: AV1 kept for the default ask", "AV1" in ocd[0]["name"])
+# demotion, not a filter: an HEVC-only set still orders fine
+oe = sorted([C("Show.2024.1080p.x265.HEVC-A"), C("Show.2024.720p.x265.HEVC-B")],
+            key=lambda c: s._candidate_order_key(c, None, None, None))
+check("codec: HEVC-only set still resolves (no filter)", len(oe) == 2 and "1080p" in oe[0]["name"])
 
 # a PROBED verdict outranks the filename hint (the name may not say it)
 probed = C("Show.2024.1080p.WEB-DL.x265-GROUP")

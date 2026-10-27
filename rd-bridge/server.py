@@ -2557,10 +2557,21 @@ def _size_rank(gb):
 
 
 def _lang_rank(c, lang):
-    """lang=dub (anime): an English-ONLY dub release ranks above Dual/Multi —
+    """Where a release sits for the REQUESTED language.
+
+    lang=dub (anime): an English-ONLY dub release ranks above Dual/Multi —
     dual-audio releases store the Japanese track first, so they always pay the
-    slow ffmpeg remux. Unchanged behaviour, moved to module level so the
-    ordering helper can share it."""
+    slow ffmpeg remux.
+
+    SUB (the default): the mirror image, and it used to be missing entirely —
+    every candidate scored 0, so a dub-only release could lead a SUB request.
+    MEASURED 2026-10-11 on Frieren S1E1 (anime sub, 111 candidates): the ranked
+    head was "[Yameii] … [English Dub] [CR WEB-DL 1080p]", i.e. a viewer who
+    asked for subtitles was handed an English dub — no Japanese track at all.
+    A release that ANNOUNCES a dub carries the dub instead of the original
+    audio, so it now sits behind every release that does not. Dual/Multi stay
+    unpenalised: those still carry the original track, which is what a sub
+    viewer wants."""
     n = (c.get("name", "") or "").upper()
     if lang == "dub":
         if any(x in n for x in ("DUAL", "MULTI")):
@@ -2568,6 +2579,9 @@ def _lang_rank(c, lang):
         if any(x in n for x in ("DUB", "ENGLISH", "EN.")):
             return 0  # dubbed — likely English-first: try first
         return 2
+    # SUB / language-agnostic request: keep dub-only releases out of the lead.
+    if re.search(r"\b(DUB|DUBBED|ENGDUB|ENGLISH\s+DUB)\b", n):
+        return 1
     return 0
 
 
@@ -2838,8 +2852,15 @@ def _quality_rank_browser(c, codec=None, want_h=None):
     if _is_cam_release(name):
         return 0
     h = _release_height(name)
-    if codec != "h264":
-        return _quality_rank(c)  # Chrome/unknown: strict highest-quality-first
+    # MEASURED 2026-10-11 (v1.6): the sweet-spot ladder is no longer Firefox-
+    # only. Chrome used to get strict highest-quality-first, and the measured
+    # result was a 2160p x265 10-bit WEBRip (Culpa Mia, 5.25 GB) leading every
+    # playable 1080p for a plain movie click: the browser then has to software-
+    # decode HEVC/SDR-downconvert and pull 5 GB through the relay before it can
+    # show a picture, which is exactly the slow start / bad playback being
+    # reported. 1080p is the practical ceiling for in-browser streaming;
+    # 2160p stays reachable as an EXPLICIT ask (want_h=2160, the player's 4K
+    # option) and still wins when no 1080p release exists at all.
     if h is None:
         return 1  # unmarked: cannot prove a height — still above cam only
     target = want_h or _FIREFOX_SWEET_SPOT
@@ -3459,6 +3480,24 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
                 if audio_plan(audio_tracks(url), accept) == "remux" and account_remux is None:
                     account_remux = (url, {"name": f"{q} (from account)"})
                     continue  # keep looking for a copy that needs no remux
+                # RESOLUTION CEILING (v1.6, MEASURED): the account walk used to
+                # return whatever the library happened to hold, whatever its
+                # resolution. For Culpa Mia the library holds ONE copy —
+                # "…[2160p] [4K] [WEB] [5.1] [YTS.MX]" — so a plain movie click
+                # was served a 5.25 GB x265 10-bit file while the indexers right
+                # below had a 1080p WEB-DL of the same film: software HEVC
+                # decode plus a multi-GB pull through the relay before the first
+                # frame. A library file ABOVE the requested/default ceiling is
+                # now treated exactly like a remux-needing one — held as the
+                # fallback, so the candidate walk gets to find a playable 1080p
+                # first, and the 4K copy is still used when nothing else exists.
+                _ah = _release_height(_url_name(url))
+                _atarget = (2160 if quality == "2160" else 1080 if quality == "1080"
+                            else 720 if quality == "720" else 480 if quality == "480"
+                            else _FIREFOX_SWEET_SPOT)
+                if _ah and _ah > _atarget and account_remux is None:
+                    account_remux = (url, {"name": f"{q} (from account)"})
+                    continue  # keep looking for a copy at/below the ceiling
                 return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
         except Exception:
             pass
@@ -3491,7 +3530,10 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
     deadline = time.time() + 115
     # Requested resolution bias (shared by the candidate ordering below and the
     # APIBay/EZTV tail sort further down).
-    want_h = 1080 if quality == "1080" else 720 if quality == "720" else 480 if quality == "480" else None
+    # 2160 is an EXPLICIT 4K ask (the player's 4K option). Without it the
+    # ladder targets 1080 — see _quality_rank_browser.
+    want_h = (2160 if quality == "2160" else 1080 if quality == "1080"
+              else 720 if quality == "720" else 480 if quality == "480" else None)
     # HARD RULE 1: never walk a CAM/TS/telecine release while an HD (720p+)
     # alternative is on the table. Drop cams here so the h264 pre-filter, the
     # ordering and the try-loop all see the same HD-only set.
@@ -3928,7 +3970,10 @@ def preview_candidates(tmdb, mtype, season=None, episode=None, quality=None, lan
         tor, mf, tz = _fetch_sources(imdb, tmdb, mtype, season, episode,
                                      budget=(_PREVIEW_TIMEOUT if budget is None else budget))
         accept = _accept_langs(mtype, lang)
-        want_h = 1080 if quality == "1080" else 720 if quality == "720" else 480 if quality == "480" else None
+        # 2160 is an EXPLICIT 4K ask (the player's 4K option). Without it the
+        # ladder targets 1080 — see _quality_rank_browser.
+        want_h = (2160 if quality == "2160" else 1080 if quality == "1080"
+                  else 720 if quality == "720" else 480 if quality == "480" else None)
         merged = _filter_cam_when_hd(list(tor) + list(mf) + list(tz))
         try:
             merged = sorted(merged, key=lambda c: _candidate_order_key(c, want_h, lang, codec, accept))

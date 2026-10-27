@@ -1611,6 +1611,126 @@ def search_apibay(q, category="0"):
         return []
 
 
+def torrentio_rd_config():
+    """The Torrentio URL segment for the STREMIO setup: our own debrid key.
+
+    `realdebrid=<key>` is what the Torrentio addon writes into its config string
+    when you install it in Stremio with a Real-Debrid account. It changes the
+    /stream/ response completely (MEASURED 2026-10-12, Fight Club tt0137523):
+
+        plain Torrentio       98 streams,   0 with `url`   -> we must addMagnet
+                                                             and poll RD (15-50s)
+        Torrentio + realdebrid 184 streams, 184 with `url` -> each url 302s
+                                                             STRAIGHT to the
+                                                             debrid file
+
+    That single hop is the whole reason Stremio feels instant: the addon has
+    already done the debrid dance. Returns None when no RD key is configured.
+    """
+    if not RD_KEY:
+        return None
+    return f"{TORRENTIO_BASE}/realdebrid={RD_KEY}|{TORRENTIO_CONFIG}" if TORRENTIO_CONFIG \
+        else f"{TORRENTIO_BASE}/realdebrid={RD_KEY}"
+
+
+def search_torrentio_rd(imdb, mtype, season=None, episode=None):
+    """Torrentio streams that ALREADY resolve to a debrid file (the Stremio RD
+    setup). Each hit carries `direct_url` — the addon's resolve endpoint, which
+    answers a 302 to real-debrid.com — plus `rd_cached` when the addon tagged it
+    [RD+] (cached in THIS account, i.e. playable with no waiting at all).
+
+    Shaped like the MediaFusion "streaming provider" hits on purpose: the
+    resolver's direct-url pass follows the link once, runs the SAME codec /
+    audio / content gates on the final file and can then serve it immediately.
+    No infoHash is involved, so nothing is added to the account here.
+    """
+    base = torrentio_rd_config()
+    if not base or not imdb:
+        return []
+    try:
+        if mtype == "movie":
+            url = f"{base}/stream/movie/{imdb}.json"
+        else:
+            url = f"{base}/stream/series/{imdb}:{season or 1}:{episode or 1}.json"
+        st, body = http_get(url, headers={"User-Agent": UA}, timeout=25)
+        if st != 200 or not body:
+            return []
+        streams = (json.loads(body).get("streams") or [])
+        hits = []
+        for s in streams:
+            u = (s.get("url") or "").strip()
+            if not u.lower().startswith("http"):
+                continue  # an infoHash row — plain Torrentio already covers it
+            bh = s.get("behaviorHints") or {}
+            fname = (bh.get("filename") or "").strip()
+            label = (s.get("title") or "").strip()
+            desc = (s.get("description") or "").strip()
+            name = fname or label or desc
+            if not name:
+                continue
+            seeders = 0
+            m = re.search(r"\U0001F464\s*(\d+)", desc) or re.search(r"\u25B6\ufe0f?\s*(\d+)", desc)
+            if m:
+                seeders = int(m.group(1))
+            size_gb = None
+            vs = bh.get("videoSize")
+            if isinstance(vs, (int, float)) and vs > 0:
+                size_gb = round(vs / (1024.0 ** 3), 2)
+            if size_gb is None:
+                size_gb = _size_gb(name) or _size_gb(desc)
+            hits.append({
+                "name": name[:90],
+                "direct_url": u,
+                "rd_cached": "[RD+]" in (s.get("name") or ""),
+                "filename": fname,
+                "seeders": seeders,
+                "size_gb": size_gb,
+                "source": "torrentio-rd",
+                "quality": (s.get("name") or "")[:30],
+            })
+        return hits
+    except Exception:
+        return []
+
+
+def _follow_redirect(url, timeout=12):
+    """Resolve the addon's 302 to the final debrid file url, without downloading.
+
+    Torrentio answers `HEAD` with the Location, so this is one cheap hop
+    (MEASURED 2026-10-12: ~200-400ms to `*.download.real-debrid.com`). Returns ""
+    when the link is uncached/expired or not a media file, which is exactly the
+    cheap rejection the direct pass wants before any ffprobe runs.
+    """
+    cur = url
+    for _ in range(4):
+        try:
+            req = urllib.request.Request(cur, headers={"User-Agent": UA}, method="HEAD")
+            opener = urllib.request.build_opener(_NoRedirect())
+            resp = opener.open(req, timeout=timeout)
+            final = resp.geturl()
+            return final if final.lower().startswith("http") else ""
+        except urllib.error.HTTPError as e:
+            loc = e.headers.get("Location")
+            if not loc:
+                return ""
+            cur = urllib.parse.urljoin(cur, loc)
+            cur_host = urllib.parse.urlparse(cur).netloc.lower()
+            # Once we are on the debrid host the 302 chain is finished: this is
+            # the file URL the player will stream.
+            if "real-debrid.com" in cur_host:
+                return cur
+        except Exception:
+            return ""
+    return cur if cur.lower().startswith("http") else ""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Stop at the first 302 so the Location can be read (and counted)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def search_torrentio(imdb, mtype, season=None, episode=None):
     """Torrentio public API — 100+ indexers, returns infoHash + fileIdx + seeders.
        The configured segment (default qualityfilter=cam,scr,threed|sort=
@@ -3410,6 +3530,13 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
             soft_hevc["title"] = name or ""
         return None
 
+    # Requested resolution bias (shared by the account walk, the Torrentio-RD
+    # pass, the candidate ordering and the APIBay/EZTV tail sort).
+    # 2160 is an EXPLICIT 4K ask (the player's 4K option). Without it the ladder
+    # targets 1080 — see _quality_rank_browser.
+    want_h = (2160 if quality == "2160" else 1080 if quality == "1080"
+              else 720 if quality == "720" else 480 if quality == "480" else None)
+
     # 0. THE ACCOUNT LIBRARY WALK RUNS FIRST. ORDERING IS A LATENCY
     #    DECISION, NOT A PREFERENCE (MEASURED 2026-10-11): the account walk
     #    costs ~1-5s and frequently HITS, while the indexer fan-out below can
@@ -3501,6 +3628,73 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
                 return {"url": url, "source": "realdebrid", "title": f"{q} (from account)", "imdb": imdb}
         except Exception:
             pass
+    # 0b. TORRENTIO-RD — the Stremio setup, and now the fastest path we have.
+    #     The addon is queried WITH our debrid key, so every stream it returns
+    #     already carries a url that 302s straight to the debrid file: no
+    #     addMagnet, no selectFiles, no polling loop. MEASURED 2026-10-12 on
+    #     Fight Club: plain Torrentio 98 streams / 0 urls vs Torrentio-RD 184
+    #     streams / 184 urls, and the whole hop to `download.real-debrid.com`
+    #     costs ~0.2-0.4s.
+    #     It runs AFTER the account walk (a library hit is still the cheapest
+    #     possible answer) and BEFORE the indexer fan-out, because a hit here
+    #     skips that 15s+ cold fan-out entirely. [RD+] rows are cached in THIS
+    #     account and are tried first; each candidate still goes through the
+    #     same cam / codec / audio-language / content-identity gates, so a
+    #     foreign-only release can never win just for being cached.
+    if torrentio_rd_config():
+        try:
+            rd_hits = search_torrentio_rd(imdb, mtype, season, episode)
+        except Exception:
+            rd_hits = []
+        if rd_hits:
+            _src_count("torrentio-rd", len(rd_hits))
+            rd_remux = None
+            rd_deadline = time.time() + 12
+            rd_order = sorted(
+                rd_hits,
+                key=lambda c: (0 if c.get("rd_cached") else 1,
+                               _candidate_order_key(c, want_h, lang, codec, accept)),
+            )
+            for c in rd_order[:6]:
+                if time.time() > rd_deadline:
+                    break
+                u = _follow_redirect(c.get("direct_url", ""))
+                if not u:
+                    continue  # uncached / expired link: rejected before any probe
+                if _is_dead(u):
+                    continue
+                if _is_cam_release(c.get("name", "")):
+                    continue
+                if codec == "h264" and not firefox_video_ok(u, c.get("name")):
+                    _keep_hevc(u, c.get("name", ""))
+                    continue
+                if audio_codec_is_browser_safe(u, filename_hint=c.get("filename") or c.get("name")) is False:
+                    _cand_verdict_set(c, accept, "reject")
+                    continue
+                if _foreign_only_name(c.get("name", "")):
+                    _cand_verdict_set(c, accept, "reject")
+                    continue
+                plan = audio_plan(audio_tracks(u), accept)
+                _cand_verdict_set(c, accept, plan)
+                if plan == "reject":
+                    continue
+                bad = content_gate(u, tmdb, mtype, season, episode)
+                if bad:
+                    _audit(f"REJECT torrentio-rd wrong content: {bad} :: {_url_name(u)[:60]}")
+                    _cand_verdict_set(c, accept, "reject")
+                    continue
+                if plan == "remux":
+                    if rd_remux is None:
+                        rd_remux = (u, c)
+                    continue
+                _audit(f"torrentio-rd hit cached={bool(c.get('rd_cached'))} {_url_name(u)[:60]}")
+                return {"url": u, "source": "torrentio-rd",
+                        "title": c.get("name", "")[:80], "imdb": imdb}
+            if rd_remux is not None and account_remux is None:
+                # Better than nothing, but still only a fallback: the indexer
+                # walk below may find a copy that plays as-is.
+                account_remux = rd_remux
+
     # 1. Indexer candidates — fetched CONCURRENTLY (see _fetch_sources), in
     #    front of the same cam/quality/audio gates: Torrentio (100+ indexers),
     #    MediaFusion (Stremio addon: infoHash+fileIdx OR a provider
@@ -3528,12 +3722,6 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
     order = []
     tried = 0
     deadline = time.time() + 115
-    # Requested resolution bias (shared by the candidate ordering below and the
-    # APIBay/EZTV tail sort further down).
-    # 2160 is an EXPLICIT 4K ask (the player's 4K option). Without it the
-    # ladder targets 1080 — see _quality_rank_browser.
-    want_h = (2160 if quality == "2160" else 1080 if quality == "1080"
-              else 720 if quality == "720" else 480 if quality == "480" else None)
     # HARD RULE 1: never walk a CAM/TS/telecine release while an HD (720p+)
     # alternative is on the table. Drop cams here so the h264 pre-filter, the
     # ordering and the try-loop all see the same HD-only set.

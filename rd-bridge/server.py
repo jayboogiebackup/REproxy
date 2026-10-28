@@ -4426,11 +4426,26 @@ class Handler(BaseHTTPRequestHandler):
                     f"?api_key={TMDB_KEY}&language=en-US", timeout=15)
                 d = json.loads(body) if st == 200 and body else {}
                 date = d.get("release_date") or d.get("first_air_date") or ""
+                # Flat-numbered anime: anikoto lists One Piece as 1..1180 while
+                # TMDB splits it into seasons, so season 21 episode 1 must become
+                # absolute episode N or the player shows the 1999 pilot. The tv
+                # detail payload already carries seasons[].episode_count, so this
+                # costs no extra request.
+                abs_ep = None
+                if mtype != "movie" and int(season or 1) > 1:
+                    tot = 0
+                    for sn in d.get("seasons") or []:
+                        sn_no = int(sn.get("season_number") or 0)
+                        if 0 < sn_no < int(season or 1):
+                            tot += int(sn.get("episode_count") or 0)
+                    if tot:
+                        abs_ep = tot + int(episode or 1)
                 info = {
                     "title": d.get("title") or d.get("name"),
                     "originalTitle": d.get("original_title") or d.get("original_name"),
                     "year": int(date[:4]) if date[:4].isdigit() else None,
                     "originalLanguage": d.get("original_language"),
+                    "absEpisode": abs_ep,
                 }
                 res = ext_sources.resolve(int(tmdb), mtype, season, episode,
                                           source=source, info=info)

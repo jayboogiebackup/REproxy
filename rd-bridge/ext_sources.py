@@ -429,14 +429,36 @@ def _ani_norm(s):
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
+def _ani_tokens(s):
+    return re.findall(r"[a-z0-9]+", (s or "").lower())
+
+
+def _ani_extra_ok(name, query):
+    """Is `name` just `query` plus benign qualifiers?
+
+    Prevents a different production from passing on a prefix match. Real example:
+    query "One Piece" matched "One Piece Film: Red" (extra: film, red) — a
+    completely different title that happened to fall within a year of the ask.
+    Only season/part/TV/cour style qualifiers are allowed to extend a title.
+    """
+    q, n = _ani_tokens(query), _ani_tokens(name)
+    if not q or n[: len(q)] != q:
+        return False
+    extra = n[len(q):]
+    if not extra:
+        return True
+    allowed = {"tv", "season", "part", "cour", "final", "st", "nd", "rd", "th", "the", "series"}
+    return all(t in allowed or t.isdigit() for t in extra)
+
+
 def _ani_score(name, year, want_titles, want_year):
     """How confidently does this search hit match what was asked for.
 
     anikoto is the ONLY source matched by text (castle and vixsrc are keyed on the
     TMDB id, so they cannot mismatch). Accepting a loose substring match is how
     the player ended up opening a different anime than the one clicked, so the
-    bar here is deliberately high: exact title, or a near-exact title with a
-    matching year. A wrong-era hit is pushed below the accept threshold.
+    bar here is deliberately high: exact title, or the same title plus only
+    season/part qualifiers. A wrong-era hit is pushed below the threshold.
     """
     n = _ani_norm(name)
     if not n:
@@ -448,12 +470,8 @@ def _ani_score(name, year, want_titles, want_year):
             continue
         if n == q:
             best = max(best, 5)
-        elif n.startswith(q) and len(n) <= len(q) + 14:
+        elif _ani_extra_ok(name, t):
             best = max(best, 3)
-        elif q.startswith(n) and len(q) <= len(n) + 14:
-            best = max(best, 3)
-        # A bare containment hit is NOT enough on its own — "evangelion" is
-        # contained in three different productions.
     if best == 0:
         return 0
     if want_year and year:
@@ -461,7 +479,8 @@ def _ani_score(name, year, want_titles, want_year):
     return best
 
 
-def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None):
+def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None,
+                    ep_override=None):
     """TMDB titles -> anikoto search -> megaplay master.m3u8."""
     import time as _t
     s = _sess({"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -513,7 +532,9 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None):
             eps.append({"num": int(m.group(2)), "dub": m.group(4) == "1", "ids": m.group(5)})
         if not eps:
             return {"error": "anikoto: no episodes"}
-        want = int(episode or 1)
+        # Flat-numbered shows (One Piece: 1..1180) need the ABSOLUTE episode;
+        # sending TMDB season 21 episode 1 as "1" played the 1999 pilot.
+        want = int(ep_override or episode or 1)
         cand = [e for e in eps if e["num"] == want] or [e for e in eps if e["num"] == 1]
         ep = cand[0]
 
@@ -556,7 +577,8 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None):
                 return {"url": master, "source": "anikoto", "audio_type": sv["type"],
                         "audio": "eng" if sv["type"] == "dub" else "jpn",
                         "needs_remux": False, "via": "megaplay",
-                        "subtitles": subs[:12], "anime_id": aid, "matched": matched}
+                        "subtitles": subs[:12], "anime_id": aid, "matched": matched,
+                        "anikoto_ep": ep["num"]}
             except Exception:
                 continue
         return {"error": "anikoto: no master"}
@@ -564,10 +586,11 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None):
         return {"error": f"anikoto: {str(e)[:80]}"}
 
 
-def _ani_safe(titles, season, episode, year=None):
+def _ani_safe(titles, season, episode, year=None, ep_override=None):
     """anikoto_resolve that never raises, so one dead provider can't break the chain."""
     try:
-        return anikoto_resolve(titles, season, episode, year=year) or {"error": "anikoto: empty"}
+        return anikoto_resolve(titles, season, episode, year=year,
+                              ep_override=ep_override) or {"error": "anikoto: empty"}
     except Exception as e:
         return {"error": f"anikoto: {str(e)[:80]}"}
 
@@ -615,7 +638,8 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
         # with an English DUB at 1080p, so for a Japanese-original title it goes
         # to the front of the chain.
         if is_anime:
-            ani = _ani_safe(titles, season, episode, (info or {}).get("year"))
+            ani = _ani_safe(titles, season, episode, (info or {}).get("year"),
+                          (info or {}).get("absEpisode"))
             if ani.get("url"):
                 out = dict(ani, source="repeaks")
                 _cache_put(_result_cache, ck, out)
@@ -632,17 +656,12 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
             _cache_put(_result_cache, ck, out)
             return out
 
-        # Last chance for anime whose TMDB language tag is not 'ja'.
-        reasons = []
-        if not is_anime:
-            ani = _ani_safe(titles, season, episode, (info or {}).get("year"))
-            if ani.get("url"):
-                out = dict(ani, source="repeaks")
-                _cache_put(_result_cache, ck, out)
-                return out
-            if ani.get("error"):
-                reasons.append(ani["error"])
-        reasons += [r["error"] for r in (first, second) if r.get("error")]
+        # NO anikoto fallback for non-anime. Measured: TMDB 111110 is the
+        # LIVE-ACTION One Piece (originalLanguage 'en'), and searching anikoto for
+        # it returned "One Piece Film: Red" — a different production entirely.
+        # anikoto is an anime catalogue; a non-anime title must never be resolved
+        # against it, even as a last resort.
+        reasons = [r["error"] for r in (first, second) if r.get("error")]
         return {"error": "; ".join(reasons)[:180] or "repeaks: no stream",
                 "rejected": (second.get("rejected") or first.get("rejected") or [])}
 

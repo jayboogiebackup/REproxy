@@ -129,7 +129,9 @@ def main():
         print(f"{label:5s} n={len(sel)}  p50={p50:.0f}ms  max={max(times)}ms  "
               f"not-clean={len(bad)}/{len(sel)}")
         for r in bad:
-            print(f"   ! {r['case']:36s} {r['flags']:22s} {r['name'][:44]}")
+            # error rows have no 'name' (resolve() returns {ms,error} on failure)
+            label = (r.get("name") or r.get("error") or "")[:44]
+            print(f"   ! {r['case']:36s} {r['flags']:22s} {label}")
     if args.json:
         print(json.dumps(rows, indent=1))
     return 0

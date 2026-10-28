@@ -3047,6 +3047,45 @@ def _primary_sanity(c, codec, want_h):
     return (codec_bad, _size_rank(gb), _res_size_sanity(h, gb))
 
 
+
+# ── COLLECTION PACKS (v1.6, MEASURED 2026-10-28) ──────────────────────────
+# For an EPISODE request, a season/collection torrent is a trap: RD accepts the
+# magnet (201) and then sits at status=downloading, progress=0, because it must
+# fetch the WHOLE collection before it can serve one file. The resolve burns its
+# deadline there and the player reports "no stream" — which is exactly what
+# happened to Frieren S1E1, where the top candidates were all packs:
+#   [ToonsHub] Frieren S01 E01-E14 2160p   · [SubsPlease] 01-28 Batch
+#   [Erai-raws] 01 ~ 28 [BATCH]            · [wham] ... S01 (BD 1080p)
+# 84 candidates came back and the walk still ended on a remux. A single-episode
+# release (Sousou no Frieren - 01) resolves from cache in seconds.
+_BATCH_RANGE_RE = re.compile(r"(?:s\d{1,2})?\s*e?p?\s*(\d{1,3})\s*[-~\u2013]\s*(?:s\d{1,2})?\s*e?p?\s*(\d{1,3})", re.I)
+_BATCH_WORD_RE = re.compile(r"\b(batch|complete|collection|season\s*pack|all\s*episodes)\b", re.I)
+
+
+def _is_collection_release(name, mtype, season=None, episode=None):
+    """True when this release is a multi-episode collection, not one episode."""
+    if mtype == "movie" or not name:
+        return False
+    n = name.lower()
+    if _BATCH_WORD_RE.search(n):
+        return True
+    m = _BATCH_RANGE_RE.search(n)
+    if m:
+        try:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if hi > lo:          # "E01-E14", "01-28", "01 ~ 28"
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _batch_penalty(c, mtype, season=None, episode=None):
+    """Sort prefix: 0 for a single-episode release, 1 to walk it only after
+    every one-episode candidate has been tried."""
+    return 1 if _is_collection_release(c.get("name", ""), mtype, season, episode) else 0
+
+
 def _candidate_order_key(c, want_h, lang, codec, accept=None):
     # Rule 1 (cam never above HD) is enforced structurally: the cam flag is the
     # FIRST key (1 = cam, so it sorts last ascending), so even a cam that
@@ -3803,7 +3842,8 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
         # one is tried first (then codec_rank breaks ties). See
         # _candidate_order_key.
         order = sorted(candidates,
-                       key=lambda c: _candidate_order_key(c, want_h, lang, codec, accept))
+                       key=lambda c: (_batch_penalty(c, mtype, season, episode),
+                                      _candidate_order_key(c, want_h, lang, codec, accept)))
         # Stremio-style: try candidates until one streams. Cached = instant;
         # non-cached = RD downloads on their servers (30s-3min).
         # PARALLEL batches (3 at a time): each add is independent, so this
@@ -4067,7 +4107,9 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
     # cached/unflagged hashes resolve instantly. Also wait longer for RD to
     # fetch non-cached torrents (RD does the downloading, not us).
     # Same popularity-first, sanity-filtered ordering as the main walk.
-    order = sorted(candidates, key=lambda c: _candidate_order_key(c, want_h, lang, codec, accept))
+    order = sorted(candidates,
+                   key=lambda c: (_batch_penalty(c, mtype, season, episode),
+                                  _candidate_order_key(c, want_h, lang, codec, accept)))
     tried = 0
     remux_fb = None
     for c in order:
@@ -4343,6 +4385,57 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "busy"}, 429, {"Retry-After": "10"})
             try:
                 return self._do_resolve(q, tmdb, mtype)
+            finally:
+                _release_slot()
+        # ── external sources (CastleTV / Vixsrc) ──────────────────────────
+        # Reverse-engineered from yapgrid's player. Spends NO Real-Debrid quota.
+        # CastleTV's hscow CDN plays DIRECT in the browser (no Referer required),
+        # so it costs this bridge no bandwidth and adds no relay hop. Its major
+        # titles are frequently Hindi-first, so ext_sources sniffs the TS head
+        # and refuses picks whose FIRST audio track is not English rather than
+        # silently serving the wrong language.
+        if url.path == "/api/rd/ext":
+            gate = self._gate()
+            if gate:
+                return gate
+            tmdb = q.get("tmdb", [None])[0]
+            mtype = q.get("type", [None])[0]
+            source = (q.get("source", ["castle"])[0] or "castle").lower()
+            if not tmdb or not mtype:
+                return self._json({"error": "tmdb + type required"}, 400)
+            if not re.fullmatch(r"\d{1,9}", str(tmdb)) or mtype not in ("movie", "tv", "anime"):
+                return self._json({"error": "bad tmdb/type"}, 400)
+            if source not in ("castle", "vixsrc"):
+                return self._json({"error": "bad source"}, 400)
+            try:
+                season = int(q.get("season", [0])[0] or 0) or None
+                episode = int(q.get("episode", [0])[0] or 0) or None
+            except (TypeError, ValueError):
+                return self._json({"error": "bad season/episode"}, 400)
+            if not _acquire_slot():
+                return self._json({"error": "busy"}, 429, {"Retry-After": "10"})
+            try:
+                import ext_sources
+                info = None
+                if source == "castle":
+                    kind = "movie" if mtype == "movie" else "tv"
+                    st, body = http_get(
+                        f"https://api.themoviedb.org/3/{kind}/{tmdb}"
+                        f"?api_key={TMDB_KEY}&language=en-US", timeout=15)
+                    d = json.loads(body) if st == 200 and body else {}
+                    date = d.get("release_date") or d.get("first_air_date") or ""
+                    info = {
+                        "title": d.get("title") or d.get("name"),
+                        "originalTitle": d.get("original_title") or d.get("original_name"),
+                        "year": int(date[:4]) if date[:4].isdigit() else None,
+                        "originalLanguage": d.get("original_language"),
+                    }
+                res = ext_sources.resolve(int(tmdb), mtype, season, episode,
+                                          source=source, info=info)
+                return self._json(res, 200 if not res.get("error") else 404)
+            except Exception as e:
+                _audit(f"EXT {source} tmdb={tmdb} failed: {e}")
+                return self._json({"error": f"{source} resolve failed"}, 502)
             finally:
                 _release_slot()
         # Read-only candidate PREVIEW for PLAYER FEEDBACK. The resolve above can

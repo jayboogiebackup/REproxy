@@ -18,6 +18,7 @@ Nothing in here touches Real-Debrid. No paid quota is spent.
 """
 
 import base64
+import html as _html
 import json
 import re
 import threading
@@ -477,7 +478,11 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None):
             best = None
             for href, body in re.findall(r'<a[^>]*class="item"[^>]*href="([^"]+)"(.*?)</a>', html, re.S):
                 m = re.search(r'class="name[^"]*"[^>]*>\s*([^<]+)', body)
-                nm = (m.group(1).strip() if m else "")
+                # Result titles are HTML-escaped ("Howl&#039;s Moving Castle"), and
+                # _ani_norm strips punctuation but keeps DIGITS — so the entity
+                # normalised to "howl039smovingcastle" and never matched. Unescape
+                # before scoring.
+                nm = _html.unescape(m.group(1).strip()) if m else ""
                 plain = re.sub(r'<[^>]+>', ' ', body)
                 ym = re.search(r'\b(19|20)\d{2}\b', plain)
                 yr = int(ym.group(0)) if ym else None

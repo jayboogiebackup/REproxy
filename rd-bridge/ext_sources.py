@@ -297,12 +297,17 @@ def vixsrc_master(mtype, tmdb, season=None, episode=None, lang="en"):
     path = (f"/api/tv/{tmdb}/{int(season or 1)}/{int(episode or 1)}"
             if mtype != "movie" else f"/api/movie/{tmdb}")
     r = s.get(f"{VIX_BASE}{path}", timeout=20)
-    r.raise_for_status()
+    # A 404 here is normal: vixsrc simply does not carry every title. Raising
+    # propagated out of the "repeaks" composite and killed the whole chain, so a
+    # missing show must degrade to None, not an exception.
+    if r.status_code != 200:
+        return None
     src = (r.json() or {}).get("src")
     if not src:
         return None
     embed = s.get(f"{VIX_BASE}{src}", timeout=25)
-    embed.raise_for_status()
+    if embed.status_code != 200:
+        return None
     html = embed.text
 
     m_url = re.search(r"url:\s*'(https://vixsrc\.to/playlist/\d+)'", html)
@@ -391,6 +396,20 @@ def _cacheable(payload):
     return any(k in err for k in _CACHEABLE_ERRORS)
 
 
+def _safe_resolve(tmdb, mtype, season, episode, source, info, require_english):
+    """resolve() that never raises.
+
+    A dead or missing provider is routine (vixsrc 404s on plenty of titles); it
+    must degrade to an error dict so the next provider in the chain still runs.
+    """
+    try:
+        return resolve(tmdb, mtype, season, episode, source=source,
+                       info=info, require_english=require_english) or {
+                           "error": f"{source}: empty result"}
+    except Exception as e:  # noqa: BLE001 - deliberately broad
+        return {"error": f"{source}: {str(e)[:80]}"}
+
+
 def resolve(tmdb, mtype, season=None, episode=None, source="castle",
             info=None, require_english=True, attempts=3):
     """-> {"url","source","audio","rejected":[...]} or {"error":...}
@@ -409,19 +428,19 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
     # 1080p with an English rendition, DEFAULT=YES, plays straight off the CDN),
     # castle second. Each keeps its own cache entry.
     if source == "repeaks":
-        first = resolve(tmdb, mtype, season, episode, source="vixsrc",
-                        info=info, require_english=require_english)
+        # One source failing must never abort the chain: a missing vixsrc title is
+        # routine, and an exception here previously took castle down with it.
+        first = _safe_resolve(tmdb, mtype, season, episode, "vixsrc", info, require_english)
         if first.get("url"):
             out = dict(first, source="repeaks", via=first.get("via") or "direct")
             _cache_put(_result_cache, ck, out)
             return out
-        second = resolve(tmdb, mtype, season, episode, source="castle",
-                         info=info, require_english=require_english)
+        second = _safe_resolve(tmdb, mtype, season, episode, "castle", info, require_english)
         if second.get("url"):
             out = dict(second, source="repeaks")
             _cache_put(_result_cache, ck, out)
             return out
-        reasons = [r.get("error") for r in (first, second) if r.get("error")]
+        reasons = [r["error"] for r in (first, second) if r.get("error")]
         return {"error": "; ".join(reasons)[:180] or "repeaks: no stream",
                 "rejected": (second.get("rejected") or first.get("rejected") or [])}
 

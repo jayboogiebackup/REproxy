@@ -4417,21 +4417,28 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 import ext_sources
                 info = None
-                if source in ("castle", "repeaks"):
-                    kind = "movie" if mtype == "movie" else "tv"
-                    st, body = http_get(
-                        f"https://api.themoviedb.org/3/{kind}/{tmdb}"
-                        f"?api_key={TMDB_KEY}&language=en-US", timeout=15)
-                    d = json.loads(body) if st == 200 and body else {}
-                    date = d.get("release_date") or d.get("first_air_date") or ""
-                    info = {
-                        "title": d.get("title") or d.get("name"),
-                        "originalTitle": d.get("original_title") or d.get("original_name"),
-                        "year": int(date[:4]) if date[:4].isdigit() else None,
-                        "originalLanguage": d.get("original_language"),
-                    }
+                # Always resolve TMDB info: castle needs the titles to match, and
+                # the player needs them to search the anime resolver even when
+                # every source here fails.
+                kind = "movie" if mtype == "movie" else "tv"
+                st, body = http_get(
+                    f"https://api.themoviedb.org/3/{kind}/{tmdb}"
+                    f"?api_key={TMDB_KEY}&language=en-US", timeout=15)
+                d = json.loads(body) if st == 200 and body else {}
+                date = d.get("release_date") or d.get("first_air_date") or ""
+                info = {
+                    "title": d.get("title") or d.get("name"),
+                    "originalTitle": d.get("original_title") or d.get("original_name"),
+                    "year": int(date[:4]) if date[:4].isdigit() else None,
+                    "originalLanguage": d.get("original_language"),
+                }
                 res = ext_sources.resolve(int(tmdb), mtype, season, episode,
                                           source=source, info=info)
+                # Hand the searchable titles back regardless of outcome.
+                res["titles"] = [t for t in (info.get("title"), info.get("originalTitle")) if t]
+                res["originalLanguage"] = info.get("originalLanguage")
+                if info.get("year"):
+                    res["year"] = info["year"]
                 return self._json(res, 200 if not res.get("error") else 404)
             except Exception as e:
                 _audit(f"EXT {source} tmdb={tmdb} failed: {e}")

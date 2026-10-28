@@ -4405,7 +4405,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "tmdb + type required"}, 400)
             if not re.fullmatch(r"\d{1,9}", str(tmdb)) or mtype not in ("movie", "tv", "anime"):
                 return self._json({"error": "bad tmdb/type"}, 400)
-            if source not in ("castle", "vixsrc", "repeaks"):
+            if source not in ("castle", "vixsrc", "repeaks", "anikoto"):
                 return self._json({"error": "bad source"}, 400)
             try:
                 season = int(q.get("season", [0])[0] or 0) or None

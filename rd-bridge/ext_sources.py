@@ -396,6 +396,138 @@ def _cacheable(payload):
     return any(k in err for k in _CACHEABLE_ERRORS)
 
 
+# ── anikoto / megaplay ───────────────────────────────────────────────────
+# Anime source. No Cloudflare challenge on the resolve chain (unlike miruro),
+# 1080p, and a real English DUB track. Media is Referer-gated on megaplay.buzz,
+# so the player relays it through /api/replayer/anime.
+ANI_BASE = "https://anikototv.to"
+ANI_KEY = "i?LMTAx0Q6,:}50U"
+ANI_IV = "W0;27ToaUpl_P%'c"
+
+
+def _ani_pad(s, n):
+    b = s.encode()
+    return (b + b"\x00" * n)[:n]
+
+
+def _ani_decrypt(enc):
+    import base64 as _b64
+
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    s = enc.replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    ct = _b64.b64decode(s)
+    dec = Cipher(algorithms.AES(_ani_pad(ANI_KEY, 32)), modes.CBC(_ani_pad(ANI_IV, 16))).decryptor()
+    pt = dec.update(ct) + dec.finalize()
+    n = pt[-1]
+    body = pt[:-n] if 0 < n <= 16 else pt
+    return json.loads(body.decode("utf-8"))
+
+
+def _ani_norm(s):
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def anikoto_resolve(titles, season=None, episode=None, prefer="dub"):
+    """TMDB titles -> anikoto search -> megaplay master.m3u8."""
+    import time as _t
+    s = _sess({"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/131.0.0.0 Safari/537.36"),
+               "Referer": ANI_BASE + "/", "X-Requested-With": "XMLHttpRequest"})
+    hit = None
+    for title in [t for t in (titles or []) if t][:2]:
+        try:
+            r = s.get(f"{ANI_BASE}/ajax/anime/search", params={"keyword": title}, timeout=20)
+            html = ((r.json().get("result") or {}).get("html")) or ""
+            best = None
+            for href, body in re.findall(r'<a[^>]*class="item"[^>]*href="([^"]+)"(.*?)</a>', html, re.S):
+                m = re.search(r'class="name[^"]*"[^>]*>\s*([^<]+)', body)
+                nm = (m.group(1).strip() if m else "")
+                score = 2 if _ani_norm(nm) == _ani_norm(title) else (
+                    1 if _ani_norm(title) in _ani_norm(nm) else 0)
+                if best is None or score > best[0]:
+                    best = (score, href)
+            if best and best[0] > 0:
+                hit = best[1]
+                break
+        except Exception:
+            continue
+    if not hit:
+        return {"error": "anikoto: no matching title"}
+
+    try:
+        aid = re.search(r'data-anime-id="(\d+)"', s.get(hit, timeout=20).text)
+        if not aid:
+            return {"error": "anikoto: no anime id"}
+        aid = aid.group(1)
+        r = s.get(f"{ANI_BASE}/ajax/episode/list/{aid}", timeout=20)
+        html = (r.json().get("result") or "")
+        eps = []
+        for m in re.finditer(r'<a[^>]*data-id="(\d+)"[^>]*data-num="(\d+)"[^>]*'
+                             r'data-sub="(\d?)"[^>]*data-dub="(\d?)"[^>]*data-ids="([^"]+)"', html):
+            eps.append({"num": int(m.group(2)), "dub": m.group(4) == "1", "ids": m.group(5)})
+        if not eps:
+            return {"error": "anikoto: no episodes"}
+        want = int(episode or 1)
+        cand = [e for e in eps if e["num"] == want] or [e for e in eps if e["num"] == 1]
+        ep = cand[0]
+
+        r = s.get(f"{ANI_BASE}/ajax/server/list", params={"servers": ep["ids"]}, timeout=20)
+        html = (r.json().get("result") or "")
+        srv = []
+        for grp in re.split(r'data-type="', html):
+            t = grp[:3]
+            if t not in ("sub", "dub"):
+                continue
+            for m in re.finditer(r'<li[^>]*data-sv-id="(\d+)"[^>]*data-link-id="([^"]+)"', grp):
+                srv.append({"type": t, "link": m.group(2)})
+        if not srv:
+            return {"error": "anikoto: no servers"}
+        # English first: dub when the episode has one, else sub (JP + English subs).
+        order = ([x for x in srv if x["type"] == prefer] + [x for x in srv if x["type"] != prefer]
+                 if prefer else srv)
+
+        for sv in order[:3]:
+            try:
+                r = s.get(f"{ANI_BASE}/ajax/server", params={"get": sv["link"]}, timeout=20)
+                embed = ((r.json().get("result") or {}).get("url")) or ""
+                if "megaplay" not in embed:
+                    continue
+                em = s.get(embed, timeout=20)
+                mid = re.search(r'data-mediaid="(\d+)"', em.text)
+                if not mid:
+                    continue
+                g = s.get("https://megaplay.buzz/stream/getSources",
+                          params={"id": mid.group(1)},
+                          headers={"Referer": "https://megaplay.buzz/"}, timeout=20)
+                j = g.json()
+                if not j.get("enc"):
+                    continue
+                inner = _ani_decrypt(j["enc"])
+                master = inner.get("file")
+                if not master:
+                    continue
+                subs = [t for t in (j.get("tracks") or []) if t.get("kind") == "captions"]
+                return {"url": master, "source": "anikoto", "audio_type": sv["type"],
+                        "audio": "eng" if sv["type"] == "dub" else "jpn",
+                        "needs_remux": False, "via": "megaplay",
+                        "subtitles": subs[:12], "anime_id": aid}
+            except Exception:
+                continue
+        return {"error": "anikoto: no master"}
+    except Exception as e:
+        return {"error": f"anikoto: {str(e)[:80]}"}
+
+
+def _ani_safe(titles, season, episode):
+    """anikoto_resolve that never raises, so one dead provider can't break the chain."""
+    try:
+        return anikoto_resolve(titles, season, episode) or {"error": "anikoto: empty"}
+    except Exception as e:
+        return {"error": f"anikoto: {str(e)[:80]}"}
+
+
 def _safe_resolve(tmdb, mtype, season, episode, source, info, require_english):
     """resolve() that never raises.
 
@@ -430,6 +562,21 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
     if source == "repeaks":
         # One source failing must never abort the chain: a missing vixsrc title is
         # routine, and an exception here previously took castle down with it.
+        is_anime = str((info or {}).get("originalLanguage") or "").lower() == "ja"
+        titles = [t for t in ((info or {}).get("title"), (info or {}).get("originalTitle")) if t]
+
+        # ANIME FIRST. vixsrc carries no anime at all (404), and castle's anime is
+        # Hindi/Tamil-first and only 720p — those two failing is exactly why every
+        # anime episode used to end up on repokapone. anikoto is the one source
+        # with an English DUB at 1080p, so for a Japanese-original title it goes
+        # to the front of the chain.
+        if is_anime:
+            ani = _ani_safe(titles, season, episode)
+            if ani.get("url"):
+                out = dict(ani, source="repeaks")
+                _cache_put(_result_cache, ck, out)
+                return out
+
         first = _safe_resolve(tmdb, mtype, season, episode, "vixsrc", info, require_english)
         if first.get("url"):
             out = dict(first, source="repeaks", via=first.get("via") or "direct")
@@ -440,9 +587,24 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
             out = dict(second, source="repeaks")
             _cache_put(_result_cache, ck, out)
             return out
-        reasons = [r["error"] for r in (first, second) if r.get("error")]
+
+        # Last chance for anime whose TMDB language tag is not 'ja'.
+        reasons = []
+        if not is_anime:
+            ani = _ani_safe(titles, season, episode)
+            if ani.get("url"):
+                out = dict(ani, source="repeaks")
+                _cache_put(_result_cache, ck, out)
+                return out
+            if ani.get("error"):
+                reasons.append(ani["error"])
+        reasons += [r["error"] for r in (first, second) if r.get("error")]
         return {"error": "; ".join(reasons)[:180] or "repeaks: no stream",
                 "rejected": (second.get("rejected") or first.get("rejected") or [])}
+
+    if source == "anikoto":
+        return _ani_safe([t for t in ((info or {}).get("title"), (info or {}).get("originalTitle")) if t],
+                         season, episode)
 
     if source == "vixsrc":
         master = vixsrc_master(mtype, tmdb, season, episode)

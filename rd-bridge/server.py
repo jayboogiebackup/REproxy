@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 import urllib.error
@@ -3285,7 +3286,7 @@ def url_matches_type(url, mtype, season=None, episode=None):
 
 
 def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None,
-                   nocache=False, dead=None):
+                   nocache=False, dead=None, rid=None):
     """Full flow → direct stream URL, with STRICT show/movie separation:
     a show never plays a movie and vice versa. Any resolved URL that fails
     the type check is rejected. codec='h264' → H.264/AVC only (Firefox
@@ -3354,7 +3355,7 @@ def resolve_stream(tmdb, mtype, season=None, episode=None, quality=None, skip_ac
                 return cached
         # else: the cached entry is a foreign-audio release (written before
         # the audio-language check) → fall through and re-resolve.
-    result = _resolve_stream_impl(tmdb, mtype, season, episode, quality, skip_account, codec, lang)
+    result = _resolve_stream_impl(tmdb, mtype, season, episode, quality, skip_account, codec, lang, rid=rid)
     if soft_cached is not None and not (isinstance(result, dict) and result.get("url")):
         # Nothing playable exists for this title — a cached HEVC / remux stream
         # beats "no stream" (the player's decode-error retry handles it).
@@ -3475,19 +3476,19 @@ def _is_hevc_name(name):
     return any(x in n for x in ("HEVC", "X265", "H265"))
 
 
-def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None):
+def _resolve_stream_impl(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None, rid=None):
     """Wrapper around the real walk. Resets the per-source diagnostic counter,
     then attaches the resulting `_sources` counts to the result dict. Purely
     informational — the walk and its behaviour are unchanged."""
     _SRC_COUNTS.clear()
     result = _resolve_stream_impl_inner(tmdb, mtype, season, episode, quality,
-                                        skip_account, codec, lang)
+                                        skip_account, codec, lang, rid=rid)
     if isinstance(result, dict):
         result["_sources"] = dict(_SRC_COUNTS)
     return result
 
 
-def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None):
+def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=None, skip_account=False, codec=None, lang=None, rid=None):
     """Full flow → direct stream URL. codec='h264' filters to H.264/AVC only.
     lang='dub' prefers English-dubbed releases for anime."""
     if not RD_KEY:
@@ -3515,6 +3516,7 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
     # failure paths can tell "the provider blocks every candidate (HTTP 451)"
     # apart from "nothing resolved (uncached / no HD / all rejected)".
     _block0 = _rd_block_snapshot()
+    _progress_start(rid)
 
     def _soft_hevc_result():
         if not soft_hevc["url"]:
@@ -3648,6 +3650,7 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
             rd_hits = []
         if rd_hits:
             _src_count("torrentio-rd", len(rd_hits))
+            _progress_set(rid, phase="torrentio-rd", total=len(rd_hits))
             rd_remux = None
             rd_deadline = time.time() + 12
             rd_order = sorted(
@@ -3687,6 +3690,7 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
                     if rd_remux is None:
                         rd_remux = (u, c)
                     continue
+                _progress_tried(rid, c.get("name", ""), "playing", "torrentio-rd cached")
                 _audit(f"torrentio-rd hit cached={bool(c.get('rd_cached'))} {_url_name(u)[:60]}")
                 return {"url": u, "source": "torrentio-rd",
                         "title": c.get("name", "")[:80], "imdb": imdb}
@@ -3881,14 +3885,24 @@ def _resolve_stream_impl_inner(tmdb, mtype, season=None, episode=None, quality=N
                                          or time.time() > fits_deadline):
                 break
             batch = order[start:start + BATCH]
+            # Progress: the batch currently in flight is what "trying" means —
+            # the walk is a small fan-out, not a serial scan, so the screen shows
+            # the group being attempted and then each verdict as it lands.
+            _progress_set(rid, phase="trying",
+                          trying=[(c.get("name") or "")[:70] for c in batch])
             with _cf.ThreadPoolExecutor(max_workers=BATCH) as ex:
-                for res in ex.map(_try_one, batch):
+                results = list(ex.map(_try_one, batch))
+            for c, res in zip(batch, results):
                     tried += 1
                     if not res:
+                        _progress_tried(rid, c.get("name", ""), "no-stream")
                         continue
                     url, c, plan = res
                     if not url:
+                        _progress_tried(rid, c.get("name", ""), "no-stream")
                         continue
+                    _progress_tried(rid, c.get("name", ""),
+                                    "remux" if plan == "remux" else "playing")
                     if plan != "remux":
                         return {"url": url, "source": "realdebrid", "title": c.get("name", "")[:80], "imdb": imdb}
                     if fallback is None:
@@ -4143,6 +4157,92 @@ def _account_library_matches(tmdb, mtype, season=None, episode=None):
     return hits
 
 
+# ── resolve PROGRESS (what the player's torrent screen shows) ─────────────
+# The player sends a `rid` (one per load) and polls /api/rd/progress, so the
+# loading screen can show the REAL walk — which releases are in flight and what
+# happened to the ones already tried — instead of an invented animation.
+#
+# FILE-BACKED, not in-memory: /api/rd/stream runs the resolve in a SUBPROCESS
+# (resolve_cli.py, so a hung RD call can never deadlock the server), which means
+# the process holding the request is not the one doing the walking. A tiny JSON
+# record per rid under the system temp dir is visible to both, costs one small
+# write per candidate, and needs no IPC.
+PROGRESS_DIR = os.path.join(tempfile.gettempdir(), "repeaks-progress")
+_PROGRESS_TTL_S = 120
+
+
+def _progress_path(rid):
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", rid or "")[:64]
+    return os.path.join(PROGRESS_DIR, f"{safe}.json") if safe else None
+
+
+def _progress_write(rid, rec):
+    path = _progress_path(rid)
+    if not path:
+        return
+    try:
+        os.makedirs(PROGRESS_DIR, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rec, f)
+        os.replace(tmp, path)   # atomic: a poller never sees a half-written file
+    except Exception:
+        pass
+
+
+def _progress_read(rid):
+    path = _progress_path(rid)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            rec = json.load(f)
+        if time.time() - rec.get("ts", 0) > _PROGRESS_TTL_S:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            return None
+        return rec
+    except Exception:
+        return None
+
+
+def _progress_start(rid):
+    if not rid:
+        return
+    _progress_write(rid, {"ts": time.time(), "started": time.time(), "phase": "sources",
+                          "trying": [], "tried": [], "total": 0, "done": False,
+                          "source": None})
+
+
+def _progress_set(rid, **fields):
+    if not rid:
+        return
+    rec = _progress_read(rid) or {"ts": time.time(), "tried": [], "trying": []}
+    rec.update(fields)
+    rec["ts"] = time.time()
+    _progress_write(rid, rec)
+
+
+def _progress_tried(rid, name, verdict, detail=""):
+    """One finished attempt, with the honest outcome: playing / remux /
+    no-stream. The screen shows these in order under the batch being tried."""
+    if not rid:
+        return
+    rec = _progress_read(rid) or {"ts": time.time(), "tried": [], "trying": []}
+    tried = rec.get("tried") or []
+    tried.append({"name": (name or "")[:88], "verdict": verdict, "detail": (detail or "")[:60]})
+    rec["tried"] = tried[-24:]      # the screen only ever shows a window
+    rec["trying"] = []
+    rec["ts"] = time.time()
+    _progress_write(rid, rec)
+
+
+def progress_get(rid):
+    return _progress_read(rid) or {}
+
+
 def preview_candidates(tmdb, mtype, season=None, episode=None, quality=None, lang=None,
                        codec=None, budget=None):
     """Read-only candidate preview for PLAYER FEEDBACK.
@@ -4253,6 +4353,15 @@ class Handler(BaseHTTPRequestHandler):
         # TRIED as soon as the first results arrive. It is strictly read-only —
         # no torrent add, no unrestrict, no resolve-cache write — so a slow or
         # hung indexer on this path can never damage the resolve.
+        if url.path == "/api/rd/progress":
+            # Polled by the player's torrent screen while a resolve is running.
+            # Read-only, token-gated like the rest, and returns an empty record
+            # for an unknown/expired rid rather than an error.
+            if self._gate():
+                return
+            ridq = (q.get("rid", [None])[0] or "")[:64]
+            return self._json({"rid": ridq, **progress_get(ridq)}, extra={
+                "Cache-Control": "no-store"})
         if url.path == "/api/rd/candidates":
             gate = self._gate()
             if gate:
@@ -4341,6 +4450,7 @@ class Handler(BaseHTTPRequestHandler):
         # Playback-failure failover: the player reports the direct link that
         # just died and asks for a fresh walk that must not serve it again.
         nocache = q.get("nocache", ["0"])[0] == "1"
+        rid = (q.get("rid", [None])[0] or "")[:64] or None
         dead = q.get("dead", [None])[0]
         # Only a plausible RD direct link is accepted (it travels into the
         # subprocess argv and into the dead-link blacklist).
@@ -4368,6 +4478,8 @@ class Handler(BaseHTTPRequestHandler):
             args.append("--nocache")
         if dead:
             args.append(f"--dead={dead}")
+        if rid:
+            args.append(f"--rid={rid}")
         debug = q.get("debug", ["0"])[0] == "1"
         try:
             proc = _sp.run(args, capture_output=True, text=True, timeout=150)

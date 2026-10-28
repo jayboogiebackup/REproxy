@@ -428,7 +428,39 @@ def _ani_norm(s):
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
-def anikoto_resolve(titles, season=None, episode=None, prefer="dub"):
+def _ani_score(name, year, want_titles, want_year):
+    """How confidently does this search hit match what was asked for.
+
+    anikoto is the ONLY source matched by text (castle and vixsrc are keyed on the
+    TMDB id, so they cannot mismatch). Accepting a loose substring match is how
+    the player ended up opening a different anime than the one clicked, so the
+    bar here is deliberately high: exact title, or a near-exact title with a
+    matching year. A wrong-era hit is pushed below the accept threshold.
+    """
+    n = _ani_norm(name)
+    if not n:
+        return 0
+    best = 0
+    for t in want_titles:
+        q = _ani_norm(t)
+        if not q:
+            continue
+        if n == q:
+            best = max(best, 5)
+        elif n.startswith(q) and len(n) <= len(q) + 14:
+            best = max(best, 3)
+        elif q.startswith(n) and len(q) <= len(n) + 14:
+            best = max(best, 3)
+        # A bare containment hit is NOT enough on its own — "evangelion" is
+        # contained in three different productions.
+    if best == 0:
+        return 0
+    if want_year and year:
+        best += 3 if abs(int(year) - int(want_year)) <= 1 else -4
+    return best
+
+
+def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None):
     """TMDB titles -> anikoto search -> megaplay master.m3u8."""
     import time as _t
     s = _sess({"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -436,7 +468,9 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub"):
                               "Chrome/131.0.0.0 Safari/537.36"),
                "Referer": ANI_BASE + "/", "X-Requested-With": "XMLHttpRequest"})
     hit = None
-    for title in [t for t in (titles or []) if t][:2]:
+    matched = None
+    want = [t for t in (titles or []) if t]
+    for title in want[:2]:
         try:
             r = s.get(f"{ANI_BASE}/ajax/anime/search", params={"keyword": title}, timeout=20)
             html = ((r.json().get("result") or {}).get("html")) or ""
@@ -444,17 +478,22 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub"):
             for href, body in re.findall(r'<a[^>]*class="item"[^>]*href="([^"]+)"(.*?)</a>', html, re.S):
                 m = re.search(r'class="name[^"]*"[^>]*>\s*([^<]+)', body)
                 nm = (m.group(1).strip() if m else "")
-                score = 2 if _ani_norm(nm) == _ani_norm(title) else (
-                    1 if _ani_norm(title) in _ani_norm(nm) else 0)
-                if best is None or score > best[0]:
-                    best = (score, href)
-            if best and best[0] > 0:
+                plain = re.sub(r'<[^>]+>', ' ', body)
+                ym = re.search(r'\b(19|20)\d{2}\b', plain)
+                yr = int(ym.group(0)) if ym else None
+                sc = _ani_score(nm, yr, want, year)
+                if best is None or sc > best[0]:
+                    best = (sc, href, nm, yr)
+            # 5 == exact title, or 3 + 3 for a near-exact title in the right year.
+            # Anything below that is a guess and must not be played.
+            if best and best[0] >= 5:
                 hit = best[1]
+                matched = {"title": best[2], "year": best[3], "score": best[0]}
                 break
         except Exception:
             continue
     if not hit:
-        return {"error": "anikoto: no matching title"}
+        return {"error": "anikoto: no verified match"}
 
     try:
         aid = re.search(r'data-anime-id="(\d+)"', s.get(hit, timeout=20).text)
@@ -512,7 +551,7 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub"):
                 return {"url": master, "source": "anikoto", "audio_type": sv["type"],
                         "audio": "eng" if sv["type"] == "dub" else "jpn",
                         "needs_remux": False, "via": "megaplay",
-                        "subtitles": subs[:12], "anime_id": aid}
+                        "subtitles": subs[:12], "anime_id": aid, "matched": matched}
             except Exception:
                 continue
         return {"error": "anikoto: no master"}
@@ -520,10 +559,10 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub"):
         return {"error": f"anikoto: {str(e)[:80]}"}
 
 
-def _ani_safe(titles, season, episode):
+def _ani_safe(titles, season, episode, year=None):
     """anikoto_resolve that never raises, so one dead provider can't break the chain."""
     try:
-        return anikoto_resolve(titles, season, episode) or {"error": "anikoto: empty"}
+        return anikoto_resolve(titles, season, episode, year=year) or {"error": "anikoto: empty"}
     except Exception as e:
         return {"error": f"anikoto: {str(e)[:80]}"}
 
@@ -571,7 +610,7 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
         # with an English DUB at 1080p, so for a Japanese-original title it goes
         # to the front of the chain.
         if is_anime:
-            ani = _ani_safe(titles, season, episode)
+            ani = _ani_safe(titles, season, episode, (info or {}).get("year"))
             if ani.get("url"):
                 out = dict(ani, source="repeaks")
                 _cache_put(_result_cache, ck, out)
@@ -591,7 +630,7 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
         # Last chance for anime whose TMDB language tag is not 'ja'.
         reasons = []
         if not is_anime:
-            ani = _ani_safe(titles, season, episode)
+            ani = _ani_safe(titles, season, episode, (info or {}).get("year"))
             if ani.get("url"):
                 out = dict(ani, source="repeaks")
                 _cache_put(_result_cache, ck, out)
@@ -604,7 +643,7 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
 
     if source == "anikoto":
         return _ani_safe([t for t in ((info or {}).get("title"), (info or {}).get("originalTitle")) if t],
-                         season, episode)
+                         season, episode, (info or {}).get("year"))
 
     if source == "vixsrc":
         master = vixsrc_master(mtype, tmdb, season, episode)

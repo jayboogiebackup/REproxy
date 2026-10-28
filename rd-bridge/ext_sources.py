@@ -367,6 +367,30 @@ def _first_segment(master_url, timeout=25):
     return None
 
 
+def _fail(ck, payload):
+    """Cache a DETERMINISTIC failure so repeat loads don't re-pay the castle walk.
+
+    Only failures that cannot change on their own are cached: no such title, no
+    episodes, and audio that is not English. Transient failures (network, no
+    video url) are NOT cached, so a blip never pins a title to the fallback.
+    """
+    _cache_put(_result_cache, ck, payload)
+    return payload
+
+
+_CACHEABLE_ERRORS = (
+    "no matching title",
+    "no episodes",
+    "not English",
+    "only non-English audio",
+)
+
+
+def _cacheable(payload):
+    err = str((payload or {}).get("error") or "")
+    return any(k in err for k in _CACHEABLE_ERRORS)
+
+
 def resolve(tmdb, mtype, season=None, episode=None, source="castle",
             info=None, require_english=True, attempts=3):
     """-> {"url","source","audio","rejected":[...]} or {"error":...}
@@ -399,7 +423,7 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
         rows = castle_search(info["originalTitle"])
     row = pick_row(rows, titles, info.get("year"), mtype)
     if not row:
-        return {"error": "castle: no matching title"}
+        return _fail(ck, {"error": "castle: no matching title"})
 
     series_id = str(row.get("id") or row.get("redirectId") or "")
     detail = castle_detail(series_id)
@@ -416,7 +440,7 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
 
     eps = detail.get("episodes") or []
     if not eps:
-        return {"error": "castle: no episodes"}
+        return _fail(ck, {"error": "castle: no episodes"})
     if episode is not None:
         ep = next((x for x in eps if x.get("number") == int(episode)), None)
     else:
@@ -461,11 +485,13 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
                     if v2.get("safe") is not False:
                         url = alt
                     else:
-                        return {"error": "castle: only non-English audio available",
-                                "rejected": rejected + [{"url": alt, "langs": v2.get("langs")}]}
+                        return _fail(ck, {
+                            "error": "castle: only non-English audio available",
+                            "rejected": rejected + [{"url": alt, "langs": v2.get("langs")}]})
                 else:
-                    return {"error": "castle: first audio track is not English",
-                            "rejected": rejected}
+                    return _fail(ck, {
+                        "error": "castle: first audio track is not English",
+                        "rejected": rejected})
             out = {"url": url, "source": "castle", "audio": "fits",
                    "needs_remux": False, "via": "direct",
                    "langs": v.get("langs"), "rejected": rejected}

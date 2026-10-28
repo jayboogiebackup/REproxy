@@ -404,13 +404,37 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
     if hit:
         return hit
 
+    # "repeaks" is the player's own multi-server source: one server name in the
+    # UI that fans out across the providers underneath it. vixsrc first (real
+    # 1080p with an English rendition, DEFAULT=YES, plays straight off the CDN),
+    # castle second. Each keeps its own cache entry.
+    if source == "repeaks":
+        first = resolve(tmdb, mtype, season, episode, source="vixsrc",
+                        info=info, require_english=require_english)
+        if first.get("url"):
+            out = dict(first, source="repeaks", via=first.get("via") or "direct")
+            _cache_put(_result_cache, ck, out)
+            return out
+        second = resolve(tmdb, mtype, season, episode, source="castle",
+                         info=info, require_english=require_english)
+        if second.get("url"):
+            out = dict(second, source="repeaks")
+            _cache_put(_result_cache, ck, out)
+            return out
+        reasons = [r.get("error") for r in (first, second) if r.get("error")]
+        return {"error": "; ".join(reasons)[:180] or "repeaks: no stream",
+                "rejected": (second.get("rejected") or first.get("rejected") or [])}
+
     if source == "vixsrc":
         master = vixsrc_master(mtype, tmdb, season, episode)
         if not master:
             return {"error": "vixsrc: no master playlist"}
-        out = {"url": master, "source": "vixsrc", "audio": "unknown",
-               "needs_remux": False, "via": "relay-required",
-               "referer": VIX_BASE + "/"}
+        # Plays DIRECT: measured CORS `*` on the master, every variant and the
+        # segment host, with no Referer needed from a residential IP. The only
+        # thing that gets blocked is a datacenter IP, which is why this must be
+        # played by the browser and never fetched through our edge.
+        out = {"url": master, "source": "vixsrc", "audio": "eng",
+               "needs_remux": False, "via": "direct"}
         _cache_put(_result_cache, ck, out)
         return out
 

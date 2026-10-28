@@ -4405,7 +4405,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "tmdb + type required"}, 400)
             if not re.fullmatch(r"\d{1,9}", str(tmdb)) or mtype not in ("movie", "tv", "anime"):
                 return self._json({"error": "bad tmdb/type"}, 400)
-            if source not in ("castle", "vixsrc"):
+            if source not in ("castle", "vixsrc", "repeaks"):
                 return self._json({"error": "bad source"}, 400)
             try:
                 season = int(q.get("season", [0])[0] or 0) or None
@@ -4417,7 +4417,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 import ext_sources
                 info = None
-                if source == "castle":
+                if source in ("castle", "repeaks"):
                     kind = "movie" if mtype == "movie" else "tv"
                     st, body = http_get(
                         f"https://api.themoviedb.org/3/{kind}/{tmdb}"

@@ -125,17 +125,37 @@ def sniff(buf):
 def verdict(buf, wanted=("en",), default_when_loud=None):
     """Full gate. Returns (safe: bool, detail: dict).
 
-    safe=None from sniff() means "2+ tracks, first is tagged" -> compare it.
+    Two shapes matter:
+      * 1 audio track  -> only accept it when it is untagged ("und") or English.
+                          A LONE Hindi/Tamil/Spanish track means the file IS that
+                          dub, so it is refused. (yapgrid passed single-track
+                          files because they were only choosing which track to
+                          play inside their own player; we are deciding whether
+                          to serve the file at all, so this has to be strict.)
+      * 2+ audio tracks -> the FIRST one is what a browser plays by default, so
+                          it must be untagged or English.
     """
     res = sniff(buf)
     langs = res["langs"]
-    if res["safe"] is not None:
-        return res["safe"], {**res, "checked": False}
+    if not langs:
+        # No PMT/descriptor found. Do NOT block playback on a parse miss.
+        return True, {**res, "checked": False}
 
-    allowed = set()
+    ok_untagged = {"", "und", "unk", "zxx"}
+
+    if len(langs) == 1:
+        first = langs[0]
+        ok = first in ok_untagged or first in LANG_ALIASES.get("en", {"eng"})
+        return ok, {
+            "langs": langs,
+            "first": first,
+            "checked": True,
+            "reason": "single-audio-ok" if ok else f"single-audio-is-{first}",
+        }
+
+    allowed = set(ok_untagged)
     for code in wanted:
         allowed |= LANG_ALIASES.get(code.lower(), {code.lower()})
-    allowed.add("und")   # untagged but playable-as-default
 
     first = langs[0]
     ok = first in allowed

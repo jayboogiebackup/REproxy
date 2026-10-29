@@ -3210,8 +3210,15 @@ def codec_rank(name, want_height=None):
 
 
 def os_subs(tmdb, mtype, season=None, episode=None):
-    """OpenSubtitles search by IMDb id → list of subtitle files.
-    Downloads the SRT and converts to VTT (browser-playable via <track>)."""
+    """OpenSubtitles search by IMDb id -> RANKED English candidates.
+
+    The old code kept only the first English result. OpenSubtitles carries a lot
+    of mislabelled uploads, and that is exactly how a request for The Apothecary
+    Diaries ep1 came back with a Thai drama's episode 7. Candidates are scored on
+    the release name (does it name this show's exact SxxExx? does it name a
+    DIFFERENT episode?) plus ratings/downloads, and several are returned so the
+    viewer can pick another track if the top one is wrong.
+    """
     try:
         imdb = tmdb_to_imdb(tmdb, "movie" if mtype == "movie" else "tv")
         if not imdb:
@@ -3219,21 +3226,72 @@ def os_subs(tmdb, mtype, season=None, episode=None):
         url = f"https://api.opensubtitles.com/api/v1/subtitles?imdb_id={imdb}&languages=en"
         if season and episode:
             url += f"&season_number={season}&episode_number={episode}"
-        req = urllib.request.Request(url, headers={"Api-Key": os.environ.get("OPENSUBTITLES_API_KEY", ""),
-                                                   "User-Agent": "repeaks v1"})
+        req = urllib.request.Request(url, headers={
+            "Api-Key": os.environ.get("OPENSUBTITLES_API_KEY", ""),
+            "User-Agent": "repeaks v1"})
         with urllib.request.urlopen(req, timeout=20) as r:
             d = json.loads(r.read())
-        out = []
-        seen = set()
+
+        want_sx = f"s{int(season):02d}e{int(episode):02d}" if (season and episode) else None
+        cands = []
         for s in (d.get("data") or []):
             att = s.get("attributes", {})
-            lang = att.get("language", "en")
-            fn = att.get("release_name", "") or att.get("title", "") or f"Subtitle {s.get('id')}"
-            fid = str(s.get("id"))
-            if lang in seen:
+            lang = (att.get("language") or "en").lower()
+            if lang not in ("en", "eng"):
                 continue
-            seen.add(lang)
-            out.append({"label": lang.capitalize(), "file_id": fid, "name": fn[:60], "file": None})
+            fid = str(s.get("id"))
+            rn = (att.get("release_name") or att.get("title") or "") or f"Subtitle {fid}"
+            low = rn.lower()
+            flat = re.sub(r"[^a-z0-9]", "", low)
+            score = 0
+            if want_sx:
+                if want_sx in flat:
+                    score += 5
+                elif re.search(r"s\d{1,2}e\d{1,2}", flat):
+                    score -= 4          # explicitly a DIFFERENT episode
+            try:
+                score += min(3, int(float(att.get("ratings") or 0)))
+            except Exception:
+                pass
+            try:
+                score += min(2, int((att.get("download_count") or 0) / 1000))
+            except Exception:
+                pass
+            cands.append((score, fid, rn[:60]))
+
+        cands.sort(key=lambda x: -x[0])
+        out, seen = [], set()
+        for score, fid, rn in cands:
+            if fid in seen:
+                continue
+            seen.add(fid)
+            out.append({"label": f"English — {rn}", "file_id": fid,
+                        "name": rn, "score": score, "file": None})
+            if len(out) >= 6:
+                break
+
+        # Verify before offering. OpenSubtitles language labels LIE — measured on
+        # Apothecary ep1: the top two "English" files were Korean and Serbian in
+        # their opening cues. Download the leading candidates and float the first
+        # one that is genuinely Latin-script English to the front.
+        for i, cand in enumerate(out[:4]):
+            path = os_download_vtt(cand["file_id"])
+            if not path:
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    txt = f.read()
+            except Exception:
+                continue
+            letters = [c for c in txt if c.isalpha()]
+            if not letters:
+                continue
+            latin = sum(1 for c in letters if ord(c) < 128)
+            if latin / len(letters) >= 0.85:
+                cand["verified"] = True
+                cand["label"] = f"English — {cand['name']}"
+                out.insert(0, out.pop(i))
+                break
         return out
     except Exception:
         return []
@@ -3252,10 +3310,24 @@ def os_download_vtt(file_id):
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0"})
             with urllib.request.urlopen(req0, timeout=30) as r0:
                 raw = r0.read()
-                if b"WEBVTT" in raw[:20] or b"--> " in raw[:2000] or b"<" not in raw[:2000]:
-                    srt = raw.decode("utf-8", "replace")
-                else:
-                    srt = None  # HTML error page
+            # The legacy endpoint serves a ZIP archive, not raw SRT. Without this
+            # every download failed the "is this text?" test below and reported
+            # "download failed".
+            if raw[:2] == b"PK":
+                import io
+                import zipfile
+                try:
+                    zf = zipfile.ZipFile(io.BytesIO(raw))
+                    names = [n for n in zf.namelist()
+                             if n.lower().endswith((".srt", ".vtt"))]
+                    if names:
+                        raw = zf.read(names[0])
+                except Exception:
+                    pass
+            if b"WEBVTT" in raw[:20] or b"--> " in raw[:2000] or b"<" not in raw[:2000]:
+                srt = raw.decode("utf-8", "replace")
+            else:
+                srt = None  # HTML error page
         except Exception:
             srt = None
         # 2) API download endpoint (falls back if legacy blocked)

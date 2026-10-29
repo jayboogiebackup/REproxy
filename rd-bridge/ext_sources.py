@@ -479,6 +479,36 @@ def _ani_score(name, year, want_titles, want_year):
     return best
 
 
+def _attr(tag, name):
+    """Read one attribute out of an HTML tag (order-independent)."""
+    m = re.search(r'\b' + re.escape(name) + r'="([^"]*)"', tag)
+    return m.group(1) if m else None
+
+
+def _mal_lookup(titles, year=None):
+    """Authoritative MAL id for an anime title, via AniList's idMal field.
+
+    Jikan (the usual MAL wrapper) is unreachable from this host — it times out —
+    but AniList answers in ~250ms and publishes the MAL id directly. This is the
+    identity anchor for anikoto, which is text-searched and therefore always one
+    fuzzy match away from serving a different show.
+    """
+    q = ("query($s:String){Media(search:$s,type:ANIME)"
+         "{idMal episodes title{romaji english}}}")
+    for t in [x for x in (titles or []) if x][:2]:
+        try:
+            r = requests.post("https://graphql.anilist.co",
+                              json={"query": q, "variables": {"s": t}}, timeout=15)
+            if r.status_code != 200:
+                continue
+            media = (r.json().get("data") or {}).get("Media") or {}
+            if media.get("idMal"):
+                return {"idMal": media["idMal"], "episodes": media.get("episodes")}
+        except Exception:
+            continue
+    return {}
+
+
 def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None,
                     ep_override=None):
     """TMDB titles -> anikoto search -> megaplay master.m3u8."""
@@ -527,11 +557,30 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None,
         r = s.get(f"{ANI_BASE}/ajax/episode/list/{aid}", timeout=20)
         html = (r.json().get("result") or "")
         eps = []
-        for m in re.finditer(r'<a[^>]*data-id="(\d+)"[^>]*data-num="(\d+)"[^>]*'
-                             r'data-sub="(\d?)"[^>]*data-dub="(\d?)"[^>]*data-ids="([^"]+)"', html):
-            eps.append({"num": int(m.group(2)), "dub": m.group(4) == "1", "ids": m.group(5)})
+        # Per-tag, order-independent: the old fixed-order regex silently produced
+        # no episodes whenever the site reordered attributes.
+        for tag in re.findall(r'<a\b[^>]*>', html):
+            ids = _attr(tag, "data-ids")
+            num = _attr(tag, "data-num")
+            if not ids or not num:
+                continue
+            eps.append({"num": int(num), "dub": _attr(tag, "data-dub") == "1",
+                        "ids": ids, "mal": _attr(tag, "data-mal")})
         if not eps:
             return {"error": "anikoto: no episodes"}
+        # ── MAL IDENTITY GATE ────────────────────────────────────────────
+        # anikoto is matched by TEXT, so a fuzzy hit can serve a different show.
+        # AniList gives the authoritative MAL id for the requested title, and
+        # every episode row carries data-mal. If they disagree we refuse instead
+        # of playing whatever the search returned. No verification, no playback.
+        _mal = _mal_lookup(want, year)
+        if not _mal.get("idMal"):
+            return {"error": "anikoto: unverified (no MAL id)"}
+        _tagged = [e for e in eps if e.get("mal")]
+        if _tagged and all(str(e["mal"]) != str(_mal["idMal"]) for e in _tagged):
+            return {"error": "anikoto: MAL mismatch (wrong anime %s != %s)"
+                             % (_tagged[0]["mal"], _mal["idMal"])}
+
         # Flat-numbered shows (One Piece: 1..1180) need the ABSOLUTE episode;
         # sending TMDB season 21 episode 1 as "1" played the 1999 pilot.
         want = int(ep_override or episode or 1)

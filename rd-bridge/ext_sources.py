@@ -663,9 +663,15 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None,
                 # EPISODE-level id, not anime-level: `data-mediaid` is constant
                 # across a series (Apothecary: 643 for ep1/2/5) so it served one
                 # file for every episode. `data-realid` differs per episode.
+                # EPISODE key = data-id. Measured on The Apothecary Diaries ep1:
+                #   data-id  12758 -> English caption reads "The Apothecary Diaries"  (CORRECT)
+                #   mediaid  643   -> "[English subtitles are available]" (placeholder)
+                #   realid   108898-> "If Italy is the Land of Love... Lupin III" (WRONG SHOW)
+                # Using realid was why every anime played the wrong thing.
+                did = re.search(r'data-id="(\d+)"', em.text)
                 rid = re.search(r'data-realid="(\d+)"', em.text)
                 mid = re.search(r'data-mediaid="(\d+)"', em.text)
-                sid = rid or mid
+                sid = did or rid or mid
                 if not sid:
                     continue
                 g = s.get("https://megaplay.buzz/stream/getSources",
@@ -797,12 +803,18 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
             str((info or {}).get("originalLanguage") or "").lower() == "ja"
         titles = [t for t in ((info or {}).get("title"), (info or {}).get("originalTitle")) if t]
 
-        # anikoto DISABLED: its file library is cross-wired. The MAL gate
-        # passes (AniList idMal == data-mal) but the media behind a correct
-        # entry is another show (Apothecary ep1 -> Lupin III, ep5 -> Midori
-        # Days). Identity verified, FILE not. Wrong content is worse than a
-        # lower-quality correct source, so anime falls through to castle /
-        # repokapone until files can be verified.
+        # ANIME FIRST. vixsrc carries no anime (404) and castle is Hindi-first at
+        # 720p, so those two failing is what pushed every anime onto repokapone.
+        # anikoto gives 1080p with an English dub, gated by MAL identity (see
+        # anikoto_resolve): the episode key is data-id, which is the one that
+        # returns the CORRECT show - realid returned other shows' files.
+        if is_anime:
+            ani = _ani_safe(titles, season, episode, (info or {}).get("year"),
+                            (info or {}).get("absEpisode"), prefer=prefer)
+            if ani.get("url"):
+                out = dict(ani, source="repeaks")
+                _cache_put(_result_cache, ck, out)
+                return out
 
         first = _safe_resolve(tmdb, mtype, season, episode, "vixsrc", info, require_english)
         if first.get("url"):

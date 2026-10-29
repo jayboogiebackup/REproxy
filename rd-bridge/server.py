@@ -4440,12 +4440,27 @@ class Handler(BaseHTTPRequestHandler):
                             tot += int(sn.get("episode_count") or 0)
                     if tot:
                         abs_ep = tot + int(episode or 1)
+                # Anime detection. `original_language` ALONE is unreliable on
+                # TMDB: Cyberpunk: Edgerunners is a Studio Trigger production but
+                # is tagged original_language "en", so a language-only test sent
+                # it down the live-action path and it fell through to repokapone.
+                # Animation genre + Japanese audio or Japanese origin is the
+                # reliable signal; the language check is kept as a fast path.
+                genres = [g.get("id") for g in (d.get("genres") or [])]
+                spoken = [s.get("iso_639_1") for s in (d.get("spoken_languages") or [])]
+                countries = list(d.get("origin_country") or []) or [
+                    p.get("iso_3166_1") for p in (d.get("production_countries") or [])]
+                is_anime = (
+                    d.get("original_language") == "ja"
+                    or (16 in genres and ("ja" in spoken or "JP" in countries))
+                )
                 info = {
                     "title": d.get("title") or d.get("name"),
                     "originalTitle": d.get("original_title") or d.get("original_name"),
                     "year": int(date[:4]) if date[:4].isdigit() else None,
                     "originalLanguage": d.get("original_language"),
                     "absEpisode": abs_ep,
+                    "isAnime": is_anime,
                 }
                 res = ext_sources.resolve(int(tmdb), mtype, season, episode,
                                           source=source, info=info)

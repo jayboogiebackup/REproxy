@@ -629,7 +629,11 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
     if source == "repeaks":
         # One source failing must never abort the chain: a missing vixsrc title is
         # routine, and an exception here previously took castle down with it.
-        is_anime = str((info or {}).get("originalLanguage") or "").lower() == "ja"
+        # isAnime is resolved from TMDB genre+language+country (see server.py);
+        # originalLanguage alone misses titles TMDB mislabels, e.g. Cyberpunk:
+        # Edgerunners is tagged 'en' but is a Japanese production.
+        is_anime = bool((info or {}).get("isAnime")) or \
+            str((info or {}).get("originalLanguage") or "").lower() == "ja"
         titles = [t for t in ((info or {}).get("title"), (info or {}).get("originalTitle")) if t]
 
         # ANIME FIRST. vixsrc carries no anime at all (404), and castle's anime is

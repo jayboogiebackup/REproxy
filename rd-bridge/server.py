@@ -4462,8 +4462,11 @@ class Handler(BaseHTTPRequestHandler):
                     "absEpisode": abs_ep,
                     "isAnime": is_anime,
                 }
+                # Explicit dub/sub request from the player's Audio menu.
+                _audio = (q.get("audio", [None])[0] or "").lower()
                 res = ext_sources.resolve(int(tmdb), mtype, season, episode,
-                                          source=source, info=info)
+                                          source=source, info=info,
+                                          prefer=_audio if _audio in ("dub", "sub") else None)
                 # Hand the searchable titles back regardless of outcome.
                 res["titles"] = [t for t in (info.get("title"), info.get("originalTitle")) if t]
                 res["originalLanguage"] = info.get("originalLanguage")

@@ -645,6 +645,7 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None,
             return {"error": "anikoto: no master"}
         return {"url": best["url"], "source": "anikoto", "audio_type": best["type"],
                 "audio": "eng" if best["type"] == "dub" else "jpn",
+                "audio_options": sorted({x["type"] for x in srv}),
                 "needs_remux": False, "via": "megaplay",
                 "height": best["height"], "server": best.get("name"),
                 "subtitles": best["subs"][:12], "anime_id": aid, "matched": matched,
@@ -653,11 +654,12 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None,
         return {"error": f"anikoto: {str(e)[:80]}"}
 
 
-def _ani_safe(titles, season, episode, year=None, ep_override=None):
+def _ani_safe(titles, season, episode, year=None, ep_override=None, prefer=None):
     """anikoto_resolve that never raises, so one dead provider can't break the chain."""
     try:
-        return anikoto_resolve(titles, season, episode, year=year,
-                              ep_override=ep_override) or {"error": "anikoto: empty"}
+        return anikoto_resolve(titles, season, episode,
+                               prefer=(prefer or "dub"), year=year,
+                               ep_override=ep_override) or {"error": "anikoto: empty"}
     except Exception as e:
         return {"error": f"anikoto: {str(e)[:80]}"}
 
@@ -677,14 +679,17 @@ def _safe_resolve(tmdb, mtype, season, episode, source, info, require_english):
 
 
 def resolve(tmdb, mtype, season=None, episode=None, source="castle",
-            info=None, require_english=True, attempts=3):
+            info=None, require_english=True, attempts=3,
+             prefer=None):
     """-> {"url","source","audio","rejected":[...]} or {"error":...}
 
     `info` = {"title","originalTitle","year","originalLanguage"} from TMDB.
     CastleTV is often Hindi-first on major titles, so each candidate's head is
     sniffed and non-English-first picks are skipped rather than served.
     """
-    ck = f"{source}|{tmdb}|{mtype}|{season}|{episode}|{int(require_english)}"
+    # prefer MUST be in the key: without it, switching Dub <-> Sub in the player
+    # re-served the cached stream from the other audio choice.
+    ck = f"{source}|{tmdb}|{mtype}|{season}|{episode}|{int(require_english)}|{prefer or ''}"
     hit = _cache_get(_result_cache, ck, _RESULT_TTL)
     if hit:
         return hit
@@ -710,7 +715,7 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
         # to the front of the chain.
         if is_anime:
             ani = _ani_safe(titles, season, episode, (info or {}).get("year"),
-                          (info or {}).get("absEpisode"))
+                          (info or {}).get("absEpisode"), prefer=prefer)
             if ani.get("url"):
                 out = dict(ani, source="repeaks")
                 _cache_put(_result_cache, ck, out)

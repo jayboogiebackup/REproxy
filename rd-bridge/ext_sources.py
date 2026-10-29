@@ -749,6 +749,52 @@ def vidrift_resolve(tmdb, mtype, season=None, episode=None):
         return {"error": "vidrift: %s" % str(e)[:60]}
 
 
+DULO_API = "https://dulo.mov/api/streams/resolve"
+
+
+def dulo_resolve(tmdb, mtype, season=None, episode=None):
+    """dulo.mov -> Cloudflare-Workers stream API.
+
+    GET /api/streams/resolve?tmdbId=&type=&progressive=true[&seasonId=&episodeId=]
+    returns {found, pending, sources:[{label, url}]}. The first call is usually
+    pending (their UI says "fetching 4K sources may take longer"), so poll twice
+    at most - anything more makes the whole chain slow.
+    Media sits behind their zstream-proxy and needs Referer https://dulo.mov/.
+    """
+    try:
+        q = {"tmdbId": tmdb, "type": mtype, "progressive": "true"}
+        if mtype != "movie":
+            q["seasonId"] = season or 1
+            q["episodeId"] = episode or 1
+        s = _sess({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                 "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                 "Chrome/131.0.0.0 Safari/537.36",
+                   "Referer": "https://dulo.mov/", "Origin": "https://dulo.mov"})
+        best = None
+        for _ in range(2):
+            r = s.get(DULO_API, params=q, timeout=20)
+            if r.status_code != 200:
+                return {"error": "dulo: %s" % r.status_code}
+            d = r.json()
+            srcs = d.get("sources") or []
+            for sv in srcs:
+                lab = sv.get("label") or ""
+                m = re.search(r"(\d{3,4})p", lab)
+                h = int(m.group(1)) if m else 0
+                if best is None or h > best[0]:
+                    best = (h, sv)
+            if best or not d.get("pending"):
+                break
+            time.sleep(6)
+        if not best:
+            return {"error": "dulo: no sources"}
+        h, sv = best
+        return {"url": sv.get("url"), "source": "dulo", "via": "dulo",
+                "height": h, "audio": "eng", "needs_remux": False}
+    except Exception as e:
+        return {"error": "dulo: %s" % str(e)[:60]}
+
+
 ATLANTIC_REF = "https://atlantic.st/"
 # AES-256-GCM key for the "ms_" Moscow token, recovered from the site bundle
 # (const TW in app.js). IV is the first 12 bytes, rest is ciphertext+tag.
@@ -878,6 +924,14 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
         at = atlantic_resolve(tmdb, mtype, season, episode)
         if at.get("url"):
             out = dict(at, source="repeaks")
+            _cache_put(_result_cache, ck, out)
+            return out
+
+        # dulo.mov: Cloudflare-Workers resolver (Zephyr 1080p / Ripple). Slower
+        # (~6-12s while it warms) so it sits after atlantic and before castle.
+        du = dulo_resolve(tmdb, mtype, season, episode)
+        if du.get("url"):
+            out = dict(du, source="repeaks")
             _cache_put(_result_cache, ck, out)
             return out
 

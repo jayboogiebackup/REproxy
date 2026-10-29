@@ -545,27 +545,75 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None,
             t = grp[:3]
             if t not in ("sub", "dub"):
                 continue
-            for m in re.finditer(r'<li[^>]*data-sv-id="(\d+)"[^>]*data-link-id="([^"]+)"', grp):
-                srv.append({"type": t, "link": m.group(2)})
+            # data-sv-id is NOT numeric — values look like "323", "e54", "1a7".
+            # Requiring \d+ silently dropped every non-numeric server, which is
+            # how Cyberpunk ended up stuck on a 640x480 mirror while the 1080p
+            # servers existed right there in the same list.
+            for m in re.finditer(
+                    r'<li[^>]*data-sv-id="[^"]+"[^>]*data-link-id="([^"]+)"[^>]*>\s*([^<]+)',
+                    grp):
+                srv.append({"type": t, "link": m.group(1), "name": m.group(2).strip()})
         if not srv:
             return {"error": "anikoto: no servers"}
         # English first: dub when the episode has one, else sub (JP + English subs).
         order = ([x for x in srv if x["type"] == prefer] + [x for x in srv if x["type"] != prefer]
                  if prefer else srv)
 
-        for sv in order[:3]:
+        def _rank(sv):
+            nm = (sv.get("name") or "").lower()
+            if nm.startswith("hd-1"):
+                return 0
+            if nm.startswith("hd-2"):
+                return 1
+            if "hd" in nm:
+                return 2
+            return 3
+
+        order = sorted(order, key=lambda x: (x["type"] != prefer, _rank(x)))
+
+        def _res_of(url):
+            """Highest rung in a master playlist, or None when unreadable.
+
+            None (not 0) matters: after several requests the CDN starts answering
+            403, and treating that as "0p" made a dead probe look like a real
+            measurement and win the comparison.
+            """
+            import time
+            for attempt in range(2):
+                try:
+                    rr = s.get(url, headers={"Referer": "https://megaplay.buzz/",
+                                             "Origin": "https://megaplay.buzz"}, timeout=20)
+                    if rr.status_code != 200:
+                        import os
+                        if os.environ.get("ANI_DEBUG"):
+                            print("[anikoto] res_of %s status=%s (retry)" % (
+                                url[-28:], rr.status_code), flush=True)
+                        time.sleep(0.35)
+                        continue
+                    hs = [int(h) for h in re.findall(r"RESOLUTION=\d+x(\d+)", rr.text)]
+                    import os
+                    if os.environ.get("ANI_DEBUG"):
+                        print("[anikoto] res_of %s status=%s res=%s" % (
+                            url[-28:], rr.status_code, hs), flush=True)
+                    return max(hs) if hs else None
+                except Exception as _e:
+                    import os
+                    if os.environ.get("ANI_DEBUG"):
+                        print("[anikoto] res_of EXC %r" % (_e,), flush=True)
+                    time.sleep(0.35)
+            return None
+
+        best = None
+        for sv in order[:5]:
             try:
                 r = s.get(f"{ANI_BASE}/ajax/server", params={"get": sv["link"]}, timeout=20)
                 embed = ((r.json().get("result") or {}).get("url")) or ""
                 if "megaplay" not in embed:
                     continue
                 em = s.get(embed, timeout=20)
-                # EPISODE-level id, not the anime-level one. `data-mediaid` is the
-                # same for every episode in a series (measured on The Apothecary
-                # Diaries: mediaid=643 for ep1, ep2 and ep5), so keying getSources
-                # off it served the SAME file for every episode — the player looked
-                # like it was playing the wrong anime. `data-realid` differs per
-                # episode (108898 / 108899 / 109211) and is what selects the file.
+                # EPISODE-level id, not anime-level: `data-mediaid` is constant
+                # across a series (Apothecary: 643 for ep1/2/5) so it served one
+                # file for every episode. `data-realid` differs per episode.
                 rid = re.search(r'data-realid="(\d+)"', em.text)
                 mid = re.search(r'data-mediaid="(\d+)"', em.text)
                 sid = rid or mid
@@ -581,15 +629,26 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None,
                 master = inner.get("file")
                 if not master:
                     continue
+                h = _res_of(master)
                 subs = [t for t in (j.get("tracks") or []) if t.get("kind") == "captions"]
-                return {"url": master, "source": "anikoto", "audio_type": sv["type"],
-                        "audio": "eng" if sv["type"] == "dub" else "jpn",
-                        "needs_remux": False, "via": "megaplay",
-                        "subtitles": subs[:12], "anime_id": aid, "matched": matched,
-                        "anikoto_ep": ep["num"]}
+                cand = {"height": h, "type": sv["type"], "url": master, "subs": subs,
+                        "name": sv.get("name")}
+                # Known resolution beats unknown; unknown still beats nothing.
+                if (best is None
+                        or (h is not None and (best["height"] is None or h > best["height"]))):
+                    best = cand
+                if h is not None and h >= 1000:
+                    break
             except Exception:
                 continue
-        return {"error": "anikoto: no master"}
+        if not best:
+            return {"error": "anikoto: no master"}
+        return {"url": best["url"], "source": "anikoto", "audio_type": best["type"],
+                "audio": "eng" if best["type"] == "dub" else "jpn",
+                "needs_remux": False, "via": "megaplay",
+                "height": best["height"], "server": best.get("name"),
+                "subtitles": best["subs"][:12], "anime_id": aid, "matched": matched,
+                "anikoto_ep": ep["num"]}
     except Exception as e:
         return {"error": f"anikoto: {str(e)[:80]}"}
 

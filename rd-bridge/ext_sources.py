@@ -703,6 +703,46 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None,
         return {"error": f"anikoto: {str(e)[:80]}"}
 
 
+VIDRIFT = "https://embed.vidrift.net"
+
+
+def vidrift_resolve(tmdb, mtype, season=None, episode=None):
+    """vidrift.net embed -> Vexon 1080p HLS.
+
+    No JS challenge: the embed HTML carries the whole payload as JSON, and for a
+    MOVIE `vexonUrl` is a 1080p HLS on media.reelvault.click that needs no Referer
+    (verified: master 200, 5 Mbps, separate audio renditions incl. English, 15
+    subtitle tracks).
+
+    MOVIE ONLY. TV/anime embeds expose only Orion streams, and measured their
+    codecs are hvc1 (HEVC) - a browser cannot decode those, so serving them would
+    look identical to the MKV failure mode.
+    """
+    if mtype != "movie":
+        return {"error": "vidrift: movie only (orion is HEVC)"}
+    try:
+        s = _sess({
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/131.0.0.0 Safari/537.36"),
+            "Referer": VIDRIFT + "/",
+        })
+        r = s.get("%s/embed/movie/%s" % (VIDRIFT, tmdb), timeout=15)
+        m = re.search(r'"vexonUrl":"([^"]+)"', r.text)
+        url = (m.group(1) if m else "").replace("\\/", "/")
+        if not url:
+            return {"error": "vidrift: no vexon stream"}
+        v = s.get(url, timeout=15)
+        if v.status_code != 200 or "#EXTM3U" not in v.text[:64]:
+            return {"error": "vidrift: vexon %s" % v.status_code}
+        hs = [int(h) for h in re.findall(r"RESOLUTION=\d+x(\d+)", v.text)]
+        return {"url": url, "source": "vidrift", "via": "direct",
+                "height": max(hs) if hs else 0,
+                "audio": "eng", "needs_remux": False}
+    except Exception as e:
+        return {"error": "vidrift: %s" % str(e)[:60]}
+
+
 def _ani_safe(titles, season, episode, year=None, ep_override=None, prefer=None):
     """anikoto_resolve that never raises, so one dead provider can't break the chain."""
     try:
@@ -769,6 +809,11 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
             out = dict(first, source="repeaks", via=first.get("via") or "direct")
             _cache_put(_result_cache, ck, out)
             return out
+        # vidrift.net is NOT in the chain: measured from this host its embed
+        # returns vexonUrl="" for every movie (one earlier sample did expose a
+        # working 1080p Vexon HLS, so it is intermittent), and its TV/anime
+        # streams are Orion hvc1/HEVC which a browser cannot decode. Adding it
+        # would only add latency. vidrift_resolve() is kept for re-testing.
         second = _safe_resolve(tmdb, mtype, season, episode, "castle", info, require_english)
         if second.get("url"):
             out = dict(second, source="repeaks")

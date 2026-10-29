@@ -560,12 +560,20 @@ def anikoto_resolve(titles, season=None, episode=None, prefer="dub", year=None,
                 if "megaplay" not in embed:
                     continue
                 em = s.get(embed, timeout=20)
+                # EPISODE-level id, not the anime-level one. `data-mediaid` is the
+                # same for every episode in a series (measured on The Apothecary
+                # Diaries: mediaid=643 for ep1, ep2 and ep5), so keying getSources
+                # off it served the SAME file for every episode — the player looked
+                # like it was playing the wrong anime. `data-realid` differs per
+                # episode (108898 / 108899 / 109211) and is what selects the file.
+                rid = re.search(r'data-realid="(\d+)"', em.text)
                 mid = re.search(r'data-mediaid="(\d+)"', em.text)
-                if not mid:
+                sid = rid or mid
+                if not sid:
                     continue
                 g = s.get("https://megaplay.buzz/stream/getSources",
-                          params={"id": mid.group(1)},
-                          headers={"Referer": "https://megaplay.buzz/"}, timeout=20)
+                          params={"id": sid.group(1)},
+                          headers={"Referer": embed}, timeout=20)
                 j = g.json()
                 if not j.get("enc"):
                     continue

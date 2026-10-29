@@ -749,6 +749,53 @@ def vidrift_resolve(tmdb, mtype, season=None, episode=None):
         return {"error": "vidrift: %s" % str(e)[:60]}
 
 
+ATLANTIC_REF = "https://atlantic.st/"
+# AES-256-GCM key for the "ms_" Moscow token, recovered from the site bundle
+# (const TW in app.js). IV is the first 12 bytes, rest is ciphertext+tag.
+ATLANTIC_KEY = bytes.fromhex(
+    "55060a042823f51a94c296894a58a0db15f3baef807155140983083fa799ef47")
+
+
+def atlantic_resolve(tmdb, mtype, season=None, episode=None):
+    """atlantic.st -> stream.hls.lol/moscow HLS.
+
+    Provider survey (measured from a residential IP):
+      /shegu   (Vespera) 503 {"error":"disabled"}
+      /amnesty           302 -> a YouTube ad, not the film
+      /q62               404 unless the title is in their catalogue
+      api.wecollege.net  (Athena/boise) returns an HTML block page to datacenter IPs
+      /moscow            WORKS: returns an AES-GCM "ms_" token -> real HLS
+    Media requires Referer https://atlantic.st/, so it must be relayed.
+    """
+    try:
+        q = {"tmdbId": tmdb, "type": mtype}
+        if mtype == "tv":
+            q["seasonId"] = season or 1
+            q["episodeId"] = episode or 1
+        s = _sess({
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/131.0.0.0 Safari/537.36"),
+            "Referer": ATLANTIC_REF,
+            "Origin": "https://atlantic.st",
+        })
+        r = s.get("https://stream.hls.lol/moscow", params=q, timeout=15)
+        tok = (((r.json().get("sources") or {}).get("Moscow") or {}).get("url")) or ""
+        if not tok.startswith("ms_"):
+            return {"error": "atlantic: no moscow token"}
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        raw = bytes.fromhex(tok[3:])
+        url = AESGCM(ATLANTIC_KEY).decrypt(raw[:12], raw[12:], None).decode()
+        v = s.get(url, timeout=15)
+        if v.status_code != 200 or "#EXTM3U" not in v.text[:64]:
+            return {"error": "atlantic: master %s" % v.status_code}
+        hs = [int(h) for h in re.findall(r"RESOLUTION=\d+x(\d+)", v.text)]
+        return {"url": url, "source": "atlantic", "via": "atlantic",
+                "height": max(hs) if hs else 0, "audio": "eng", "needs_remux": False}
+    except Exception as e:
+        return {"error": "atlantic: %s" % str(e)[:60]}
+
+
 def _ani_safe(titles, season, episode, year=None, ep_override=None, prefer=None):
     """anikoto_resolve that never raises, so one dead provider can't break the chain."""
     try:
@@ -826,6 +873,14 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
         # working 1080p Vexon HLS, so it is intermittent), and its TV/anime
         # streams are Orion hvc1/HEVC which a browser cannot decode. Adding it
         # would only add latency. vidrift_resolve() is kept for re-testing.
+        # Atlantic (stream.hls.lol/moscow): H.264 HLS, 1080p on anime, 720-800p
+        # on movies/TV. Relayed because the CDN requires an atlantic.st Referer.
+        at = atlantic_resolve(tmdb, mtype, season, episode)
+        if at.get("url"):
+            out = dict(at, source="repeaks")
+            _cache_put(_result_cache, ck, out)
+            return out
+
         second = _safe_resolve(tmdb, mtype, season, episode, "castle", info, require_english)
         if second.get("url"):
             out = dict(second, source="repeaks")

@@ -757,18 +757,12 @@ def resolve(tmdb, mtype, season=None, episode=None, source="castle",
             str((info or {}).get("originalLanguage") or "").lower() == "ja"
         titles = [t for t in ((info or {}).get("title"), (info or {}).get("originalTitle")) if t]
 
-        # ANIME FIRST. vixsrc carries no anime at all (404), and castle's anime is
-        # Hindi/Tamil-first and only 720p — those two failing is exactly why every
-        # anime episode used to end up on repokapone. anikoto is the one source
-        # with an English DUB at 1080p, so for a Japanese-original title it goes
-        # to the front of the chain.
-        if is_anime:
-            ani = _ani_safe(titles, season, episode, (info or {}).get("year"),
-                          (info or {}).get("absEpisode"), prefer=prefer)
-            if ani.get("url"):
-                out = dict(ani, source="repeaks")
-                _cache_put(_result_cache, ck, out)
-                return out
+        # anikoto DISABLED: its file library is cross-wired. The MAL gate
+        # passes (AniList idMal == data-mal) but the media behind a correct
+        # entry is another show (Apothecary ep1 -> Lupin III, ep5 -> Midori
+        # Days). Identity verified, FILE not. Wrong content is worse than a
+        # lower-quality correct source, so anime falls through to castle /
+        # repokapone until files can be verified.
 
         first = _safe_resolve(tmdb, mtype, season, episode, "vixsrc", info, require_english)
         if first.get("url"):
